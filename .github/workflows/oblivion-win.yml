@@ -1,0 +1,512 @@
+# Oblivion: Windows x64 Release build (Qt 6), derived from win.yml.
+#
+# Put this file to .github/workflows/oblivion-win.yml on the branch
+# "oblivion-win" (see out/oblivion-tools/win/PLAN.md). On that branch all the
+# other workflow files must be removed, otherwise every push starts them too.
+#
+# Two jobs, each has its own 6 hour limit of a GitHub-hosted runner:
+#   deps  - builds all third-party libraries (Debug and Release, Qt 6.11.1),
+#           the result is saved to the cache EVEN IF the job fails or runs
+#           out of time, so the next run continues from the failed library.
+#   build - restores the libraries, builds Oblivion.exe and uploads it.
+#
+# The cache keys are made from the list of finished libraries ("state"), so
+# an unchanged set of libraries is never uploaded twice.
+
+name: Oblivion Windows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "What to build (libraries are always built for both)"
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      deps_only:
+        description: "Only build and cache the libraries"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - oblivion-win
+
+# A new push waits for the running build instead of building the
+# libraries twice in parallel.
+concurrency:
+  group: oblivion-win-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+
+  deps:
+    name: Libraries (x64, Qt 6)
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          rem The libraries are built for Debug and Release, that needs
+          rem more than the ~30 GB free on C:, so D: is used when it exists.
+          rem The real path is a part of the prepare.py cache keys.
+          set "TROOT=%userprofile%\TBuild"
+          if exist D:\ set "TROOT=D:\TBuild"
+          echo Build root: %TROOT%
+          mkdir %TROOT%\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %TROOT%
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Disk space before.
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          # prepare.py does not need the submodules.
+          submodules: false
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "Configurate git for cherry-picks."
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      # MSYS2 has removed mingw-w64-x86_64-diffutils from its repository
+      # (checked 2026-10-01), so the msys64 stage of prepare.py of the
+      # 7.0.9 base fails. This is upstream commit b244f1b34 ("Update msys2
+      # and use ucrt versions of packages"), applied only if it is missing.
+      - name: Port the upstream msys2 fix.
+        shell: python
+        run: |
+          import os, sys
+          path = os.path.join(
+              os.environ['TBUILD'],
+              os.environ['REPO_NAME'],
+              os.environ['PREPARE_PATH'])
+          with open(path, encoding='utf-8', newline='') as f:
+              text = f.read()
+          if 'mingw-w64-x86_64-diffutils' not in text:
+              print('Already fixed, nothing to do.')
+              sys.exit(0)
+          replaces = [
+              (r"'ThirdParty\\msys64\\mingw64\\bin'",
+                  r"'ThirdParty\\msys64\\ucrt64\\bin'"),
+              ('download/2025-08-30/msys2-base-x86_64-20250830.sfx.exe',
+                  'download/2026-09-27/msys2-base-x86_64-20260927.sfx.exe'),
+          ] + [
+              ('mingw-w64-x86_64-' + name, 'mingw-w64-ucrt-x86_64-' + name)
+              for name in ['diffutils', 'gperf', 'nasm', 'perl', 'pkgconf']
+          ]
+          for was, now in replaces:
+              if text.count(was) != 1:
+                  print('::error::prepare.py changed, "%s" found %d times.'
+                      % (was, text.count(was)))
+                  sys.exit(1)
+              text = text.replace(was, now)
+          with open(path, 'w', encoding='utf-8', newline='') as f:
+              f.write(text)
+          print('Applied %d replaces.' % len(replaces))
+
+      - uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223 # master on 2026-10-01, the commit upstream win.yml runs
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Restore ThirdParty cache.
+        id: restore-third-party
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: oblivion-win64-third-party-v1-none
+          restore-keys: oblivion-win64-third-party-v1-
+
+      - name: Restore Libraries cache.
+        id: restore-libs
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-libs-v1-none
+          restore-keys: oblivion-win64-libs-v1-
+
+      - name: Restore Qt cache.
+        id: restore-qt
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-qt6-v1-none
+          restore-keys: oblivion-win64-qt6-v1-
+
+      # No "skip-release": the Release libraries are needed. The step limit
+      # leaves time to save the caches before the 6 hour limit of the job.
+      - name: Libraries.
+        timeout-minutes: 300
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent qt6
+
+      - name: Disk space after.
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
+      # Keeps only what is linked and included, like win.yml does, so the
+      # caches stay small. An unfinished library has no cache key and is
+      # built from scratch by the next run.
+      - name: Free up some disk space.
+        if: always()
+        shell: bash
+        run: |
+          LIBS="$(cygpath -u "$LibrariesPath")"
+          [ -d "$LIBS" ] || exit 0
+          find "$LIBS" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete || true
+
+      - name: Cache state.
+        if: always()
+        shell: python
+        run: |
+          import hashlib, os, re
+
+          def state(folder, want):
+              if not os.path.isdir(folder):
+                  return ''
+              names = sorted(
+                  name for name in os.listdir(folder)
+                  if want(name) and os.path.isfile(os.path.join(folder, name)))
+              if not names:
+                  return ''
+              result = hashlib.sha256()
+              for name in names:
+                  with open(os.path.join(folder, name), 'rb') as f:
+                      result.update(name.encode('utf-8') + b'=' + f.read() + b'\n')
+              print(folder, ':', ' '.join(names))
+              return result.hexdigest()[:24]
+
+          def qt(name):
+              return re.match(r'[qQ]t[_-]', name) is not None
+
+          libs = os.path.join(os.environ.get('LibrariesPath', ''), 'cache_keys')
+          tools = os.path.join(os.environ.get('TBUILD', ''), 'ThirdParty', 'cache_keys')
+          values = {
+              'LIBS_STATE': state(libs, lambda name: not qt(name)),
+              'QT_STATE': state(libs, qt),
+              'TP_STATE': state(tools, lambda name: True),
+          }
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              for key, value in values.items():
+                  f.write('%s=%s\n' % (key, value))
+                  print(key, '=', value or '(nothing to save)')
+
+      - name: Save ThirdParty cache.
+        if: always() && env.TP_STATE != '' && steps.restore-third-party.outputs.cache-matched-key != format('oblivion-win64-third-party-v1-{0}', env.TP_STATE)
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: oblivion-win64-third-party-v1-${{ env.TP_STATE }}
+
+      - name: Save Libraries cache.
+        if: always() && env.LIBS_STATE != '' && steps.restore-libs.outputs.cache-matched-key != format('oblivion-win64-libs-v1-{0}', env.LIBS_STATE)
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-libs-v1-${{ env.LIBS_STATE }}
+
+      - name: Save Qt cache.
+        if: always() && env.QT_STATE != '' && steps.restore-qt.outputs.cache-matched-key != format('oblivion-win64-qt6-v1-{0}', env.QT_STATE)
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-qt6-v1-${{ env.QT_STATE }}
+
+  build:
+    name: Oblivion (x64, Qt 6)
+    needs: deps
+    if: github.event_name != 'workflow_dispatch' || inputs.deps_only != true
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+      # A push builds Debug: it compiles about twice faster, which matters
+      # while the MSVC errors of the mod are being fixed. The exe for people
+      # is built by a manual run with configuration=Release.
+      BUILD_CONFIG: ${{ inputs.configuration || 'Debug' }}
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          rem Must be the same as in the "deps" job.
+          set "TROOT=%userprofile%\TBuild"
+          if exist D:\ set "TROOT=D:\TBuild"
+          echo Build root: %TROOT%
+          mkdir %TROOT%\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %TROOT%
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "Configurate git for cherry-picks."
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      # The same replaces as in the "deps" job: the cache keys of prepare.py
+      # are made from its commands, both jobs must see the same file.
+      - name: Port the upstream msys2 fix.
+        shell: python
+        run: |
+          import os, sys
+          path = os.path.join(
+              os.environ['TBUILD'],
+              os.environ['REPO_NAME'],
+              os.environ['PREPARE_PATH'])
+          with open(path, encoding='utf-8', newline='') as f:
+              text = f.read()
+          if 'mingw-w64-x86_64-diffutils' not in text:
+              print('Already fixed, nothing to do.')
+              sys.exit(0)
+          replaces = [
+              (r"'ThirdParty\\msys64\\mingw64\\bin'",
+                  r"'ThirdParty\\msys64\\ucrt64\\bin'"),
+              ('download/2025-08-30/msys2-base-x86_64-20250830.sfx.exe',
+                  'download/2026-09-27/msys2-base-x86_64-20260927.sfx.exe'),
+          ] + [
+              ('mingw-w64-x86_64-' + name, 'mingw-w64-ucrt-x86_64-' + name)
+              for name in ['diffutils', 'gperf', 'nasm', 'perl', 'pkgconf']
+          ]
+          for was, now in replaces:
+              if text.count(was) != 1:
+                  print('::error::prepare.py changed, "%s" found %d times.'
+                      % (was, text.count(was)))
+                  sys.exit(1)
+              text = text.replace(was, now)
+          with open(path, 'w', encoding='utf-8', newline='') as f:
+              f.write(text)
+          print('Applied %d replaces.' % len(replaces))
+
+      - uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223 # master on 2026-10-01, the commit upstream win.yml runs
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Restore ThirdParty cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: oblivion-win64-third-party-v1-none
+          restore-keys: oblivion-win64-third-party-v1-
+          fail-on-cache-miss: true
+
+      - name: Restore Libraries cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-libs-v1-none
+          restore-keys: oblivion-win64-libs-v1-
+          fail-on-cache-miss: true
+
+      - name: Restore Qt cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: oblivion-win64-qt6-v1-none
+          restore-keys: oblivion-win64-qt6-v1-
+          fail-on-cache-miss: true
+
+      # Everything must be "SKIPPING" here except the tiny stages that the
+      # clean up removes completely (gas-preprocessor). If a real library
+      # starts to build, the caches were not restored: stop, do not rebuild.
+      - name: Libraries (check).
+        timeout-minutes: 45
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent qt6
+
+      - name: Oblivion build.
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat ^
+          x64 ^
+          qt6 ^
+          -D TDESKTOP_API_ID=2040 ^
+          -D TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627 ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem The file loggers collect every error of the run in one short
+          rem file: cl.exe goes on with the other files after an error.
+          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram --parallel -- /fl "/flp:logfile=%GITHUB_WORKSPACE%\msbuild-errors.log;errorsonly" /fl1 "/flp1:logfile=%GITHUB_WORKSPACE%\msbuild-warnings.log;warningsonly"
+
+      # All the compiler and linker errors of the run in one short list.
+      - name: Errors summary.
+        if: failure()
+        shell: bash
+        run: |
+          LOG="$(cygpath -u "$GITHUB_WORKSPACE")/msbuild-errors.log"
+          if [ -s "$LOG" ]; then
+            echo "Error lines: $(grep -c 'error' "$LOG" || true)"
+            sort -u "$LOG" | head -n 500
+          else
+            echo "No msbuild-errors.log, the failure is before or after the compilation."
+          fi
+
+      - name: Upload build logs.
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: msbuild-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Move artifact.
+        run: |
+          set OUT=%TBUILD%\%REPO_NAME%\out\%BUILD_CONFIG%
+          mkdir artifact
+          move %OUT%\Oblivion.exe artifact/
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          if exist %OUT%\modules xcopy /E /I /Y %OUT%\modules artifact\modules
+          certutil -hashfile artifact\Oblivion.exe SHA256
+
+      # A Debug exe is huge and is never given to anyone: not uploaded.
+      - uses: actions/upload-artifact@v7
+        name: Upload artifact.
+        if: env.BUILD_CONFIG == 'Release'
+        with:
+          name: Oblivion-win64-${{ env.BUILD_CONFIG }}
+          path: artifact\
+          if-no-files-found: error
+          retention-days: 7
+
+      # The exe is already uploaded, so the two steps below never fail the
+      # job. They start the built exe in the headless self-test mode of the
+      # mod (oblivion/oblivion_selftest.h): the only runtime check possible
+      # without a Windows machine. Look at the exit codes and the reports.
+      - name: Self-test.
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          OBLIVION_SELFTEST: all
+          OBLIVION_SELFTEST_OUT: ${{ runner.temp }}\oblivion-selftest\report.txt
+        run: |
+          chcp 65001 >nul
+          mkdir %RUNNER_TEMP%\oblivion-selftest\work
+          start "" /wait artifact\Oblivion.exe -workdir %RUNNER_TEMP%\oblivion-selftest\work
+          set CODE=%errorlevel%
+          if exist "%OBLIVION_SELFTEST_OUT%" type "%OBLIVION_SELFTEST_OUT%"
+          echo Self-test exit code: %CODE%
+          exit /b %CODE%
+
+      - name: Self-test (UI snapshots).
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          OBLIVION_SELFTEST: ui
+          OBLIVION_SELFTEST_OUT: ${{ runner.temp }}\oblivion-selftest\ui-report.txt
+          OBLIVION_SELFTEST_OUT_DIR: ${{ runner.temp }}\oblivion-selftest\ui
+        run: |
+          chcp 65001 >nul
+          mkdir %RUNNER_TEMP%\oblivion-selftest\ui
+          mkdir %RUNNER_TEMP%\oblivion-selftest\work-ui
+          start "" /wait artifact\Oblivion.exe -workdir %RUNNER_TEMP%\oblivion-selftest\work-ui
+          set CODE=%errorlevel%
+          if exist "%OBLIVION_SELFTEST_OUT%" type "%OBLIVION_SELFTEST_OUT%"
+          echo UI snapshots exit code: %CODE%
+          exit /b %CODE%
+
+      - name: Upload self-test results.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: selftest
+          path: |
+            ${{ runner.temp }}\oblivion-selftest\
+            !${{ runner.temp }}\oblivion-selftest\work\tdata\
+            !${{ runner.temp }}\oblivion-selftest\work-ui\tdata\
+          if-no-files-found: ignore
+          retention-days: 14
