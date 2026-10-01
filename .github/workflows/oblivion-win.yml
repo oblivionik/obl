@@ -59,16 +59,17 @@ jobs:
     steps:
       - name: Prepare directories.
         run: |
-          rem The libraries are built for Debug and Release, that needs
-          rem more than the ~30 GB free on C:, so D: is used when it exists.
-          rem The real path is a part of the prepare.py cache keys.
-          set "TROOT=%userprofile%\TBuild"
-          if exist D:\ set "TROOT=D:\TBuild"
+          rem A real folder inside the workspace (drive D: of the runner,
+          rem the one with the most free space), not a link as in win.yml:
+          rem actions/checkout binds the token of a private repository to
+          rem the real path of the clone, through a link the fetch gets no
+          rem credentials. The path is a part of the prepare.py cache keys,
+          rem it must be the same in both jobs.
+          set "TROOT=%GITHUB_WORKSPACE%\TBuild"
           echo Build root: %TROOT%
           mkdir %TROOT%\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %TROOT%
-          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
-          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+          echo TBUILD=%TROOT%>>%GITHUB_ENV%
+          echo LibrariesPath=%TROOT%\Libraries\win64>>%GITHUB_ENV%
 
       - name: Disk space before.
         shell: pwsh
@@ -288,13 +289,11 @@ jobs:
       - name: Prepare directories.
         run: |
           rem Must be the same as in the "deps" job.
-          set "TROOT=%userprofile%\TBuild"
-          if exist D:\ set "TROOT=D:\TBuild"
+          set "TROOT=%GITHUB_WORKSPACE%\TBuild"
           echo Build root: %TROOT%
           mkdir %TROOT%\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %TROOT%
-          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
-          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+          echo TBUILD=%TROOT%>>%GITHUB_ENV%
+          echo LibrariesPath=%TROOT%\Libraries\win64>>%GITHUB_ENV%
 
       - name: Get repository name.
         shell: bash
