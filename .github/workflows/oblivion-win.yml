@@ -421,6 +421,25 @@ jobs:
         run: |
           %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent qt6
 
+      # Every two minutes: free memory and the biggest processes, to see
+      # what uses the memory up if the build fails with C1060 again.
+      - name: Memory monitor.
+        shell: pwsh
+        run: |
+          $code = @'
+          while ($true) {
+            $os = Get-CimInstance Win32_OperatingSystem
+            $top = Get-Process | Sort-Object PM -Descending | Select-Object -First 5 | ForEach-Object { "$($_.Name)=$([math]::Round($_.PM/1MB))" }
+            "$(Get-Date -Format HH:mm:ss) commitFreeMB=$([math]::Round($os.FreeVirtualMemory/1024)) ramFreeMB=$([math]::Round($os.FreePhysicalMemory/1024)) top: $($top -join ' ')" | Out-File -Append -Encoding utf8 "$env:GITHUB_WORKSPACE\memory.log"
+            Start-Sleep -Seconds 120
+          }
+          '@
+          $file = Join-Path $env:RUNNER_TEMP 'memory-monitor.ps1'
+          Set-Content -Path $file -Value $code -Encoding utf8
+          Start-Process pwsh -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $file -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          Get-Content "$env:GITHUB_WORKSPACE\memory.log" -ErrorAction SilentlyContinue
+
       - name: Oblivion build.
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
@@ -437,7 +456,30 @@ jobs:
 
           rem The file loggers collect every error of the run in one short
           rem file: cl.exe goes on with the other files after an error.
-          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram -- /fl "/flp:logfile=%GITHUB_WORKSPACE%\msbuild-errors.log;errorsonly" /fl1 "/flp1:logfile=%GITHUB_WORKSPACE%\msbuild-warnings.log;warningsonly"
+          rem
+          rem Up to three passes. On the 8 GB runner the Release build ran
+          rem for almost four hours and then the last heavy files failed
+          rem with C1060 "compiler is out of heap space": the long-lived
+          rem compiler processes had used up the memory. A new pass starts
+          rem new processes and compiles only what is still missing, the
+          rem third one compiles one file at a time.
+          set PASS=1
+          :pass
+          echo ===== Build pass %PASS% =====
+          set "EXTRA="
+          if "%PASS%"=="3" set "EXTRA=/p:CL_MPCount=1"
+          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram -- /nr:false %EXTRA% /fl "/flp:logfile=%GITHUB_WORKSPACE%\msbuild-errors-pass%PASS%.log;errorsonly" /fl1 "/flp1:logfile=%GITHUB_WORKSPACE%\msbuild-warnings-pass%PASS%.log;warningsonly"
+          set CODE=%errorlevel%
+          copy /Y "%GITHUB_WORKSPACE%\msbuild-errors-pass%PASS%.log" "%GITHUB_WORKSPACE%\msbuild-errors.log" >nul
+          if %CODE% equ 0 goto built
+          echo ===== Pass %PASS% failed with %CODE%, memory state =====
+          powershell -NoProfile -Command "$os = Get-CimInstance Win32_OperatingSystem; 'Commit free MB: ' + [math]::Round($os.FreeVirtualMemory/1024) + ' of ' + [math]::Round($os.TotalVirtualMemorySize/1024) + ', RAM free MB: ' + [math]::Round($os.FreePhysicalMemory/1024); Get-Process | Sort-Object PM -Descending | Select-Object -First 12 Name, Id, @{n='PrivateMB';e={[math]::Round($_.PM/1MB)}}, @{n='WorkingMB';e={[math]::Round($_.WS/1MB)}} | Format-Table -AutoSize"
+          type "%GITHUB_WORKSPACE%\msbuild-errors-pass%PASS%.log"
+          if "%PASS%"=="3" exit /b %CODE%
+          set /a PASS=%PASS%+1
+          goto pass
+          :built
+          echo ===== Built on pass %PASS% =====
 
       # All the compiler and linker errors of the run in one short list.
       - name: Errors summary.
@@ -453,11 +495,13 @@ jobs:
           fi
 
       - name: Upload build logs.
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: build-logs
-          path: msbuild-*.log
+          path: |
+            msbuild-*.log
+            memory.log
           if-no-files-found: ignore
           retention-days: 14
 
