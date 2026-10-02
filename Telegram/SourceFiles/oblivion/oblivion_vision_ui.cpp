@@ -53,6 +53,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtGui/QClipboard>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QPainterPath>
+#include <QtCore/QDir>
 
 namespace Oblivion {
 namespace {
@@ -527,7 +528,10 @@ void CutoutBox(not_null<Ui::GenericBox*> box, CutoutBoxArgs &&args) {
 				Photo::SaveFormat::Png);
 			crl::on_main([=] {
 				toast(written
-					? tr::lng_oblivion_saved_to(tr::now, lt_path, path)
+					? tr::lng_oblivion_saved_to(
+						tr::now,
+						lt_path,
+						QDir::toNativeSeparators(path))
 					: tr::lng_oblivion_photo_io_save_failed(tr::now));
 			});
 		});

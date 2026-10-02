@@ -1621,7 +1621,7 @@ void SaveAsset(
 					show->showToast(tr::lng_oblivion_saved_to(
 						tr::now,
 						lt_path,
-						target));
+						QDir::toNativeSeparators(target)));
 				} else {
 					show->showToast(tr::lng_oblivion_write_failed(tr::now));
 				}

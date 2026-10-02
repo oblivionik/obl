@@ -22,6 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "ui/layers/show.h"
 
+#include <QtCore/QDir>
+
 namespace Oblivion {
 
 void ShowVisualGiftInChat(
@@ -84,7 +86,10 @@ void SaveGiftAttribute(
 	if (target.open(QIODevice::WriteOnly)) {
 		target.write(media->bytes());
 		target.close();
-		show->showToast(tr::lng_oblivion_saved_to(tr::now, lt_path, path));
+		show->showToast(tr::lng_oblivion_saved_to(
+			tr::now,
+			lt_path,
+			QDir::toNativeSeparators(path)));
 	} else {
 		show->showToast(tr::lng_oblivion_write_failed(tr::now));
 	}

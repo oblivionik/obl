@@ -16,9 +16,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 // a separate empty -workdir (it is refused without one):
 //
 // mkdir -p /private/tmp/claude-501/oblivion-snap-wd
-// OBLIVION_SELFTEST=ui \
-// OBLIVION_SELFTEST_OUT_DIR=/private/tmp/claude-501/oblivion-snap \
-//   out/Release/Oblivion.app/Contents/MacOS/Oblivion \
+// OBLIVION_SELFTEST=ui
+//   OBLIVION_SELFTEST_OUT_DIR=/private/tmp/claude-501/oblivion-snap
+//   out/Release/Oblivion.app/Contents/MacOS/Oblivion
 //   -workdir /private/tmp/claude-501/oblivion-snap-wd
 //
 // Optional environment:
