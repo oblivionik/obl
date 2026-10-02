@@ -295,6 +295,24 @@ jobs:
           echo TBUILD=%TROOT%>>%GITHUB_ENV%
           echo LibrariesPath=%TROOT%\Libraries\win64>>%GITHUB_ENV%
 
+      # The runner of a private repository has little memory: the first
+      # build was killed with "Out of memory" after 83 minutes. A big page
+      # file on D: and one project at a time (see "Oblivion build.").
+      - name: Bigger page file.
+        uses: al-cheb/configure-pagefile-action@9b6da52fb72a3c6147c1aad2df22d8d905681adc # v1.5
+        with:
+          minimum-size: 24GB
+          maximum-size: 24GB
+          disk-root: "D:"
+
+      - name: Machine.
+        shell: pwsh
+        run: |
+          $cs = Get-CimInstance Win32_ComputerSystem
+          "Logical processors: $($cs.NumberOfLogicalProcessors), memory: $([math]::Round($cs.TotalPhysicalMemory/1GB,1)) GB"
+          Get-CimInstance Win32_PageFileUsage | Select-Object Name, AllocatedBaseSize, CurrentUsage | Format-Table -AutoSize
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
       - name: Get repository name.
         shell: bash
         run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
@@ -419,7 +437,7 @@ jobs:
 
           rem The file loggers collect every error of the run in one short
           rem file: cl.exe goes on with the other files after an error.
-          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram --parallel -- /fl "/flp:logfile=%GITHUB_WORKSPACE%\msbuild-errors.log;errorsonly" /fl1 "/flp1:logfile=%GITHUB_WORKSPACE%\msbuild-warnings.log;warningsonly"
+          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram -- /fl "/flp:logfile=%GITHUB_WORKSPACE%\msbuild-errors.log;errorsonly" /fl1 "/flp1:logfile=%GITHUB_WORKSPACE%\msbuild-warnings.log;warningsonly"
 
       # All the compiler and linker errors of the run in one short list.
       - name: Errors summary.
