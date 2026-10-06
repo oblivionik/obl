@@ -55,10 +55,23 @@ class SessionController;
 //  - the media viewer menu of a photo or an image file;
 //  - Settings > Oblivion > Tools > Photo editor: open a file, paste from
 //    the clipboard or drop an image.
+//
+// An editor (or the result box after it) that is closed not by the user,
+// with all the layers of its window (the passcode lock, a switch to
+// another account, a chat opened from a notification), keeps the edit
+// with its layers in the memory. A toast tells about it (after the
+// passcode is entered), and the next time the editor is opened from any
+// of the entry points the user is asked whether to continue that edit or
+// to start the new one. It is dropped when its account is logged out.
 namespace Oblivion {
 
 // Settings > Oblivion > Tools.
 void ShowPhotoEditorImport(not_null<Window::SessionController*> controller);
+
+// Settings > Oblivion > Tools > Photo collage: asks for several photos
+// and opens the editor with a collage of them (the collage tool is
+// chosen). "Done" shows the same result box as for a photo.
+void ShowPhotoCollage(not_null<Window::SessionController*> controller);
 
 // Opens a ready image (from a file, the clipboard, etc.).
 // name is the suggested file name for "Save as" without an extension,
@@ -122,6 +135,13 @@ void AddPhotoEditorAction(
 // the box list (if it is still there) and refresh the previews.
 void AddAttachPhotoEditorAction(
 	not_null<Ui::PopupMenu*> menu,
+	std::shared_ptr<ChatHelpers::Show> show,
+	not_null<QWidget*> box,
+	const Ui::PreparedFile &file,
+	Fn<void(Fn<void(Ui::PreparedFile&)> apply)> replace);
+// The same without a menu, for a button: opens the editor right away.
+// False (and nothing happens) if the file is not a static image.
+bool OpenAttachPhotoEditor(
 	std::shared_ptr<ChatHelpers::Show> show,
 	not_null<QWidget*> box,
 	const Ui::PreparedFile &file,

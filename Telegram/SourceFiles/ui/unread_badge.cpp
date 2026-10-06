@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/stickers/data_custom_emoji.h"
 #include "main/main_session.h"
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_badge.h"
 #include "ui/painter.h"
 #include "ui/rect.h"
 #include "ui/power_saving.h"
@@ -234,7 +235,32 @@ PeerBadge::PeerBadge() = default;
 
 PeerBadge::~PeerBadge() = default;
 
+// Oblivion: the mark of an Oblivion user goes after the upstream badges,
+// which are painted as before in a place made narrower by its width.
 int PeerBadge::drawGetWidth(Painter &p, Descriptor &&descriptor) {
+	const auto peer = descriptor.peer;
+	const auto full = descriptor.rectForName;
+	const auto mark = descriptor.premiumFg
+		? Oblivion::Badge::WidthFor(peer, full.width())
+		: 0;
+	if (!mark) {
+		return drawGetWidthUpstream(p, std::move(descriptor));
+	}
+	const auto nameWidth = descriptor.nameWidth;
+	const auto outerWidth = descriptor.outerWidth;
+	const auto color = (*descriptor.premiumFg)->c;
+	descriptor.rectForName.setWidth(full.width() - mark);
+	const auto upstream = drawGetWidthUpstream(p, std::move(descriptor));
+	return upstream + Oblivion::Badge::PaintAfterName(
+		p,
+		peer,
+		full,
+		nameWidth + upstream,
+		outerWidth,
+		color);
+}
+
+int PeerBadge::drawGetWidthUpstream(Painter &p, Descriptor &&descriptor) {
 	Expects(descriptor.customEmojiRepaint != nullptr);
 
 	const auto peer = descriptor.peer;

@@ -782,7 +782,7 @@ const LangOverride kTools[] = {
 	{ "lng_oblivion_photo_param_grain", "Зерно" },
 	{ "lng_oblivion_photo_param_threshold", "Порог" },
 	{ "lng_oblivion_photo_param_color1", "Цвет теней" },
-	{ "lng_oblivion_photo_param_color2", "Цвет светов" },
+	{ "lng_oblivion_photo_param_color2", "Цвет светлых участков" },
 	// Tools: photo editor UI.
 	{ "lng_oblivion_photo_ui_title", "Фоторедактор" },
 	{ "lng_oblivion_photo_ui_done", "Готово" },
@@ -1121,10 +1121,6 @@ const LangOverride kTools[] = {
 	{
 		"lng_oblivion_lottie_issue_marker",
 		"Нет отметки стикера Telegram.",
-	},
-	{
-		"lng_oblivion_lottie_issue_masks",
-		"Использует маски — они замедляют стикер.",
 	},
 	{
 		"lng_oblivion_lottie_issue_effects",
@@ -2213,6 +2209,2296 @@ const LangOverride kExtras[] = {
 	{ "lng_oblivion_unified_empty", "Чатов пока нет" },
 };
 
+// Each round 4 feature appends its rows after its own marker comment,
+// the markers are the same as in lang.strings.
+const LangOverride kRound4[] = {
+	// Oblivion round 4: photo layers.
+	{ "lng_oblivion_photo_layers_title", "Слои" },
+	{ "lng_oblivion_photo_layers_add", "Добавить слой" },
+	{ "lng_oblivion_photo_layers_more", "Действия со слоем" },
+	{ "lng_oblivion_photo_layers_empty", "Слоёв пока нет." },
+	{ "lng_oblivion_photo_layers_paste", "Вставить из буфера обмена" },
+	{ "lng_oblivion_photo_layers_paste_empty", "В буфере обмена нет изображения." },
+	{ "lng_oblivion_photo_layers_rename", "Переименовать" },
+	{ "lng_oblivion_photo_layers_duplicate", "Дублировать" },
+	{ "lng_oblivion_photo_layers_show", "Показать слой" },
+	{ "lng_oblivion_photo_layers_hide", "Скрыть слой" },
+	{ "lng_oblivion_photo_layers_lock", "Заблокировать слой" },
+	{ "lng_oblivion_photo_layers_unlock", "Разблокировать слой" },
+	{ "lng_oblivion_photo_layers_locked", "Слой заблокирован. Сначала разблокируйте его в списке слоёв." },
+	{ "lng_oblivion_photo_layers_hidden", "Слой скрыт. Сначала включите его в списке слоёв." },
+	{ "lng_oblivion_photo_layers_blend_menu", "Режим наложения" },
+	{ "lng_oblivion_photo_layers_opacity_menu", "Непрозрачность" },
+	{ "lng_oblivion_photo_layers_percent", "{value}%" },
+	{ "lng_oblivion_photo_layers_blend_info", "{name}, {percent}" },
+	{ "lng_oblivion_photo_layers_move_up", "Поднять выше" },
+	{ "lng_oblivion_photo_layers_move_down", "Опустить ниже" },
+	{ "lng_oblivion_photo_layers_merge_down", "Объединить с нижним" },
+	{ "lng_oblivion_photo_layers_flatten", "Свести все слои" },
+	{ "lng_oblivion_photo_layers_merging", "Объединяем слои…" },
+	{ "lng_oblivion_photo_layers_flattening", "Сводим слои…" },
+	{ "lng_oblivion_photo_layers_delete", "Удалить слой" },
+	{ "lng_oblivion_photo_layers_delete_last", "Единственный слой удалить нельзя." },
+	{ "lng_oblivion_photo_layers_transform", "Переместить и изменить размер" },
+	{ "lng_oblivion_photo_layers_mask_add", "Добавить маску" },
+	{ "lng_oblivion_photo_layers_mask_paint", "Рисовать по маске" },
+	{ "lng_oblivion_photo_layers_mask_invert", "Инвертировать маску" },
+	{ "lng_oblivion_photo_layers_mask_disable", "Отключить маску" },
+	{ "lng_oblivion_photo_layers_mask_enable", "Включить маску" },
+	{ "lng_oblivion_photo_layers_mask_remove", "Удалить маску" },
+	{ "lng_oblivion_photo_layers_tool_transform", "Перемещение, размер и поворот слоя" },
+	{ "lng_oblivion_photo_layers_tool_mask", "Маска слоя" },
+	{ "lng_oblivion_photo_layers_tf_mode_free", "Размер и поворот" },
+	{ "lng_oblivion_photo_layers_tf_mode_perspective", "Перспектива" },
+	{
+		"lng_oblivion_photo_layers_tf_hint",
+		"Перетаскивайте слой, чтобы двигать его. Квадраты на рамке "
+		"меняют размер, круглая ручка поворачивает. Shift "
+		"переключает сохранение пропорций, {shortcut} с углом свободно "
+		"искажает слой.",
+	},
+	{
+		"lng_oblivion_photo_layers_tf_hint_perspective",
+		"Перетаскивайте углы, чтобы задать перспективу. Сам слой можно "
+		"двигать как обычно.",
+	},
+	{ "lng_oblivion_photo_layers_tf_section", "Положение и размер" },
+	{ "lng_oblivion_photo_layers_tf_reset", "Сбросить" },
+	{ "lng_oblivion_photo_layers_tf_x", "Сдвиг по горизонтали" },
+	{ "lng_oblivion_photo_layers_tf_y", "Сдвиг по вертикали" },
+	{ "lng_oblivion_photo_layers_tf_width", "Ширина" },
+	{ "lng_oblivion_photo_layers_tf_height", "Высота" },
+	{ "lng_oblivion_photo_layers_tf_rotation", "Поворот" },
+	{ "lng_oblivion_photo_layers_tf_skew", "Наклон" },
+	{
+		"lng_oblivion_photo_layers_tf_perspective_note",
+		"Слой искажён перспективой, поэтому задать его положение и "
+		"размер числами нельзя. Нажмите «Сбросить», чтобы убрать "
+		"перспективу.",
+	},
+	{ "lng_oblivion_photo_layers_tf_no_layer", "Выберите слой, чтобы перемещать его и менять размер." },
+	{ "lng_oblivion_photo_layers_tf_keep_aspect", "Сохранять пропорции" },
+	{ "lng_oblivion_photo_layers_tf_snap", "Привязка к краям и центру" },
+	{ "lng_oblivion_photo_layers_tf_actions", "Быстрые действия" },
+	{ "lng_oblivion_photo_layers_tf_flip_h", "Отразить по горизонтали" },
+	{ "lng_oblivion_photo_layers_tf_flip_v", "Отразить по вертикали" },
+	{ "lng_oblivion_photo_layers_tf_rotate_left", "Повернуть влево" },
+	{ "lng_oblivion_photo_layers_tf_rotate_right", "Повернуть вправо" },
+	{ "lng_oblivion_photo_layers_tf_fit", "Вписать в холст" },
+	{ "lng_oblivion_photo_layers_tf_fill", "Заполнить холст" },
+	{ "lng_oblivion_photo_layers_tf_center", "По центру" },
+	{ "lng_oblivion_photo_layers_mask_mode_hide", "Скрывать" },
+	{ "lng_oblivion_photo_layers_mask_mode_show", "Возвращать" },
+	{
+		"lng_oblivion_photo_layers_mask_hint",
+		"Проведите по фото, чтобы скрыть часть слоя. Переключитесь на "
+		"«Возвращать», чтобы вернуть скрытое.",
+	},
+	{ "lng_oblivion_photo_layers_mask_none", "У этого слоя пока нет маски. Она появится с первым мазком." },
+	{
+		"lng_oblivion_photo_layers_mask_reveal_none",
+		"На этом слое пока ничего не скрыто. Переключитесь на "
+		"«Скрывать», чтобы рисовать маску.",
+	},
+	{ "lng_oblivion_photo_layers_mask_no_layer", "Выберите слой, чтобы рисовать его маску." },
+	{ "lng_oblivion_photo_layers_mask_size", "Размер кисти" },
+	{ "lng_oblivion_photo_layers_mask_hardness", "Жёсткость" },
+	{ "lng_oblivion_photo_layers_mask_strength", "Сила" },
+	{ "lng_oblivion_photo_layers_mask_overlay", "Подсвечивать скрытое" },
+	{ "lng_oblivion_photo_layers_mask_enabled", "Маска включена" },
+	{ "lng_oblivion_photo_layers_mask_actions", "Маска" },
+	{ "lng_oblivion_photo_layers_mask_show_all", "Показать всё" },
+	{ "lng_oblivion_photo_layers_mask_hide_all", "Скрыть всё" },
+	// Oblivion round 4: photo adjust.
+	{ "lng_oblivion_photo_adj_light", "Экспозиция и тон" },
+	{ "lng_oblivion_photo_adj_curve", "Кривые" },
+	{ "lng_oblivion_photo_adj_color", "Цвет и баланс белого" },
+	{ "lng_oblivion_photo_adj_hsl", "Цвета по диапазонам (HSL)" },
+	{ "lng_oblivion_photo_adj_grading", "Цветокоррекция по тонам" },
+	{ "lng_oblivion_photo_adj_bw", "Чёрно-белый микс" },
+	{ "lng_oblivion_photo_adj_presence", "Текстура, чёткость, дымка" },
+	{ "lng_oblivion_photo_adj_sharpen", "Резкость" },
+	{ "lng_oblivion_photo_adj_denoise", "Шумоподавление" },
+	{ "lng_oblivion_photo_adj_vignette", "Виньетка" },
+	{ "lng_oblivion_photo_adj_grain", "Зерно" },
+	{ "lng_oblivion_photo_adj_exposure", "Экспозиция" },
+	{ "lng_oblivion_photo_adj_contrast", "Контраст" },
+	{ "lng_oblivion_photo_adj_highlights", "Света" },
+	{ "lng_oblivion_photo_adj_shadows", "Тени" },
+	{ "lng_oblivion_photo_adj_whites", "Белые" },
+	{ "lng_oblivion_photo_adj_blacks", "Чёрные" },
+	{ "lng_oblivion_photo_adj_temperature", "Температура" },
+	{ "lng_oblivion_photo_adj_tint", "Оттенок" },
+	{ "lng_oblivion_photo_adj_vibrance", "Красочность" },
+	{ "lng_oblivion_photo_adj_saturation", "Насыщенность" },
+	{ "lng_oblivion_photo_adj_hue", "Цветовой тон" },
+	{ "lng_oblivion_photo_adj_luminance", "Яркость" },
+	{ "lng_oblivion_photo_adj_texture", "Текстура" },
+	{ "lng_oblivion_photo_adj_clarity", "Чёткость" },
+	{ "lng_oblivion_photo_adj_dehaze", "Удаление дымки" },
+	{ "lng_oblivion_photo_adj_amount", "Сила" },
+	{ "lng_oblivion_photo_adj_vignette_amount", "Яркость краёв" },
+	{ "lng_oblivion_photo_adj_radius", "Радиус" },
+	{ "lng_oblivion_photo_adj_masking", "Маскирование" },
+	{ "lng_oblivion_photo_adj_noise_luminance", "Яркостный шум" },
+	{ "lng_oblivion_photo_adj_noise_color", "Цветовой шум" },
+	{ "lng_oblivion_photo_adj_midpoint", "Средняя точка" },
+	{ "lng_oblivion_photo_adj_roundness", "Округлость" },
+	{ "lng_oblivion_photo_adj_feather", "Растушёвка" },
+	{ "lng_oblivion_photo_adj_size", "Размер" },
+	{ "lng_oblivion_photo_adj_roughness", "Неровность" },
+	{ "lng_oblivion_photo_adj_midtones", "Средние тона" },
+	{ "lng_oblivion_photo_adj_shadows_lum", "Яркость теней" },
+	{ "lng_oblivion_photo_adj_midtones_lum", "Яркость средних тонов" },
+	{ "lng_oblivion_photo_adj_highlights_lum", "Яркость светов" },
+	{ "lng_oblivion_photo_adj_blending", "Смешение" },
+	{ "lng_oblivion_photo_adj_balance", "Баланс" },
+	{ "lng_oblivion_photo_adj_red", "Красный" },
+	{ "lng_oblivion_photo_adj_orange", "Оранжевый" },
+	{ "lng_oblivion_photo_adj_yellow", "Жёлтый" },
+	{ "lng_oblivion_photo_adj_green", "Зелёный" },
+	{ "lng_oblivion_photo_adj_aqua", "Голубой" },
+	{ "lng_oblivion_photo_adj_blue", "Синий" },
+	{ "lng_oblivion_photo_adj_purple", "Фиолетовый" },
+	{ "lng_oblivion_photo_adj_magenta", "Пурпурный" },
+	{ "lng_oblivion_photo_adj_curve_all", "Общая кривая" },
+	{ "lng_oblivion_photo_adj_reset", "Сбросить" },
+	{ "lng_oblivion_photo_adj_curve_point", "Вход {input} → выход {output}" },
+	{
+		"lng_oblivion_photo_adj_curve_hint",
+		"Нажмите на кривую, чтобы добавить точку, и перетащите её. "
+		"Двойной щелчок по точке удаляет её.",
+	},
+	{ "lng_oblivion_photo_adj_wheel_value", "{hue}° · {saturation}%" },
+	{ "lng_oblivion_photo_adj_wheel_none", "Без оттенка" },
+	{
+		"lng_oblivion_photo_adj_wheel_hint",
+		"Перетащите точку в круге, чтобы выбрать оттенок. "
+		"Двойной щелчок сбрасывает его.",
+	},
+	// Oblivion round 4: photo blur and distort.
+	{ "lng_oblivion_photo_blur_gaussian", "Размытие по Гауссу" },
+	{ "lng_oblivion_photo_blur_box", "Размытие по рамке" },
+	{ "lng_oblivion_photo_blur_motion", "Размытие в движении" },
+	{ "lng_oblivion_photo_blur_spin", "Размытие вращением" },
+	{ "lng_oblivion_photo_blur_zoom", "Размытие приближением" },
+	{ "lng_oblivion_photo_blur_tilt", "Тилт-шифт" },
+	{ "lng_oblivion_photo_blur_lens", "Размытие объектива (боке)" },
+	{ "lng_oblivion_photo_blur_surface", "Размытие по поверхности" },
+	{ "lng_oblivion_photo_blur_radius", "Радиус" },
+	{ "lng_oblivion_photo_blur_angle", "Угол" },
+	{ "lng_oblivion_photo_blur_distance", "Длина смаза" },
+	{ "lng_oblivion_photo_blur_center", "Центр" },
+	{ "lng_oblivion_photo_blur_spin_angle", "Угол поворота" },
+	{ "lng_oblivion_photo_blur_amount", "Сила" },
+	{ "lng_oblivion_photo_blur_tilt_center", "Центр резкой полосы" },
+	{ "lng_oblivion_photo_blur_tilt_width", "Ширина резкой полосы" },
+	{ "lng_oblivion_photo_blur_tilt_falloff", "Плавность перехода" },
+	{ "lng_oblivion_photo_blur_lens_shape", "Форма бликов" },
+	{ "lng_oblivion_photo_blur_lens_disc", "Круг" },
+	{ "lng_oblivion_photo_blur_lens_pentagon", "Пятиугольник" },
+	{ "lng_oblivion_photo_blur_lens_hexagon", "Шестиугольник" },
+	{ "lng_oblivion_photo_blur_lens_octagon", "Восьмиугольник" },
+	{ "lng_oblivion_photo_blur_lens_rotation", "Поворот формы" },
+	{ "lng_oblivion_photo_blur_lens_highlights", "Яркость бликов" },
+	{ "lng_oblivion_photo_blur_lens_threshold", "Порог бликов" },
+	{ "lng_oblivion_photo_blur_surface_threshold", "Порог" },
+	{ "lng_oblivion_photo_blur_region", "Область" },
+	{ "lng_oblivion_photo_blur_region_whole", "Весь слой" },
+	{ "lng_oblivion_photo_blur_region_linear", "Линейный градиент" },
+	{ "lng_oblivion_photo_blur_region_radial", "Круговой градиент" },
+	{ "lng_oblivion_photo_blur_region_center", "Центр области" },
+	{ "lng_oblivion_photo_blur_region_angle", "Направление" },
+	{ "lng_oblivion_photo_blur_region_length", "Длина перехода" },
+	{ "lng_oblivion_photo_blur_region_radius", "Радиус резкой зоны" },
+	{ "lng_oblivion_photo_blur_region_feather", "Растушёвка" },
+	{ "lng_oblivion_photo_blur_region_invert", "Обратить область" },
+	{ "lng_oblivion_photo_distort_keystone", "Наклон перспективы" },
+	{ "lng_oblivion_photo_distort_corners", "Перспектива по углам" },
+	{ "lng_oblivion_photo_distort_skew", "Скос" },
+	{ "lng_oblivion_photo_distort_lens", "Дисторсия объектива" },
+	{ "lng_oblivion_photo_distort_bulge", "Выпуклость / вогнутость" },
+	{ "lng_oblivion_photo_distort_twirl", "Скручивание" },
+	{ "lng_oblivion_photo_distort_wave", "Волна" },
+	{ "lng_oblivion_photo_distort_ripple", "Рябь" },
+	{ "lng_oblivion_photo_distort_mesh", "Деформация сеткой" },
+	{ "lng_oblivion_photo_distort_vertical", "По вертикали" },
+	{ "lng_oblivion_photo_distort_horizontal", "По горизонтали" },
+	{ "lng_oblivion_photo_distort_zoom", "Масштаб" },
+	{ "lng_oblivion_photo_distort_lens_amount", "Бочка / подушка" },
+	{ "lng_oblivion_photo_distort_strength", "Сила" },
+	{ "lng_oblivion_photo_distort_radius", "Радиус" },
+	{ "lng_oblivion_photo_distort_center", "Центр" },
+	{ "lng_oblivion_photo_distort_angle", "Угол" },
+	{ "lng_oblivion_photo_distort_amplitude", "Амплитуда" },
+	{ "lng_oblivion_photo_distort_wavelength", "Длина волны" },
+	{ "lng_oblivion_photo_distort_direction", "Направление" },
+	{ "lng_oblivion_photo_distort_phase", "Сдвиг волны" },
+	{ "lng_oblivion_photo_distort_wave_shape", "Форма волны" },
+	{ "lng_oblivion_photo_distort_wave_sine", "Плавная" },
+	{ "lng_oblivion_photo_distort_wave_triangle", "Зигзаг" },
+	{ "lng_oblivion_photo_distort_decay", "Затухание" },
+	{ "lng_oblivion_photo_distort_edges", "Края" },
+	{ "lng_oblivion_photo_distort_edges_clear", "Прозрачные" },
+	{ "lng_oblivion_photo_distort_edges_stretch", "Растянутые" },
+	{ "lng_oblivion_photo_distort_edges_mirror", "Зеркальные" },
+	{ "lng_oblivion_photo_distort_mesh_grid", "Сетка" },
+	{ "lng_oblivion_photo_distort_edit", "Изменить на фото" },
+	{ "lng_oblivion_photo_distort_edit_done", "Готово" },
+	{ "lng_oblivion_photo_distort_reset", "Сбросить" },
+	{
+		"lng_oblivion_photo_distort_mesh_hint",
+		"Перетаскивайте узлы сетки на фото. "
+			"Когда закончите, нажмите «Готово» или Esc.",
+	},
+	{
+		"lng_oblivion_photo_distort_corners_hint",
+		"Перетаскивайте углы на фото. "
+			"Когда закончите, нажмите «Готово» или Esc.",
+	},
+	{ "lng_oblivion_photo_distort_locked", "Этот слой заблокирован." },
+	{
+		"lng_oblivion_photo_distort_switched_off",
+		"Включите эффект, чтобы изменить его на фото.",
+	},
+	// Oblivion round 4: photo lofi and glitch.
+	{ "lng_oblivion_photo_lofi_camera", "Старая цифровая камера" },
+	{ "lng_oblivion_photo_lofi_sensor", "Разрешение сенсора" },
+	{ "lng_oblivion_photo_lofi_jpeg", "Сжатие JPEG" },
+	{ "lng_oblivion_photo_lofi_noise", "Шум матрицы" },
+	{ "lng_oblivion_photo_lofi_aberration", "Хроматические аберрации" },
+	{ "lng_oblivion_photo_lofi_bloom", "Свечение и ореолы" },
+	{ "lng_oblivion_photo_lofi_flash", "Вспышка" },
+	{ "lng_oblivion_photo_lofi_cast", "Сбитый баланс белого" },
+	{ "lng_oblivion_photo_lofi_sharpen", "Избыточная резкость" },
+	{ "lng_oblivion_photo_lofi_stamp", "Дата на фото" },
+	{ "lng_oblivion_photo_lofi_depth", "Глубина цвета" },
+	{ "lng_oblivion_photo_lofi_scanlines", "Строки развёртки" },
+	{ "lng_oblivion_photo_lofi_vhs", "Кассета VHS" },
+	{ "lng_oblivion_photo_lofi_pixelate", "Пикселизация" },
+	{ "lng_oblivion_photo_lofi_posterize", "Постеризация" },
+	{ "lng_oblivion_photo_lofi_halftone", "Полутоновая печать" },
+	{ "lng_oblivion_photo_lofi_amount", "Сила" },
+	{ "lng_oblivion_photo_lofi_size", "Размер" },
+	{ "lng_oblivion_photo_lofi_radius", "Радиус" },
+	{ "lng_oblivion_photo_lofi_threshold", "Порог" },
+	{ "lng_oblivion_photo_lofi_center", "Центр" },
+	{ "lng_oblivion_photo_lofi_angle", "Угол" },
+	{ "lng_oblivion_photo_lofi_resolution", "Разрешение" },
+	{ "lng_oblivion_photo_lofi_downscale", "Уменьшение" },
+	{ "lng_oblivion_photo_lofi_downscale_smooth", "Плавное" },
+	{ "lng_oblivion_photo_lofi_downscale_rough", "Грубое" },
+	{ "lng_oblivion_photo_lofi_upscale", "Увеличение" },
+	{ "lng_oblivion_photo_lofi_upscale_smooth", "Плавное" },
+	{ "lng_oblivion_photo_lofi_upscale_pixels", "Пиксели" },
+	{ "lng_oblivion_photo_lofi_upscale_sharp", "Резкое" },
+	{ "lng_oblivion_photo_lofi_quality", "Качество" },
+	{ "lng_oblivion_photo_lofi_generations", "Сохранений" },
+	{ "lng_oblivion_photo_lofi_block", "Размер блоков" },
+	{ "lng_oblivion_photo_lofi_noise_luma", "Шум" },
+	{ "lng_oblivion_photo_lofi_noise_color", "Цветной шум" },
+	{ "lng_oblivion_photo_lofi_noise_grain", "Размер зерна" },
+	{ "lng_oblivion_photo_lofi_noise_hot", "Горячие пиксели" },
+	{ "lng_oblivion_photo_lofi_noise_banding", "Полосы" },
+	{ "lng_oblivion_photo_lofi_aberrations", "Аберрации" },
+	{ "lng_oblivion_photo_lofi_fringe", "Фиолетовая кайма" },
+	{ "lng_oblivion_photo_lofi_glow", "Свечение" },
+	{ "lng_oblivion_photo_lofi_halation", "Красный ореол" },
+	{ "lng_oblivion_photo_lofi_falloff", "Тёмные углы" },
+	{ "lng_oblivion_photo_lofi_temperature", "Температура" },
+	{ "lng_oblivion_photo_lofi_tint", "Оттенок" },
+	{ "lng_oblivion_photo_lofi_saturation", "Насыщенность" },
+	{ "lng_oblivion_photo_lofi_fade", "Выцветание" },
+	{ "lng_oblivion_photo_lofi_levels", "Уровней на канал" },
+	{ "lng_oblivion_photo_lofi_mono", "Чёрно-белое" },
+	{ "lng_oblivion_photo_lofi_dither", "Дизеринг" },
+	{ "lng_oblivion_photo_lofi_dither_none", "Нет" },
+	{ "lng_oblivion_photo_lofi_dither_ordered", "Упорядоченный" },
+	{ "lng_oblivion_photo_lofi_dither_bayer2", "Упорядоченный 2×2" },
+	{ "lng_oblivion_photo_lofi_dither_bayer4", "Упорядоченный 4×4" },
+	{ "lng_oblivion_photo_lofi_dither_bayer8", "Упорядоченный 8×8" },
+	{ "lng_oblivion_photo_lofi_dither_fs", "Флойд — Стейнберг" },
+	{ "lng_oblivion_photo_lofi_dither_atkinson", "Аткинсон" },
+	{ "lng_oblivion_photo_lofi_dot", "Размер точки" },
+	{ "lng_oblivion_photo_lofi_depth_full", "Без изменений" },
+	{ "lng_oblivion_photo_lofi_depth_16", "16 бит" },
+	{ "lng_oblivion_photo_lofi_depth_12", "12 бит" },
+	{ "lng_oblivion_photo_lofi_depth_256", "256 цветов" },
+	{ "lng_oblivion_photo_lofi_depth_64", "64 цвета" },
+	{ "lng_oblivion_photo_lofi_depth_8", "8 цветов" },
+	{ "lng_oblivion_photo_lofi_depth_gray", "4 оттенка серого" },
+	{ "lng_oblivion_photo_lofi_depth_bw", "Чёрно-белое, 1 бит" },
+	{ "lng_oblivion_photo_lofi_pitch", "Шаг строк" },
+	{ "lng_oblivion_photo_lofi_comb", "Чересстрочный сдвиг" },
+	{ "lng_oblivion_photo_lofi_vhs_bleed", "Растекание цвета" },
+	{ "lng_oblivion_photo_lofi_vhs_soft", "Мягкость" },
+	{ "lng_oblivion_photo_lofi_vhs_tracking", "Полосы трекинга" },
+	{ "lng_oblivion_photo_lofi_vhs_noise", "Шум" },
+	{ "lng_oblivion_photo_lofi_vhs_wobble", "Дрожание" },
+	{ "lng_oblivion_photo_lofi_shape", "Форма" },
+	{ "lng_oblivion_photo_lofi_shape_squares", "Квадраты" },
+	{ "lng_oblivion_photo_lofi_shape_dots", "Точки" },
+	{ "lng_oblivion_photo_lofi_shape_lcd", "ЖК-экран" },
+	{ "lng_oblivion_photo_lofi_mode", "Режим" },
+	{ "lng_oblivion_photo_lofi_mode_ink", "Одна краска" },
+	{ "lng_oblivion_photo_lofi_mode_color", "Цветной" },
+	{ "lng_oblivion_photo_lofi_ink", "Краска" },
+	{ "lng_oblivion_photo_lofi_paper", "Бумага" },
+	{ "lng_oblivion_photo_lofi_stamp_text", "Текст" },
+	{ "lng_oblivion_photo_lofi_stamp_font", "Шрифт" },
+	{ "lng_oblivion_photo_lofi_stamp_font_segments", "Цифры камеры" },
+	{ "lng_oblivion_photo_lofi_stamp_font_pixel", "Пиксели" },
+	{ "lng_oblivion_photo_lofi_stamp_font_bold", "Жирные пиксели" },
+	{ "lng_oblivion_photo_lofi_stamp_font_camcorder", "Видеокамера" },
+	{ "lng_oblivion_photo_lofi_stamp_color", "Цвет" },
+	{ "lng_oblivion_photo_lofi_stamp_corner", "Расположение" },
+	{ "lng_oblivion_photo_lofi_stamp_corner_br", "Справа внизу" },
+	{ "lng_oblivion_photo_lofi_stamp_corner_bl", "Слева внизу" },
+	{ "lng_oblivion_photo_lofi_stamp_corner_tr", "Справа вверху" },
+	{ "lng_oblivion_photo_lofi_stamp_corner_tl", "Слева вверху" },
+	{ "lng_oblivion_photo_lofi_stamp_glow", "Свечение" },
+	{ "lng_oblivion_photo_lofi_stamp_margin", "Отступ" },
+	{ "lng_oblivion_photo_lofi_stamp_today", "Сегодня" },
+	{ "lng_oblivion_photo_lofi_stamp_now", "Сейчас" },
+	{ "lng_oblivion_photo_lofi_stamp_classic", "Плёнка" },
+	{ "lng_oblivion_photo_lofi_stamp_hint", "Дата или текст" },
+	{ "lng_oblivion_photo_lofi_sec_sensor", "Сенсор" },
+	{ "lng_oblivion_photo_lofi_sec_optics", "Оптика" },
+	{ "lng_oblivion_photo_lofi_sec_light", "Свет и цвет" },
+	{ "lng_oblivion_photo_lofi_sec_noise", "Шум матрицы" },
+	{ "lng_oblivion_photo_lofi_sec_processing", "Обработка" },
+	{ "lng_oblivion_photo_lofi_sec_jpeg", "JPEG" },
+	{ "lng_oblivion_photo_lofi_sec_stamp", "Дата" },
+	{ "lng_oblivion_photo_lofi_preset_phone", "Старый телефон 2005" },
+	{ "lng_oblivion_photo_lofi_preset_ccd", "CCD-мыльница 2008" },
+	{ "lng_oblivion_photo_lofi_preset_webcam", "Веб-камера" },
+	{ "lng_oblivion_photo_lofi_preset_mms", "MMS 176×144" },
+	{ "lng_oblivion_photo_lofi_preset_flash", "Вспышка в упор 2003" },
+	{ "lng_oblivion_photo_lofi_preset_pocket", "Карманная пиксель-камера" },
+	{ "lng_oblivion_photo_lofi_preset_cctv", "Камера наблюдения" },
+	{ "lng_oblivion_photo_lofi_preset_vhs", "Домашняя видеокассета" },
+	{ "lng_oblivion_photo_glitch_rgb", "Сдвиг каналов RGB" },
+	{ "lng_oblivion_photo_glitch_slices", "Сдвиг полос" },
+	{ "lng_oblivion_photo_glitch_blocks", "Битые блоки" },
+	{ "lng_oblivion_photo_glitch_sort", "Сортировка пикселей" },
+	{ "lng_oblivion_photo_glitch_smear", "Размазывание" },
+	{ "lng_oblivion_photo_glitch_mosh", "Датамош" },
+	{ "lng_oblivion_photo_glitch_jitter", "Дрожание строк" },
+	{ "lng_oblivion_photo_glitch_wave", "Волна" },
+	{ "lng_oblivion_photo_glitch_bands", "Полосы помех" },
+	{ "lng_oblivion_photo_glitch_crush", "Потеря битов" },
+	{ "lng_oblivion_photo_glitch_bend", "Битый JPEG" },
+	{ "lng_oblivion_photo_glitch_amount", "Сила" },
+	{ "lng_oblivion_photo_glitch_count", "Количество" },
+	{ "lng_oblivion_photo_glitch_size", "Размер" },
+	{ "lng_oblivion_photo_glitch_length", "Длина" },
+	{ "lng_oblivion_photo_glitch_amplitude", "Амплитуда" },
+	{ "lng_oblivion_photo_glitch_direction", "Направление" },
+	{ "lng_oblivion_photo_glitch_dir_right", "Вправо" },
+	{ "lng_oblivion_photo_glitch_dir_left", "Влево" },
+	{ "lng_oblivion_photo_glitch_dir_down", "Вниз" },
+	{ "lng_oblivion_photo_glitch_dir_up", "Вверх" },
+	{ "lng_oblivion_photo_glitch_axis_horizontal", "По горизонтали" },
+	{ "lng_oblivion_photo_glitch_axis_vertical", "По вертикали" },
+	{ "lng_oblivion_photo_glitch_red", "Красный" },
+	{ "lng_oblivion_photo_glitch_green", "Зелёный" },
+	{ "lng_oblivion_photo_glitch_blue", "Синий" },
+	{ "lng_oblivion_photo_glitch_shift_x", "По горизонтали" },
+	{ "lng_oblivion_photo_glitch_shift_y", "По вертикали" },
+	{ "lng_oblivion_photo_glitch_chaos", "Случайность" },
+	{ "lng_oblivion_photo_glitch_wrap", "Перенос через край" },
+	{ "lng_oblivion_photo_glitch_split", "Расслоение цвета" },
+	{ "lng_oblivion_photo_glitch_mode", "Режим" },
+	{ "lng_oblivion_photo_glitch_mode_mix", "Смесь" },
+	{ "lng_oblivion_photo_glitch_mode_move", "Сдвиг" },
+	{ "lng_oblivion_photo_glitch_mode_channels", "Каналы" },
+	{ "lng_oblivion_photo_glitch_mode_invert", "Инверсия" },
+	{ "lng_oblivion_photo_glitch_mode_noise", "Шум" },
+	{ "lng_oblivion_photo_glitch_mode_stretch", "Растяжение" },
+	{ "lng_oblivion_photo_glitch_grid", "Сетка" },
+	{ "lng_oblivion_photo_glitch_low", "Нижний порог" },
+	{ "lng_oblivion_photo_glitch_high", "Верхний порог" },
+	{ "lng_oblivion_photo_glitch_key", "Сортировать по" },
+	{ "lng_oblivion_photo_glitch_key_luma", "Яркости" },
+	{ "lng_oblivion_photo_glitch_key_hue", "Оттенку" },
+	{ "lng_oblivion_photo_glitch_key_saturation", "Насыщенности" },
+	{ "lng_oblivion_photo_glitch_fade", "Затухание" },
+	{ "lng_oblivion_photo_glitch_block", "Размер блока" },
+	{ "lng_oblivion_photo_glitch_distance", "Дальность" },
+	{ "lng_oblivion_photo_glitch_angle", "Угол" },
+	{ "lng_oblivion_photo_glitch_passes", "Проходы" },
+	{ "lng_oblivion_photo_glitch_density", "Плотность" },
+	{ "lng_oblivion_photo_glitch_line_height", "Высота строк" },
+	{ "lng_oblivion_photo_glitch_wavelength", "Длина волны" },
+	{ "lng_oblivion_photo_glitch_phase", "Фаза" },
+	{ "lng_oblivion_photo_glitch_shape", "Форма" },
+	{ "lng_oblivion_photo_glitch_shape_sine", "Синус" },
+	{ "lng_oblivion_photo_glitch_shape_triangle", "Треугольник" },
+	{ "lng_oblivion_photo_glitch_shape_steps", "Ступени" },
+	{ "lng_oblivion_photo_glitch_shape_noise", "Шум" },
+	{ "lng_oblivion_photo_glitch_kind", "Вид" },
+	{ "lng_oblivion_photo_glitch_kind_static", "Снег" },
+	{ "lng_oblivion_photo_glitch_kind_color", "Цветной снег" },
+	{ "lng_oblivion_photo_glitch_kind_dropouts", "Выпадения" },
+	{ "lng_oblivion_photo_glitch_band_height", "Высота полос" },
+	{ "lng_oblivion_photo_glitch_grain", "Зерно" },
+	{ "lng_oblivion_photo_glitch_shift", "Сдвиг" },
+	{ "lng_oblivion_photo_glitch_bits", "Биты" },
+	{ "lng_oblivion_photo_glitch_crush_cut", "Отсечение" },
+	{ "lng_oblivion_photo_glitch_crush_rotate", "Вращение" },
+	{ "lng_oblivion_photo_glitch_crush_xor", "XOR" },
+	{ "lng_oblivion_photo_glitch_in_bands", "Полосами" },
+	{ "lng_oblivion_photo_glitch_breaks", "Повреждения" },
+	{ "lng_oblivion_photo_glitch_drift", "Искажение цвета" },
+	{ "lng_oblivion_photo_glitch_garbage", "Мусорные блоки" },
+	{ "lng_oblivion_photo_glitch_preset_signal", "Сигнал потерян" },
+	{ "lng_oblivion_photo_glitch_preset_file", "Битый файл" },
+	{ "lng_oblivion_photo_glitch_preset_mosh", "Плывущая картинка" },
+	{ "lng_oblivion_photo_glitch_preset_vapor", "Вейпорвейв" },
+	// Oblivion round 4: photo draw.
+	{ "lng_oblivion_photo_draw_pen", "Перо" },
+	{ "lng_oblivion_photo_draw_marker", "Маркер" },
+	{ "lng_oblivion_photo_draw_pencil", "Карандаш" },
+	{ "lng_oblivion_photo_draw_eraser", "Ластик" },
+	{ "lng_oblivion_photo_draw_line", "Линия" },
+	{ "lng_oblivion_photo_draw_arrow", "Стрелка" },
+	{ "lng_oblivion_photo_draw_rect", "Прямоугольник" },
+	{ "lng_oblivion_photo_draw_ellipse", "Эллипс" },
+	{ "lng_oblivion_photo_draw_text", "Текст" },
+	{ "lng_oblivion_photo_draw_layer", "Рисунок" },
+	{ "lng_oblivion_photo_draw_color", "Цвет" },
+	{ "lng_oblivion_photo_draw_recent", "Недавние цвета" },
+	{ "lng_oblivion_photo_draw_size", "Размер" },
+	{ "lng_oblivion_photo_draw_opacity", "Непрозрачность" },
+	{ "lng_oblivion_photo_draw_strength", "Сила" },
+	{ "lng_oblivion_photo_draw_smoothing", "Сглаживание" },
+	{ "lng_oblivion_photo_draw_dynamic", "Тоньше при быстром движении" },
+	{ "lng_oblivion_photo_draw_fill", "Заливка" },
+	{
+		"lng_oblivion_photo_draw_hint_freehand",
+		"Рисуйте прямо на фото. Штрихи ложатся на выбранный слой с рисунком; если выбран другой слой, для них создаётся новый. Клавиши [ и ] меняют размер.",
+	},
+	{
+		"lng_oblivion_photo_draw_hint_eraser",
+		"Ластик стирает только нарисованное на выбранном слое с рисунком, фото и текст он не трогает. Клавиши [ и ] меняют размер.",
+	},
+	{
+		"lng_oblivion_photo_draw_hint_line",
+		"Удерживайте Shift, чтобы линия шла строго горизонтально, вертикально или под углом 45°.",
+	},
+	{
+		"lng_oblivion_photo_draw_hint_rect",
+		"Удерживайте Shift, чтобы нарисовать квадрат, Alt — чтобы рисовать от центра.",
+	},
+	{
+		"lng_oblivion_photo_draw_hint_ellipse",
+		"Удерживайте Shift, чтобы нарисовать круг, Alt — чтобы рисовать от центра.",
+	},
+	{
+		"lng_oblivion_photo_draw_hint_text",
+		"Нажмите на фото, чтобы добавить текст. Готовую надпись можно перетащить, а чтобы изменить её — нажмите на неё.",
+	},
+	{
+		"lng_oblivion_photo_draw_locked",
+		"Этот слой заблокирован. Разблокируйте его или выберите другой слой.",
+	},
+	{
+		"lng_oblivion_photo_draw_eraser_no_layer",
+		"Сначала выберите слой с рисунком: ластик стирает только на нём.",
+	},
+	{
+		"lng_oblivion_photo_draw_too_many",
+		"На этом слое слишком много штрихов. Чтобы продолжить, добавьте новый слой с рисунком.",
+	},
+	{ "lng_oblivion_photo_draw_text_field", "Введите текст" },
+	{ "lng_oblivion_photo_draw_text_font", "Шрифт" },
+	{ "lng_oblivion_photo_draw_text_font_default", "Обычный" },
+	{ "lng_oblivion_photo_draw_text_font_serif", "С засечками" },
+	{ "lng_oblivion_photo_draw_text_font_mono", "Моноширинный" },
+	{ "lng_oblivion_photo_draw_text_weight", "Начертание" },
+	{ "lng_oblivion_photo_draw_text_weight_regular", "Обычное" },
+	{ "lng_oblivion_photo_draw_text_weight_bold", "Жирное" },
+	{ "lng_oblivion_photo_draw_text_align", "Выравнивание" },
+	{ "lng_oblivion_photo_draw_text_align_left", "По левому краю" },
+	{ "lng_oblivion_photo_draw_text_align_center", "По центру" },
+	{ "lng_oblivion_photo_draw_text_align_right", "По правому краю" },
+	{ "lng_oblivion_photo_draw_text_plate", "Фон под текстом" },
+	{ "lng_oblivion_photo_draw_text_plate_color", "Цвет фона" },
+	{ "lng_oblivion_photo_draw_text_plate_opacity", "Непрозрачность фона" },
+	// Oblivion round 4: photo collage.
+	{ "lng_oblivion_photo_collage_kind", "Коллаж" },
+	{
+		"lng_oblivion_photo_collage_create_about",
+		"Коллаж собирает несколько фото в сетку. Добавьте фото — те, "
+		"что уже открыты в редакторе, тоже попадут в коллаж.",
+	},
+	{ "lng_oblivion_photo_collage_add", "Добавить фото…" },
+	{ "lng_oblivion_photo_collage_from_layers", "Собрать из слоёв" },
+	{ "lng_oblivion_photo_collage_paste", "Вставить из буфера обмена" },
+	{ "lng_oblivion_photo_collage_paste_empty", "В буфере обмена нет изображения." },
+	{ "lng_oblivion_photo_collage_building", "Собираем коллаж…" },
+	{ "lng_oblivion_photo_collage_locked", "Слой с коллажем заблокирован." },
+	{ "lng_oblivion_photo_collage_templates#one", "Шаблоны для {count} фото" },
+	{ "lng_oblivion_photo_collage_templates#few", "Шаблоны для {count} фото" },
+	{ "lng_oblivion_photo_collage_templates#many", "Шаблоны для {count} фото" },
+	{ "lng_oblivion_photo_collage_templates#other", "Шаблоны для {count} фото" },
+	{ "lng_oblivion_photo_collage_grid", "Своя сетка" },
+	{ "lng_oblivion_photo_collage_rows", "Строки" },
+	{ "lng_oblivion_photo_collage_columns", "Столбцы" },
+	{ "lng_oblivion_photo_collage_look", "Оформление" },
+	{ "lng_oblivion_photo_collage_spacing", "Промежутки" },
+	{ "lng_oblivion_photo_collage_margin", "Поля по краям" },
+	{ "lng_oblivion_photo_collage_radius", "Скругление углов" },
+	{ "lng_oblivion_photo_collage_background", "Фон" },
+	{ "lng_oblivion_photo_collage_bg_none", "Прозрачный" },
+	{ "lng_oblivion_photo_collage_bg_color", "Цвет" },
+	{ "lng_oblivion_photo_collage_bg_gradient", "Градиент" },
+	{ "lng_oblivion_photo_collage_bg_blur", "Размытое фото" },
+	{ "lng_oblivion_photo_collage_color", "Цвет" },
+	{ "lng_oblivion_photo_collage_color2", "Второй цвет" },
+	{ "lng_oblivion_photo_collage_angle", "Направление" },
+	{ "lng_oblivion_photo_collage_blur_amount", "Размытие" },
+	{ "lng_oblivion_photo_collage_blur_dim", "Затемнение" },
+	{
+		"lng_oblivion_photo_collage_blur_photo",
+		"Сменить фото для фона ({index} из {total})",
+	},
+	{ "lng_oblivion_photo_collage_aspect", "Формат холста" },
+	{ "lng_oblivion_photo_collage_cell", "Выбранное фото" },
+	{ "lng_oblivion_photo_collage_cell_empty", "Выбранная ячейка" },
+	{ "lng_oblivion_photo_collage_cell_hint", "Нажмите на фото в коллаже, чтобы настроить его." },
+	{ "lng_oblivion_photo_collage_cell_zoom", "Масштаб" },
+	{ "lng_oblivion_photo_collage_cell_replace", "Заменить фото…" },
+	{ "lng_oblivion_photo_collage_cell_choose", "Выбрать фото…" },
+	{ "lng_oblivion_photo_collage_cell_fit", "Показать фото целиком" },
+	{ "lng_oblivion_photo_collage_cell_fill", "Заполнить ячейку" },
+	{ "lng_oblivion_photo_collage_cell_rotate", "Повернуть" },
+	{ "lng_oblivion_photo_collage_cell_mirror", "Отразить" },
+	{ "lng_oblivion_photo_collage_cell_remove", "Убрать фото" },
+	{ "lng_oblivion_photo_collage_cell_delete", "Удалить ячейку" },
+	{ "lng_oblivion_photo_collage_shuffle", "Перемешать фото" },
+	{ "lng_oblivion_photo_collage_to_layers", "Разобрать на слои" },
+	{
+		"lng_oblivion_photo_collage_to_layers_empty",
+		"В коллаже нет ничего, из чего можно сделать слои.",
+	},
+	{ "lng_oblivion_photo_collage_converting", "Создаём слои…" },
+	{ "lng_oblivion_photo_collage_background_layer", "Фон коллажа" },
+	{ "lng_oblivion_photo_collage_cell_name", "Фото {index}" },
+	{
+		"lng_oblivion_photo_collage_hidden#one",
+		"{count} фото не поместилось в сетку. Выберите шаблон выше — "
+		"в нём поместятся все.",
+	},
+	{
+		"lng_oblivion_photo_collage_hidden#few",
+		"{count} фото не поместились в сетку. Выберите шаблон выше — "
+		"в нём поместятся все.",
+	},
+	{
+		"lng_oblivion_photo_collage_hidden#many",
+		"{count} фото не поместились в сетку. Выберите шаблон выше — "
+		"в нём поместятся все.",
+	},
+	{
+		"lng_oblivion_photo_collage_hidden#other",
+		"{count} фото не поместились в сетку. Выберите шаблон выше — "
+		"в нём поместятся все.",
+	},
+	{
+		"lng_oblivion_photo_collage_hint",
+		"Тяните границы, чтобы менять размеры ячеек. Тяните фото, чтобы "
+		"сдвинуть его внутри ячейки; колесо мыши над выбранным фото "
+		"меняет масштаб. Чтобы поменять два фото местами, перетащите "
+		"круглый значок на другую ячейку.",
+	},
+	{
+		"lng_oblivion_photo_collage_layer_about",
+		"Фото, сетка и оформление коллажа настраиваются "
+		"инструментом «Коллаж».",
+	},
+	{ "lng_oblivion_photo_collage_layer_open", "Настроить коллаж" },
+	{ "lng_oblivion_photo_collage_open_failed", "Не удалось открыть эти фото." },
+	{ "lng_oblivion_photo_collage_choose_title", "Выберите фото для коллажа" },
+	{ "lng_oblivion_photo_collage_file_name", "коллаж" },
+	{ "lng_oblivion_photo_collage_settings", "Коллаж из фото" },
+	{
+		"lng_oblivion_photo_collage_full",
+		"В коллаже уже {max} фото — больше в нём не поместится.",
+	},
+	{
+		"lng_oblivion_photo_collage_limit",
+		"В коллаже помещается не больше {max} фото. "
+		"Не добавлено: {skipped}.",
+	},
+	// Oblivion round 4: photo panels.
+	{ "lng_oblivion_photo_panel_seed", "Вариант" },
+	{ "lng_oblivion_photo_panel_fx_filter", "Фильтр" },
+	{ "lng_oblivion_photo_panel_tool_view", "Просмотр: перетаскивайте, чтобы двигать фото" },
+	{ "lng_oblivion_photo_panel_tab_layer", "Слой" },
+	{ "lng_oblivion_photo_panel_tab_tool", "Инструмент" },
+	{ "lng_oblivion_photo_panel_tab_layers", "Все слои" },
+	{ "lng_oblivion_photo_panel_layer_photo", "Фото" },
+	{ "lng_oblivion_photo_panel_layer_name", "Слой {index}" },
+	{ "lng_oblivion_photo_panel_no_image_layer", "Сначала выберите слой с фотографией." },
+	{ "lng_oblivion_photo_panel_layer_locked", "Этот слой заблокирован." },
+	{ "lng_oblivion_photo_panel_import", "Добавить фото…" },
+	{ "lng_oblivion_photo_panel_import_title", "Выберите фото, чтобы добавить их слоями" },
+	{ "lng_oblivion_photo_panel_no_layer", "Выберите слой, чтобы увидеть его настройки." },
+	{ "lng_oblivion_photo_panel_opacity", "Непрозрачность" },
+	{ "lng_oblivion_photo_panel_blend", "Наложение" },
+	{ "lng_oblivion_photo_panel_effects", "Эффекты слоя" },
+	{ "lng_oblivion_photo_panel_effects_empty", "У этого слоя пока нет эффектов." },
+	{ "lng_oblivion_photo_panel_add_effect", "Добавить эффект" },
+	{ "lng_oblivion_photo_panel_effect_unknown", "Неизвестный эффект" },
+	{ "lng_oblivion_photo_panel_randomize", "Другой случайный вариант" },
+	{ "lng_oblivion_photo_panel_point_pick", "Указать на фото" },
+	{ "lng_oblivion_photo_panel_point_done", "Готово" },
+	{ "lng_oblivion_photo_panel_point_hint", "Нажмите на фото или перетащите точку. Когда закончите, нажмите Esc." },
+	{ "lng_oblivion_photo_panel_on", "Вкл." },
+	{ "lng_oblivion_photo_panel_off", "Выкл." },
+	{ "lng_oblivion_photo_panel_blend_normal", "Обычное" },
+	{ "lng_oblivion_photo_panel_blend_multiply", "Умножение" },
+	{ "lng_oblivion_photo_panel_blend_screen", "Экран" },
+	{ "lng_oblivion_photo_panel_blend_overlay", "Перекрытие" },
+	{ "lng_oblivion_photo_panel_blend_soft_light", "Мягкий свет" },
+	{ "lng_oblivion_photo_panel_blend_hard_light", "Жёсткий свет" },
+	{ "lng_oblivion_photo_panel_blend_darken", "Затемнение" },
+	{ "lng_oblivion_photo_panel_blend_lighten", "Замена светлым" },
+	{ "lng_oblivion_photo_panel_blend_color_dodge", "Осветление основы" },
+	{ "lng_oblivion_photo_panel_blend_color_burn", "Затемнение основы" },
+	{ "lng_oblivion_photo_panel_blend_difference", "Разница" },
+	{ "lng_oblivion_photo_panel_blend_exclusion", "Исключение" },
+	{ "lng_oblivion_photo_panel_blend_add", "Сложение" },
+	{ "lng_oblivion_photo_panel_blend_hue", "Цветовой тон" },
+	{ "lng_oblivion_photo_panel_blend_saturation", "Насыщенность" },
+	{ "lng_oblivion_photo_panel_blend_color", "Цветность" },
+	{ "lng_oblivion_photo_panel_blend_luminosity", "Яркость" },
+	{ "lng_oblivion_photo_panel_group_light", "Свет" },
+	{ "lng_oblivion_photo_panel_group_color", "Цвет" },
+	{ "lng_oblivion_photo_panel_group_detail", "Детали" },
+	{ "lng_oblivion_photo_panel_group_finish", "Виньетка и зерно" },
+	{ "lng_oblivion_photo_panel_group_blur", "Размытие" },
+	{ "lng_oblivion_photo_panel_group_distort", "Искажение" },
+	{ "lng_oblivion_photo_panel_group_lofi", "Плохая камера" },
+	{ "lng_oblivion_photo_panel_group_glitch", "Глитч" },
+	{ "lng_oblivion_photo_panel_group_stylize", "Стилизация" },
+	{ "lng_oblivion_photo_panel_group_classic", "Классические" },
+	{ "lng_oblivion_photo_panel_fine_title", "Точная коррекция" },
+	{
+		"lng_oblivion_photo_panel_fine_about",
+		"Кривые, цвета по диапазонам (HSL), цветокоррекция по тонам, "
+		"чёрно-белый микс, резкость, шумоподавление и другое "
+		"добавляются к активному слою как эффекты.",
+	},
+	{ "lng_oblivion_photo_panel_fine_button", "Добавить коррекцию…" },
+	{ "lng_oblivion_photo_panel_more_title", "Эффекты слоя" },
+	{
+		"lng_oblivion_photo_panel_more_about",
+		"Размытия, искажения, «плохая камера» и глитч добавляются "
+		"к активному слою, их можно сочетать.",
+	},
+	{ "lng_oblivion_photo_panel_more_button", "Добавить эффект слоя…" },
+	{
+		"lng_oblivion_photo_panel_locked_about",
+		"Слой заблокирован. Разблокируйте его в списке слоёв, "
+		"чтобы менять эффекты.",
+	},
+	{ "lng_oblivion_photo_panel_canvas_title", "Холст" },
+	{ "lng_oblivion_photo_panel_canvas_width", "Ширина" },
+	{ "lng_oblivion_photo_panel_canvas_height", "Высота" },
+	{
+		"lng_oblivion_photo_panel_canvas_extend",
+		"Расширить холст до пропорций:",
+	},
+	{
+		"lng_oblivion_photo_panel_canvas_about",
+		"Нажмите на число, чтобы ввести точный размер. На большем "
+		"холсте вокруг фото появляется прозрачное место для других "
+		"слоёв, на меньшем всё, что выступает, скрывается. Слои "
+		"остаются на своих местах, рамка обрезки сбрасывается.",
+	},
+	{
+		"lng_oblivion_photo_panel_import_partial",
+		"Добавлено фото: {added} из {total}. За один раз добавляется не "
+		"больше {limit}, а файлы, которые не удалось открыть, "
+		"пропускаются.",
+	},
+	{
+		"lng_oblivion_photo_panel_kept",
+		"Фоторедактор был закрыт. Незаконченная работа со всеми слоями "
+		"хранится до выхода из приложения или из этого аккаунта: "
+		"откройте фоторедактор, чтобы продолжить.",
+	},
+	{
+		"lng_oblivion_photo_panel_restore_text",
+		"В фоторедакторе осталась незаконченная работа. Продолжить её "
+		"или начать новую? Если начать новую, незаконченная работа "
+		"будет удалена.",
+	},
+	{ "lng_oblivion_photo_panel_restore_continue", "Продолжить" },
+	{ "lng_oblivion_photo_panel_restore_new", "Начать новую" },
+	{
+		"lng_oblivion_photo_panel_merge_blend",
+		"Эти слои нельзя объединить, не изменив картинку: у нижнего "
+		"слоя задан режим наложения. Сначала выберите для него "
+		"наложение «Обычное».",
+	},
+	// Oblivion round 4: video fx.
+	{ "lng_oblivion_vfx_fx_tracking", "Трекинг объектов" },
+	{ "lng_oblivion_vfx_fx_edges", "Светящиеся контуры" },
+	{ "lng_oblivion_vfx_fx_feedback", "Шлейф" },
+	{ "lng_oblivion_vfx_fx_difference", "Разница кадров" },
+	{ "lng_oblivion_vfx_fx_slitscan", "Щелевая развёртка" },
+	{ "lng_oblivion_vfx_fx_pixelsort", "Сортировка пикселей" },
+	{ "lng_oblivion_vfx_fx_rgbsplit", "Расслоение RGB" },
+	{ "lng_oblivion_vfx_fx_displace", "Смещение по яркости" },
+	{ "lng_oblivion_vfx_fx_kaleidoscope", "Калейдоскоп" },
+	{ "lng_oblivion_vfx_fx_mirror", "Зеркало" },
+	{ "lng_oblivion_vfx_fx_ascii", "Символы ASCII" },
+	{ "lng_oblivion_vfx_fx_halftone", "Печатный растр" },
+	{ "lng_oblivion_vfx_fx_dither", "Дизеринг" },
+	{ "lng_oblivion_vfx_fx_threshold", "Порог" },
+	{ "lng_oblivion_vfx_fx_posterize", "Постеризация" },
+	{ "lng_oblivion_vfx_fx_falsecolor", "Ложные цвета" },
+	{ "lng_oblivion_vfx_fx_glitch", "Глитч" },
+	{ "lng_oblivion_vfx_fx_datamosh", "Датамош" },
+	{ "lng_oblivion_vfx_fx_crt", "Экран с кинескопом" },
+	{ "lng_oblivion_vfx_fx_grain", "Шум и зерно" },
+	{ "lng_oblivion_vfx_fx_strobe", "Стробоскоп" },
+	{ "lng_oblivion_vfx_group_analysis", "Трекинг и контуры" },
+	{ "lng_oblivion_vfx_group_time", "Время" },
+	{ "lng_oblivion_vfx_group_distort", "Искажения" },
+	{ "lng_oblivion_vfx_group_stylize", "Стилизация" },
+	{ "lng_oblivion_vfx_p_source", "Что отслеживать" },
+	{ "lng_oblivion_vfx_p_sensitivity", "Чувствительность" },
+	{ "lng_oblivion_vfx_p_min_size", "Наименьший объект" },
+	{ "lng_oblivion_vfx_p_limit", "Число объектов" },
+	{ "lng_oblivion_vfx_p_style", "Стиль" },
+	{ "lng_oblivion_vfx_p_color", "Цвет" },
+	{ "lng_oblivion_vfx_p_background", "Цвет фона" },
+	{ "lng_oblivion_vfx_p_width", "Толщина линий" },
+	{ "lng_oblivion_vfx_p_links", "Соединительные линии" },
+	{ "lng_oblivion_vfx_p_labels", "Подписи" },
+	{ "lng_oblivion_vfx_p_text_size", "Размер подписей" },
+	{ "lng_oblivion_vfx_p_trails", "Следы движения" },
+	{ "lng_oblivion_vfx_p_smoothing", "Сглаживание" },
+	{ "lng_oblivion_vfx_p_dim", "Затемнить видео" },
+	{ "lng_oblivion_vfx_p_threshold", "Порог" },
+	{ "lng_oblivion_vfx_p_amount", "Сила" },
+	{ "lng_oblivion_vfx_p_glow", "Свечение" },
+	{ "lng_oblivion_vfx_p_colors", "Цвета" },
+	{ "lng_oblivion_vfx_p_original", "Исходное видео" },
+	{ "lng_oblivion_vfx_p_persistence", "Длина шлейфа" },
+	{ "lng_oblivion_vfx_p_zoom", "Масштаб" },
+	{ "lng_oblivion_vfx_p_rotation", "Поворот" },
+	{ "lng_oblivion_vfx_p_shift_x", "Сдвиг по горизонтали" },
+	{ "lng_oblivion_vfx_p_shift_y", "Сдвиг по вертикали" },
+	{ "lng_oblivion_vfx_p_mode", "Режим" },
+	{ "lng_oblivion_vfx_p_hue", "Сдвиг оттенка" },
+	{ "lng_oblivion_vfx_p_depth", "Глубина по времени" },
+	{ "lng_oblivion_vfx_p_direction", "Направление" },
+	{ "lng_oblivion_vfx_p_smooth", "Плавные переходы" },
+	{ "lng_oblivion_vfx_p_low", "Яркость от" },
+	{ "lng_oblivion_vfx_p_high", "Яркость до" },
+	{ "lng_oblivion_vfx_p_key", "Признак сортировки" },
+	{ "lng_oblivion_vfx_p_length", "Длина полос" },
+	{ "lng_oblivion_vfx_p_angle", "Угол" },
+	{ "lng_oblivion_vfx_p_smoothness", "Плавность" },
+	{ "lng_oblivion_vfx_p_segments", "Секторы" },
+	{ "lng_oblivion_vfx_p_spin", "Вращение" },
+	{ "lng_oblivion_vfx_p_center_x", "Центр по горизонтали" },
+	{ "lng_oblivion_vfx_p_center_y", "Центр по вертикали" },
+	{ "lng_oblivion_vfx_p_position", "Положение зеркала" },
+	{ "lng_oblivion_vfx_p_size", "Размер" },
+	{ "lng_oblivion_vfx_p_charset", "Символы" },
+	{ "lng_oblivion_vfx_p_invert", "Инвертировать" },
+	{ "lng_oblivion_vfx_p_shape", "Форма" },
+	{ "lng_oblivion_vfx_p_levels", "Число уровней" },
+	{ "lng_oblivion_vfx_p_method", "Метод" },
+	{ "lng_oblivion_vfx_p_pixel", "Размер пикселя" },
+	{ "lng_oblivion_vfx_p_palette", "Палитра" },
+	{ "lng_oblivion_vfx_p_softness", "Мягкость" },
+	{ "lng_oblivion_vfx_p_level", "Уровень" },
+	{ "lng_oblivion_vfx_p_keep_hues", "Сохранять оттенки" },
+	{ "lng_oblivion_vfx_p_shift", "Сдвиг палитры" },
+	{ "lng_oblivion_vfx_p_cycle", "Перелив" },
+	{ "lng_oblivion_vfx_p_bands", "Полосы" },
+	{ "lng_oblivion_vfx_p_slices", "Сдвиг полос" },
+	{ "lng_oblivion_vfx_p_blocks", "Битые блоки" },
+	{ "lng_oblivion_vfx_p_rgb", "Расслоение цветов" },
+	{ "lng_oblivion_vfx_p_speed", "Скорость" },
+	{ "lng_oblivion_vfx_p_seed", "Вариант" },
+	{ "lng_oblivion_vfx_p_interval", "Интервал обновления" },
+	{ "lng_oblivion_vfx_p_block", "Размер блока" },
+	{ "lng_oblivion_vfx_p_scanlines", "Строки развёртки" },
+	{ "lng_oblivion_vfx_p_curvature", "Выпуклость экрана" },
+	{ "lng_oblivion_vfx_p_mask", "RGB-маска" },
+	{ "lng_oblivion_vfx_p_vignette", "Виньетка" },
+	{ "lng_oblivion_vfx_p_flicker", "Мерцание" },
+	{ "lng_oblivion_vfx_p_colored", "Цветной шум" },
+	{ "lng_oblivion_vfx_p_frequency", "Частота" },
+	{ "lng_oblivion_vfx_p_duty", "Длина вспышки" },
+	{ "lng_oblivion_vfx_o_auto", "Авто" },
+	{ "lng_oblivion_vfx_o_motion", "Движение" },
+	{ "lng_oblivion_vfx_o_contrast", "Контраст" },
+	{ "lng_oblivion_vfx_o_bright", "Светлые области" },
+	{ "lng_oblivion_vfx_o_dark", "Тёмные области" },
+	{ "lng_oblivion_vfx_o_boxes", "Рамки" },
+	{ "lng_oblivion_vfx_o_corners", "Уголки" },
+	{ "lng_oblivion_vfx_o_points", "Точки" },
+	{ "lng_oblivion_vfx_o_inverted", "Инверсия" },
+	{ "lng_oblivion_vfx_o_off", "Нет" },
+	{ "lng_oblivion_vfx_o_nearest", "К ближайшему" },
+	{ "lng_oblivion_vfx_o_chain", "Цепочкой" },
+	{ "lng_oblivion_vfx_o_web", "Паутина" },
+	{ "lng_oblivion_vfx_o_id", "Номер" },
+	{ "lng_oblivion_vfx_o_coords", "Координаты" },
+	{ "lng_oblivion_vfx_o_id_coords", "Номер и координаты" },
+	{ "lng_oblivion_vfx_o_tint", "Один цвет" },
+	{ "lng_oblivion_vfx_o_source", "Цвета видео" },
+	{ "lng_oblivion_vfx_o_rainbow", "Радуга" },
+	{ "lng_oblivion_vfx_o_lighten", "Осветление" },
+	{ "lng_oblivion_vfx_o_screen", "Экран" },
+	{ "lng_oblivion_vfx_o_blend", "Смешивание" },
+	{ "lng_oblivion_vfx_o_over", "Поверх видео" },
+	{ "lng_oblivion_vfx_o_down", "Сверху вниз" },
+	{ "lng_oblivion_vfx_o_up", "Снизу вверх" },
+	{ "lng_oblivion_vfx_o_right", "Слева направо" },
+	{ "lng_oblivion_vfx_o_left", "Справа налево" },
+	{ "lng_oblivion_vfx_o_outward", "От центра" },
+	{ "lng_oblivion_vfx_o_inward", "К центру" },
+	{ "lng_oblivion_vfx_o_brightness", "Яркость" },
+	{ "lng_oblivion_vfx_o_hue", "Оттенок" },
+	{ "lng_oblivion_vfx_o_saturation", "Насыщенность" },
+	{ "lng_oblivion_vfx_o_linear", "Под заданным углом" },
+	{ "lng_oblivion_vfx_o_radial", "От центра" },
+	{ "lng_oblivion_vfx_o_mirror_left", "Левая сторона" },
+	{ "lng_oblivion_vfx_o_mirror_right", "Правая сторона" },
+	{ "lng_oblivion_vfx_o_mirror_top", "Верх" },
+	{ "lng_oblivion_vfx_o_mirror_bottom", "Низ" },
+	{ "lng_oblivion_vfx_o_mirror_quad", "Четыре стороны" },
+	{ "lng_oblivion_vfx_o_classic", "Классические" },
+	{ "lng_oblivion_vfx_o_blocks", "Блоки" },
+	{ "lng_oblivion_vfx_o_binary", "Нули и единицы" },
+	{ "lng_oblivion_vfx_o_dots", "Точки" },
+	{ "lng_oblivion_vfx_o_lines", "Линии" },
+	{ "lng_oblivion_vfx_o_squares", "Квадраты" },
+	{ "lng_oblivion_vfx_o_two_colors", "Два цвета" },
+	{ "lng_oblivion_vfx_o_cmyk", "Цветная печать" },
+	{ "lng_oblivion_vfx_o_bayer4", "Узор 4×4" },
+	{ "lng_oblivion_vfx_o_bayer8", "Узор 8×8" },
+	{ "lng_oblivion_vfx_o_floyd", "Флойд — Стейнберг" },
+	{ "lng_oblivion_vfx_o_noise", "Шум" },
+	{ "lng_oblivion_vfx_o_retro", "Ретроконсоль" },
+	{ "lng_oblivion_vfx_o_thermal", "Тепловизор" },
+	{ "lng_oblivion_vfx_o_night", "Ночное видение" },
+	{ "lng_oblivion_vfx_o_fire", "Огонь" },
+	{ "lng_oblivion_vfx_o_ice", "Лёд" },
+	{ "lng_oblivion_vfx_o_neon", "Неон" },
+	{ "lng_oblivion_vfx_o_xray", "Рентген" },
+	{ "lng_oblivion_vfx_o_black", "Чёрный" },
+	{ "lng_oblivion_vfx_o_white", "Белый" },
+	{ "lng_oblivion_vfx_o_negative", "Негатив" },
+	{ "lng_oblivion_vfx_o_freeze", "Стоп-кадр" },
+	{ "lng_oblivion_vfx_unit_seconds", "с" },
+	{ "lng_oblivion_vfx_unit_hertz", "Гц" },
+	{ "lng_oblivion_vfx_preset_tracker", "Трекер объектов" },
+	{ "lng_oblivion_vfx_preset_thermal", "Тепловизор" },
+	{ "lng_oblivion_vfx_preset_neon", "Неоновые контуры" },
+	{ "lng_oblivion_vfx_preset_tv", "Старый телевизор" },
+	{ "lng_oblivion_vfx_preset_mosh", "Датамош" },
+	{ "lng_oblivion_vfx_preset_terminal", "Терминал" },
+	{ "lng_oblivion_vfx_preset_echo", "Эхо" },
+	{ "lng_oblivion_vfx_preset_print", "Газета" },
+	{ "lng_oblivion_vfx_preset_scanner", "Сканер времени" },
+	{ "lng_oblivion_vfx_preset_motion", "Только движение" },
+	{ "lng_oblivion_vfx_title", "Эффекты" },
+	{ "lng_oblivion_vfx_none", "Нет" },
+	{ "lng_oblivion_vfx_all_off", "Выключены" },
+	{ "lng_oblivion_vfx_add", "Добавить эффект" },
+	{ "lng_oblivion_vfx_presets", "Заготовки" },
+	{ "lng_oblivion_vfx_remove_all", "Убрать все" },
+	{ "lng_oblivion_vfx_done", "Готово" },
+	{
+		"lng_oblivion_vfx_empty",
+		"Эффектов пока нет. Добавьте эффект или выберите заготовку: "
+		"эффекты меняют всё видео и применяются по очереди, сверху вниз.",
+	},
+	{
+		"lng_oblivion_vfx_hint",
+		"Предпросмотр показывается в пониженном качестве. В готовом видео, "
+		"GIF или стикере эффекты будут в полном качестве.",
+	},
+	{ "lng_oblivion_vfx_mix", "Интенсивность" },
+	{ "lng_oblivion_vfx_randomize", "Случайно" },
+	{ "lng_oblivion_vfx_move_up", "Выше" },
+	{ "lng_oblivion_vfx_move_down", "Ниже" },
+	{ "lng_oblivion_vfx_remove", "Убрать эффект" },
+	{
+		"lng_oblivion_vfx_limit",
+		"Одновременно можно использовать не больше {max} эффектов.",
+	},
+	{ "lng_oblivion_vfx_color_title", "Цвет" },
+	{
+		"lng_oblivion_vfx_strobe_warning",
+		"Частые вспышки могут быть опасны для людей с фоточувствительной "
+		"эпилепсией.",
+	},
+	// Oblivion round 4: sticker export.
+	{ "lng_oblivion_sexport_save_as", "Сохранить как" },
+	{ "lng_oblivion_sexport_save_set", "Сохранить весь набор (.zip)" },
+	{ "lng_oblivion_sexport_format_png", "Изображение PNG" },
+	{ "lng_oblivion_sexport_format_webp", "Изображение WebP" },
+	{ "lng_oblivion_sexport_format_tgs", "Стикер TGS" },
+	{ "lng_oblivion_sexport_format_json", "Анимация Lottie JSON" },
+	{ "lng_oblivion_sexport_format_gif", "Анимация GIF" },
+	{ "lng_oblivion_sexport_format_webm", "Видео WebM" },
+	{ "lng_oblivion_sexport_format_zip", "Архив ZIP" },
+	{ "lng_oblivion_sexport_format_original", "{format} (оригинал)" },
+	{ "lng_oblivion_sexport_dialog_sticker", "Сохранить стикер" },
+	{ "lng_oblivion_sexport_dialog_emoji", "Сохранить эмодзи" },
+	{ "lng_oblivion_sexport_dialog_set", "Сохранить набор" },
+	{ "lng_oblivion_sexport_name_sticker", "Стикер" },
+	{ "lng_oblivion_sexport_name_emoji", "Эмодзи" },
+	{
+		"lng_oblivion_sexport_downloading",
+		"Скачиваем, файл сохранится через мгновение…",
+	},
+	{
+		"lng_oblivion_sexport_converting",
+		"Преобразуем в GIF, файл сохранится через мгновение…",
+	},
+	{ "lng_oblivion_sexport_saved_to", "Сохранено в {path}" },
+	{
+		"lng_oblivion_sexport_download_failed",
+		"Не удалось скачать стикер, ничего не сохранено.",
+	},
+	{
+		"lng_oblivion_sexport_convert_failed",
+		"Не удалось преобразовать стикер в этот формат, ничего не "
+		"сохранено.",
+	},
+	{
+		"lng_oblivion_sexport_write_failed",
+		"Не удалось записать файл в {path}",
+	},
+	{
+		"lng_oblivion_sexport_busy",
+		"Сейчас сохраняется другой набор. Дождитесь окончания.",
+	},
+	{
+		"lng_oblivion_sexport_interrupted",
+		"Сохранение набора отменено: окно сохранения было закрыто.",
+	},
+	{ "lng_oblivion_sexport_box_title", "Сохранение набора" },
+	{ "lng_oblivion_sexport_stickers#one", "{count} стикер" },
+	{ "lng_oblivion_sexport_stickers#few", "{count} стикера" },
+	{ "lng_oblivion_sexport_stickers#many", "{count} стикеров" },
+	{ "lng_oblivion_sexport_stickers#other", "{count} стикера" },
+	{ "lng_oblivion_sexport_emoji#one", "{count} эмодзи" },
+	{ "lng_oblivion_sexport_emoji#few", "{count} эмодзи" },
+	{ "lng_oblivion_sexport_emoji#many", "{count} эмодзи" },
+	{ "lng_oblivion_sexport_emoji#other", "{count} эмодзи" },
+	{ "lng_oblivion_sexport_loading_set", "Загружаем набор…" },
+	{
+		"lng_oblivion_sexport_choose_path",
+		"Выберите, куда сохранить архив…",
+	},
+	{
+		"lng_oblivion_sexport_progress",
+		"Скачиваем файлы: {ready} из {total}",
+	},
+	{ "lng_oblivion_sexport_writing", "Записываем архив…" },
+	{ "lng_oblivion_sexport_done#one", "Готово: в архиве {count} файл." },
+	{ "lng_oblivion_sexport_done#few", "Готово: в архиве {count} файла." },
+	{
+		"lng_oblivion_sexport_done#many",
+		"Готово: в архиве {count} файлов.",
+	},
+	{
+		"lng_oblivion_sexport_done#other",
+		"Готово: в архиве {count} файла.",
+	},
+	{
+		"lng_oblivion_sexport_done_partial",
+		"Файлов в архиве: {ready} из {total}.\nОстальные не удалось "
+		"скачать, они отмечены в файле manifest.json.",
+	},
+	{
+		"lng_oblivion_sexport_failed_set",
+		"Не удалось загрузить набор. Возможно, он был удалён.",
+	},
+	{
+		"lng_oblivion_sexport_failed_empty",
+		"Этот набор пуст, сохранять нечего.",
+	},
+	{
+		"lng_oblivion_sexport_failed_download",
+		"Не удалось скачать файлы набора. Проверьте подключение "
+		"к интернету и попробуйте ещё раз.",
+	},
+	{
+		"lng_oblivion_sexport_failed_write",
+		"Не удалось записать архив. Возможно, на диске нет места или "
+		"в эту папку нельзя сохранять файлы.",
+	},
+	{ "lng_oblivion_sexport_show_in_folder", "Показать в папке" },
+	{ "lng_oblivion_sexport_show_in_finder", "Показать в Finder" },
+	// Oblivion round 4: sticker batch.
+	{ "lng_oblivion_sbatch_settings", "Пакетное создание стикеров" },
+	{ "lng_oblivion_sbatch_add_several", "Добавить несколько файлов…" },
+	{ "lng_oblivion_sbatch_new_emoji_title", "Новый набор эмодзи" },
+	{
+		"lng_oblivion_sbatch_new_emoji_about",
+		"Набор будет создан, когда в него загрузится первый файл.",
+	},
+	{
+		"lng_oblivion_sbatch_new_emoji_hint",
+		"Латинские буквы, цифры и подчёркивания. Ссылка на набор "
+		"будет такой: t.me/addemoji/имя.",
+	},
+	{ "lng_oblivion_sbatch_target", "Набор" },
+	{ "lng_oblivion_sbatch_target_choose", "Выбрать" },
+	{ "lng_oblivion_sbatch_target_loading", "Загрузка…" },
+	{ "lng_oblivion_sbatch_target_new", "Новый: {title}" },
+	{ "lng_oblivion_sbatch_target_emoji", "{title} (эмодзи)" },
+	{ "lng_oblivion_sbatch_menu_new_stickers", "Новый набор стикеров…" },
+	{ "lng_oblivion_sbatch_menu_new_emoji", "Новый набор эмодзи…" },
+	{ "lng_oblivion_sbatch_emoji_default", "Эмодзи для всех файлов" },
+	{ "lng_oblivion_sbatch_emoji_default_title", "Эмодзи для всех файлов" },
+	{
+		"lng_oblivion_sbatch_emoji_default_about",
+		"Для файлов, у которых нет своих эмодзи",
+	},
+	{
+		"lng_oblivion_sbatch_emoji_default_empty",
+		"В очереди пока нет файлов",
+	},
+	{ "lng_oblivion_sbatch_emoji_title", "Эмодзи файла" },
+	{ "lng_oblivion_sbatch_emoji_about", "Выберите эмодзи для этого файла" },
+	{
+		"lng_oblivion_sbatch_emoji_required",
+		"Выберите хотя бы один эмодзи.",
+	},
+	{ "lng_oblivion_sbatch_done", "Готово" },
+	{ "lng_oblivion_sbatch_drop_title", "Перетащите файлы сюда" },
+	{
+		"lng_oblivion_sbatch_drop_about",
+		"или нажмите, чтобы выбрать их. Подойдут картинки, GIF, видео, "
+		".tgs и Lottie JSON — всё конвертируется автоматически. От видео "
+		"берутся первые 3\xC2\xA0" "секунды.",
+	},
+	{ "lng_oblivion_sbatch_add_files", "Добавить файлы" },
+	{ "lng_oblivion_sbatch_choose_files", "Выберите файлы для стикеров" },
+	{ "lng_oblivion_sbatch_upload", "Загрузить" },
+	{ "lng_oblivion_sbatch_pause", "Пауза" },
+	{ "lng_oblivion_sbatch_resume", "Продолжить" },
+	{ "lng_oblivion_sbatch_stop", "Остановить" },
+	{ "lng_oblivion_sbatch_retry", "Повторить" },
+	{ "lng_oblivion_sbatch_type_static", "Картинка" },
+	{ "lng_oblivion_sbatch_type_animated", "Анимация" },
+	{ "lng_oblivion_sbatch_type_video", "Видео" },
+	{ "lng_oblivion_sbatch_seconds", "{value} с" },
+	{ "lng_oblivion_sbatch_row_waiting", "Ждёт конвертации" },
+	{ "lng_oblivion_sbatch_row_converting", "Конвертируем…" },
+	{
+		"lng_oblivion_sbatch_row_converting_percent",
+		"Конвертируем… {percent}",
+	},
+	{ "lng_oblivion_sbatch_row_uploading", "Загружаем… {percent}" },
+	{ "lng_oblivion_sbatch_row_adding", "Добавляем в набор…" },
+	{ "lng_oblivion_sbatch_row_done", "Добавлено в набор" },
+	{
+		"lng_oblivion_sbatch_row_checking",
+		"Проверяем, попал ли файл в набор…",
+	},
+	{
+		"lng_oblivion_sbatch_row_unsure",
+		"Загрузка прервана, проверьте набор",
+	},
+	{ "lng_oblivion_sbatch_row_fixed", "исправлена" },
+	{ "lng_oblivion_sbatch_problem_read", "Не удалось прочитать файл" },
+	{
+		"lng_oblivion_sbatch_problem_unknown",
+		"Из такого файла стикер не сделать",
+	},
+	{
+		"lng_oblivion_sbatch_problem_image",
+		"Не удалось конвертировать картинку",
+	},
+	{
+		"lng_oblivion_sbatch_problem_lottie",
+		"Telegram не примет эту анимацию",
+	},
+	{
+		"lng_oblivion_sbatch_problem_video",
+		"Не удалось конвертировать видео",
+	},
+	{ "lng_oblivion_sbatch_error_upload", "Не удалось загрузить файл" },
+	{
+		"lng_oblivion_sbatch_error_file",
+		"Telegram не принял файл ({error})",
+	},
+	{ "lng_oblivion_sbatch_error_emoji", "Telegram не принял эмодзи" },
+	{
+		"lng_oblivion_sbatch_error_generic",
+		"Не удалось добавить файл ({error})",
+	},
+	{ "lng_oblivion_sbatch_menu_emoji", "Изменить эмодзи…" },
+	{ "lng_oblivion_sbatch_menu_emoji_reset", "Сбросить эмодзи файла" },
+	{ "lng_oblivion_sbatch_menu_trim", "Обрезать видео…" },
+	{ "lng_oblivion_sbatch_menu_retry", "Повторить" },
+	{ "lng_oblivion_sbatch_menu_remove", "Убрать из очереди" },
+	{ "lng_oblivion_sbatch_menu_clear", "Очистить очередь" },
+	{
+		"lng_oblivion_sbatch_status_drop",
+		"Отпустите файлы, чтобы добавить их в очередь.",
+	},
+	{
+		"lng_oblivion_sbatch_status_preparing",
+		"Готовим файлы… {ready} из {total}",
+	},
+	{
+		"lng_oblivion_sbatch_status_ready#one",
+		"К загрузке готов {count} файл.",
+	},
+	{
+		"lng_oblivion_sbatch_status_ready#few",
+		"К загрузке готовы {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_ready#many",
+		"К загрузке готово {count} файлов.",
+	},
+	{
+		"lng_oblivion_sbatch_status_ready#other",
+		"К загрузке готовы {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_invalid#one",
+		"Не подходит {count} файл.",
+	},
+	{
+		"lng_oblivion_sbatch_status_invalid#few",
+		"Не подходят {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_invalid#many",
+		"Не подходит {count} файлов.",
+	},
+	{
+		"lng_oblivion_sbatch_status_invalid#other",
+		"Не подходят {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_uploading",
+		"Загружаем {index} из {total}…",
+	},
+	{
+		"lng_oblivion_sbatch_status_converting",
+		"Ждём, пока конвертируется следующий файл…",
+	},
+	{
+		"lng_oblivion_sbatch_status_flood",
+		"Telegram просит подождать {time}, затем продолжим.",
+	},
+	{
+		"lng_oblivion_sbatch_status_paused",
+		"Пауза. Загружено {done} из {total}.",
+	},
+	{
+		"lng_oblivion_sbatch_status_pausing",
+		"Загрузка остановится после текущего файла…",
+	},
+	{
+		"lng_oblivion_sbatch_status_stopped",
+		"Загрузка остановлена. Загружено {done} из {total}.",
+	},
+	{
+		"lng_oblivion_sbatch_status_restored",
+		"Прошлая загрузка не завершена: добавлено {done} из {total}. "
+		"Остальные файлы снова в очереди.",
+	},
+	{
+		"lng_oblivion_sbatch_status_errors",
+		"Несколько ошибок подряд — загрузка приостановлена. Проверьте "
+		"соединение и нажмите «Продолжить».",
+	},
+	{
+		"lng_oblivion_sbatch_status_floods",
+		"Telegram несколько раз подряд попросил подождать. Загрузка "
+		"приостановлена, продолжите её позже.",
+	},
+	{
+		"lng_oblivion_sbatch_status_full",
+		"Набор заполнен (максимум — {max}). Выберите другой набор "
+		"для оставшихся файлов.",
+	},
+	{
+		"lng_oblivion_sbatch_status_name",
+		"Это короткое имя занято или не подходит. Нажмите «Загрузить» "
+		"и введите другое.",
+	},
+	{
+		"lng_oblivion_sbatch_status_target",
+		"Набор не найден. Выберите другой.",
+	},
+	{
+		"lng_oblivion_sbatch_status_done#one",
+		"Готово: добавлен {count} файл.",
+	},
+	{
+		"lng_oblivion_sbatch_status_done#few",
+		"Готово: добавлено {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_done#many",
+		"Готово: добавлено {count} файлов.",
+	},
+	{
+		"lng_oblivion_sbatch_status_done#other",
+		"Готово: добавлено {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_failed#one",
+		"Не удалось добавить {count} файл.",
+	},
+	{
+		"lng_oblivion_sbatch_status_failed#few",
+		"Не удалось добавить {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_status_failed#many",
+		"Не удалось добавить {count} файлов.",
+	},
+	{
+		"lng_oblivion_sbatch_status_failed#other",
+		"Не удалось добавить {count} файла.",
+	},
+	{
+		"lng_oblivion_sbatch_toast_skipped#one",
+		"Пропущен {count} файл: из такого стикер не сделать.",
+	},
+	{
+		"lng_oblivion_sbatch_toast_skipped#few",
+		"Пропущено {count} файла: из таких стикер не сделать.",
+	},
+	{
+		"lng_oblivion_sbatch_toast_skipped#many",
+		"Пропущено {count} файлов: из таких стикер не сделать.",
+	},
+	{
+		"lng_oblivion_sbatch_toast_skipped#other",
+		"Пропущено {count} файла: из таких стикер не сделать.",
+	},
+	{
+		"lng_oblivion_sbatch_toast_limit",
+		"В очереди помещается не больше {max} файлов.",
+	},
+	{ "lng_oblivion_sbatch_toast_target", "Сначала выберите набор." },
+	{
+		"lng_oblivion_sbatch_toast_loading",
+		"Список ваших наборов ещё загружается.",
+	},
+	{ "lng_oblivion_sbatch_toast_busy", "Сначала остановите загрузку." },
+	{ "lng_oblivion_sbatch_toast_nothing", "Загружать пока нечего." },
+	// Oblivion round 4: attach tools.
+	{
+		"lng_oblivion_attach_settings",
+		"Кнопки инструментов при отправке файлов",
+	},
+	{ "lng_oblivion_attach_photo_editor", "Редактор" },
+	{
+		"lng_oblivion_attach_photo_editor_tip",
+		"Открыть в фоторедакторе Oblivion. Результат заменит "
+		"прикреплённое фото.",
+	},
+	{ "lng_oblivion_attach_sticker", "Стикер" },
+	{
+		"lng_oblivion_attach_sticker_tip",
+		"Сделать из этого фото стикер и добавить его в ваш набор.",
+	},
+	{ "lng_oblivion_attach_cutout", "Без фона" },
+	{
+		"lng_oblivion_attach_cutout_tip",
+		"Убрать фон: вырезать объект с фото.",
+	},
+	{ "lng_oblivion_attach_text", "Текст с фото" },
+	{
+		"lng_oblivion_attach_text_tip",
+		"Распознать текст на фото, чтобы скопировать его.",
+	},
+	{ "lng_oblivion_attach_video_editor", "Редактор" },
+	{
+		"lng_oblivion_attach_video_editor_tip",
+		"Открыть в видеоредакторе: обрезка, кадрирование, скорость.",
+	},
+	{
+		"lng_oblivion_attach_video_editor_closes_tip",
+		"Открыть в видеоредакторе: обрезка, кадрирование, скорость.\n"
+		"Это окно закроется, подпись вернётся в поле сообщения.",
+	},
+	{ "lng_oblivion_attach_round", "Кружок" },
+	{
+		"lng_oblivion_attach_round_tip",
+		"Отправить кружком — как круглое видеосообщение.\n"
+		"Это окно закроется, подпись вернётся в поле сообщения.",
+	},
+	{ "lng_oblivion_attach_video_sticker", "Стикер" },
+	{
+		"lng_oblivion_attach_video_sticker_tip",
+		"Сделать видеостикер из фрагмента до 3 секунд.",
+	},
+	{ "lng_oblivion_attach_gif", "GIF" },
+	{
+		"lng_oblivion_attach_gif_tip",
+		"Превратить в GIF: зацикленное видео без звука заменит "
+		"прикреплённое.",
+	},
+	{ "lng_oblivion_attach_music", "Музыкальный редактор" },
+	{
+		"lng_oblivion_attach_music_tip",
+		"Открыть в музыкальном редакторе: темп, тон, реверберация, "
+		"обрезка.",
+	},
+	{ "lng_oblivion_attach_lottie", "Редактор Lottie" },
+	{
+		"lng_oblivion_attach_lottie_tip",
+		"Открыть анимацию в редакторе Lottie.\n"
+		"«Сохранить» в редакторе изменит сам прикреплённый файл.",
+	},
+	{ "lng_oblivion_attach_gif_title", "Создание GIF" },
+	{
+		"lng_oblivion_attach_gif_progress",
+		"Преобразование видео… {percent}",
+	},
+	{
+		"lng_oblivion_attach_gif_about",
+		"Прикреплённое видео будет заменено зацикленным роликом без "
+		"звука.",
+	},
+	{ "lng_oblivion_attach_gif_done", "Видео заменено на GIF." },
+	{
+		"lng_oblivion_attach_gif_failed",
+		"Не удалось сделать GIF из этого видео.",
+	},
+	{ "lng_oblivion_attach_open_failed", "Не удалось открыть этот файл." },
+	{
+		"lng_oblivion_attach_lottie_failed",
+		"В этом файле нет анимации Lottie.",
+	},
+	// Oblivion round 4: chat stats.
+	{ "lng_oblivion_stats_menu", "Статистика чата" },
+	{
+		"lng_oblivion_stats_unsupported",
+		"Статистика считается только для личных чатов с людьми и для "
+		"групп, в которых вы состоите.",
+	},
+	{ "lng_oblivion_stats_period_3m", "3 месяца" },
+	{ "lng_oblivion_stats_period_year", "Год" },
+	{ "lng_oblivion_stats_period_all", "Всё время" },
+	{ "lng_oblivion_stats_refresh", "Обновить" },
+	{ "lng_oblivion_stats_stop", "Остановить" },
+	{ "lng_oblivion_stats_resume", "Продолжить" },
+	{ "lng_oblivion_stats_retry", "Повторить" },
+	{ "lng_oblivion_stats_clear", "Очистить данные" },
+	{
+		"lng_oblivion_stats_clear_sure",
+		"Удалить сохранённую статистику этого чата? История будет "
+		"загружена заново, когда вы откроете статистику в следующий раз.",
+	},
+	{ "lng_oblivion_stats_status_loading", "Загрузка сохранённых данных…" },
+	{ "lng_oblivion_stats_status_reading", "Загрузка истории…" },
+	{
+		"lng_oblivion_stats_status_reading_till",
+		"Загрузка истории: прочитано до {date}",
+	},
+	{ "lng_oblivion_stats_status_count#one", "Загружено {count} сообщение." },
+	{ "lng_oblivion_stats_status_count#few", "Загружено {count} сообщения." },
+	{ "lng_oblivion_stats_status_count#many", "Загружено {count} сообщений." },
+	{
+		"lng_oblivion_stats_status_count#other",
+		"Загружено {count} сообщения.",
+	},
+	{
+		"lng_oblivion_stats_status_background",
+		"Это окно можно закрыть — загрузка продолжится.",
+	},
+	{
+		"lng_oblivion_stats_status_waiting",
+		"В очереди: сначала загружается чат «{chat}».",
+	},
+	{
+		"lng_oblivion_stats_status_flood",
+		"Telegram попросил подождать {time}. Загрузка продолжится сама.",
+	},
+	{
+		"lng_oblivion_stats_status_stopped",
+		"Загрузка остановлена, данные неполные.",
+	},
+	{
+		"lng_oblivion_stats_status_incomplete",
+		"Данные за этот период неполные.",
+	},
+	{
+		"lng_oblivion_stats_status_failed",
+		"Не удалось загрузить историю: {error}",
+	},
+	{
+		"lng_oblivion_stats_status_failed_access",
+		"Нет доступа к истории этого чата.",
+	},
+	{
+		"lng_oblivion_stats_status_failed_stuck",
+		"Сервер вернул неожиданный ответ. Попробуйте позже.",
+	},
+	{
+		"lng_oblivion_stats_status_failed_cache",
+		"Не удалось прочитать сохранённую статистику этого чата. "
+		"Попробуйте ещё раз или очистите данные.",
+	},
+	{ "lng_oblivion_stats_updated", "Обновлено {date}" },
+	{ "lng_oblivion_stats_updated_now", "Обновлено только что" },
+	{ "lng_oblivion_stats_messages#one", "{count} сообщение" },
+	{ "lng_oblivion_stats_messages#few", "{count} сообщения" },
+	{ "lng_oblivion_stats_messages#many", "{count} сообщений" },
+	{ "lng_oblivion_stats_messages#other", "{count} сообщения" },
+	{ "lng_oblivion_stats_words#one", "{count} слово" },
+	{ "lng_oblivion_stats_words#few", "{count} слова" },
+	{ "lng_oblivion_stats_words#many", "{count} слов" },
+	{ "lng_oblivion_stats_words#other", "{count} слова" },
+	{ "lng_oblivion_stats_chars#one", "{count} символ" },
+	{ "lng_oblivion_stats_chars#few", "{count} символа" },
+	{ "lng_oblivion_stats_chars#many", "{count} символов" },
+	{ "lng_oblivion_stats_chars#other", "{count} символа" },
+	{ "lng_oblivion_stats_days#one", "{count} день" },
+	{ "lng_oblivion_stats_days#few", "{count} дня" },
+	{ "lng_oblivion_stats_days#many", "{count} дней" },
+	{ "lng_oblivion_stats_days#other", "{count} дня" },
+	{ "lng_oblivion_stats_people_more#one", "и ещё {count} участник" },
+	{ "lng_oblivion_stats_people_more#few", "и ещё {count} участника" },
+	{ "lng_oblivion_stats_people_more#many", "и ещё {count} участников" },
+	{ "lng_oblivion_stats_people_more#other", "и ещё {count} участника" },
+	{ "lng_oblivion_stats_span_s", "{value} с" },
+	{ "lng_oblivion_stats_span_m", "{value} мин" },
+	{ "lng_oblivion_stats_span_h", "{value} ч" },
+	{ "lng_oblivion_stats_span_hm", "{hours} ч {minutes} мин" },
+	{ "lng_oblivion_stats_cell_messages", "Сообщения" },
+	{ "lng_oblivion_stats_cell_words", "Слова" },
+	{ "lng_oblivion_stats_cell_people", "Участники" },
+	{ "lng_oblivion_stats_cell_emoji", "Эмодзи" },
+	{ "lng_oblivion_stats_cell_days", "Активные дни" },
+	{ "lng_oblivion_stats_cell_per_day", "В активный день" },
+	{ "lng_oblivion_stats_cell_length", "Слов в сообщении" },
+	{ "lng_oblivion_stats_section_people", "Участники" },
+	{ "lng_oblivion_stats_section_people_private", "Кто сколько пишет" },
+	{ "lng_oblivion_stats_section_hours", "По часам" },
+	{ "lng_oblivion_stats_section_weekdays", "По дням недели" },
+	{ "lng_oblivion_stats_section_calendar", "Календарь" },
+	{ "lng_oblivion_stats_section_days", "По дням" },
+	{ "lng_oblivion_stats_section_months", "По месяцам" },
+	{ "lng_oblivion_stats_section_words", "Частые слова" },
+	{ "lng_oblivion_stats_section_emoji", "Частые эмодзи" },
+	{ "lng_oblivion_stats_section_stickers", "Частые стикеры" },
+	{ "lng_oblivion_stats_section_media", "По типам сообщений" },
+	{ "lng_oblivion_stats_section_facts", "Интересное" },
+	{ "lng_oblivion_stats_you", "Вы" },
+	{ "lng_oblivion_stats_unknown", "Неизвестный участник" },
+	{ "lng_oblivion_stats_answer_you", "отвечаете за {time}" },
+	{ "lng_oblivion_stats_answer_other", "отвечает за {time}" },
+	{ "lng_oblivion_stats_kind_text", "Только текст" },
+	{ "lng_oblivion_stats_kind_photo", "Фото" },
+	{ "lng_oblivion_stats_kind_video", "Видео" },
+	{ "lng_oblivion_stats_kind_round", "Кружки" },
+	{ "lng_oblivion_stats_kind_voice", "Голосовые" },
+	{ "lng_oblivion_stats_kind_music", "Музыка" },
+	{ "lng_oblivion_stats_kind_file", "Файлы" },
+	{ "lng_oblivion_stats_kind_sticker", "Стикеры" },
+	{ "lng_oblivion_stats_kind_gif", "GIF" },
+	{ "lng_oblivion_stats_kind_poll", "Опросы" },
+	{ "lng_oblivion_stats_kind_location", "Геопозиции" },
+	{ "lng_oblivion_stats_kind_contact", "Контакты" },
+	{ "lng_oblivion_stats_kind_call", "Звонки" },
+	{ "lng_oblivion_stats_kind_other", "Другое" },
+	{ "lng_oblivion_stats_kind_link", "Со ссылками" },
+	{ "lng_oblivion_stats_fact_period", "Даты сообщений" },
+	{ "lng_oblivion_stats_fact_first", "Первое сообщение" },
+	{
+		"lng_oblivion_stats_fact_first_period",
+		"Первое сообщение за период",
+	},
+	{ "lng_oblivion_stats_fact_streak", "Дольше всего подряд" },
+	{ "lng_oblivion_stats_fact_streak_now", "Сейчас подряд" },
+	{ "lng_oblivion_stats_fact_top_day", "Самый активный день" },
+	{ "lng_oblivion_stats_fact_top_days", "Самые активные дни" },
+	{ "lng_oblivion_stats_fact_replies", "Ответы" },
+	{ "lng_oblivion_stats_fact_forwards", "Пересланные" },
+	{ "lng_oblivion_stats_fact_length", "Среднее сообщение" },
+	{ "lng_oblivion_stats_tip_none", "нет сообщений" },
+	{ "lng_oblivion_stats_less", "меньше" },
+	{ "lng_oblivion_stats_more", "больше" },
+	{
+		"lng_oblivion_stats_empty_reading",
+		"Первые цифры появятся через несколько секунд.",
+	},
+	{
+		"lng_oblivion_stats_empty_waiting",
+		"Статистика появится здесь, когда история загрузится.",
+	},
+	{
+		"lng_oblivion_stats_empty_cleared",
+		"Данных пока нет. Нажмите «Обновить», чтобы загрузить историю "
+		"чата.",
+	},
+	{
+		"lng_oblivion_stats_empty_chat",
+		"В этом чате пока нет сообщений.",
+	},
+	{
+		"lng_oblivion_stats_empty_period",
+		"За выбранный период в этом чате нет сообщений.",
+	},
+	{
+		"lng_oblivion_stats_about",
+		"Всё считается на этом устройстве и никуда не отправляется. "
+		"Ни тексты, ни список сообщений не сохраняются — только "
+		"счётчики: за каждый день сколько сообщений, слов и символов "
+		"отправил каждый участник, сколько было эмодзи, ответов, "
+		"пересылок и ссылок, в какие часы и какого типа были сообщения и "
+		"как быстро приходили ответы. Ещё сохраняются имена участников, "
+		"время и автор первого и последнего учтённого сообщения и то, до "
+		"какого места загружена история. Слова, эмодзи и стикеры "
+		"считаются за целые месяцы. Слово, эмодзи или стикер сохраняется "
+		"как есть, только когда встретится три раза (стикер — со своим "
+		"эмодзи и номером одного сообщения, чтобы показать картинку). Их "
+		"счётчики по "
+		"месяцам хранятся обезличенно: без ключа, которого нет в файле, "
+		"не узнать, какому слову они принадлежат. Сам файл не "
+		"зашифрован. Сообщения, удалённые после подсчёта, остаются в "
+		"статистике. Чтобы стереть всё сохранённое, нажмите «Очистить "
+		"данные».",
+	},
+	// Oblivion round 4: badge.
+	{ "lng_oblivion_badge_settings", "Значок Oblivion" },
+	{
+		"lng_oblivion_badge_settings_about",
+		"Oblivion допишет невидимую метку в конец вашего раздела «О "
+		"себе», поэтому он не должен быть пустым. По метке другие "
+		"пользователи Oblivion увидят значок Oblivion рядом с вашим "
+		"именем, в других приложениях ничего не изменится. Это не "
+		"верификация Telegram. Если выключить, метка будет удалена. "
+		"Действует только для текущего аккаунта.",
+	},
+	{ "lng_oblivion_badge_tooltip", "Пользователь Oblivion" },
+	{ "lng_oblivion_badge_consent_title", "Значок Oblivion" },
+	{
+		"lng_oblivion_badge_consent_preview",
+		"Так вас увидят в Oblivion",
+	},
+	{
+		"lng_oblivion_badge_consent_about",
+		"Значок Oblivion появится рядом с вашим именем. Это не "
+		"верификация Telegram и не официальная галочка.",
+	},
+	{
+		"lng_oblivion_badge_consent_bio",
+		"Для этого Oblivion допишет невидимую метку из нескольких "
+		"символов в конец раздела «О\xC2\xA0" "себе» аккаунта {name}. Ваш "
+		"текст останется прежним, метка лишь займёт немного места из "
+		"лимита длины.",
+	},
+	{
+		"lng_oblivion_badge_consent_reveals",
+		"Значок увидят все, кто откроет ваш профиль в Oblivion, и "
+		"поймут, что вы тоже пользуетесь Oblivion. В обычных "
+		"приложениях Telegram метка не видна, но остаётся частью "
+		"текста «О\xC2\xA0" "себе».",
+	},
+	{
+		"lng_oblivion_badge_consent_off",
+		"Выключить значок можно в настройках Oblivion: метка будет "
+		"убрана из «О\xC2\xA0" "себе».",
+	},
+	{ "lng_oblivion_badge_consent_enable", "Включить" },
+	{ "lng_oblivion_badge_on", "Значок Oblivion включён." },
+	{ "lng_oblivion_badge_off", "Значок Oblivion выключен." },
+	{
+		"lng_oblivion_badge_off_removed",
+		"Значок Oblivion выключен, метка убрана из «О себе».",
+	},
+	{
+		"lng_oblivion_badge_off_later",
+		"Значок Oblivion выключен. Метка будет убрана из «О себе» при "
+		"следующем запуске Oblivion с этим аккаунтом.",
+	},
+	{
+		"lng_oblivion_badge_off_wait",
+		"Значок Oblivion выключен. Telegram просит подождать, прежде "
+		"чем снова менять профиль, поэтому Oblivion уберёт метку из "
+		"«О себе» при запуске с этим аккаунтом после этого ожидания.",
+	},
+	{
+		"lng_oblivion_badge_no_room#one",
+		"В «О себе» не хватает места для метки. Сократите текст на "
+		"{count} символ и включите значок снова.",
+	},
+	{
+		"lng_oblivion_badge_no_room#few",
+		"В «О себе» не хватает места для метки. Сократите текст на "
+		"{count} символа и включите значок снова.",
+	},
+	{
+		"lng_oblivion_badge_no_room#many",
+		"В «О себе» не хватает места для метки. Сократите текст на "
+		"{count} символов и включите значок снова.",
+	},
+	{
+		"lng_oblivion_badge_no_room#other",
+		"В «О себе» не хватает места для метки. Сократите текст на "
+		"{count} символа и включите значок снова.",
+	},
+	{
+		"lng_oblivion_badge_no_room_off",
+		"В «О себе» не осталось места для метки Oblivion, поэтому "
+		"значок выключен.",
+	},
+	{
+		"lng_oblivion_badge_empty_bio",
+		"Раздел «О себе» пуст, поэтому другие не видят ваш значок "
+		"Oblivion. Напишите что-нибудь о себе, и метка вернётся. Если "
+		"при следующем запуске Oblivion раздел останется пустым, значок "
+		"будет выключен.",
+	},
+	{
+		"lng_oblivion_badge_needs_bio",
+		"Для значка нужен непустой раздел «О себе»: Oblivion не "
+		"записывает «О себе», состоящее из одной невидимой метки. "
+		"Напишите что-нибудь о себе и включите значок снова.",
+	},
+	{
+		"lng_oblivion_badge_dropped",
+		"Telegram не сохранил метку в «О себе», поэтому значок "
+		"выключен. Текст «О себе» не изменился.",
+	},
+	{
+		"lng_oblivion_badge_dropped_part",
+		"Telegram сохранил метку лишь частично, поэтому значок "
+		"выключен. В конце «О себе» осталось несколько невидимых "
+		"символов. Oblivion уберёт их при следующем запуске.",
+	},
+	{
+		"lng_oblivion_badge_lost",
+		"Метки Oblivion больше нет в вашем «О себе», поэтому значок "
+		"выключен. Включить его снова можно в настройках Oblivion.",
+	},
+	{
+		"lng_oblivion_badge_adopted",
+		"В «О себе» этого аккаунта есть метка Oblivion, поэтому значок "
+		"включён и здесь. Выключить его можно в настройках Oblivion.",
+	},
+	{
+		"lng_oblivion_badge_stuck",
+		"Oblivion несколько раз не смог убрать свою метку из «О себе». "
+		"Значок остаётся выключенным. Чтобы убрать метку самостоятельно, "
+		"измените текст «О себе» в настройках: при сохранении метка "
+		"исчезнет.",
+	},
+	{
+		"lng_oblivion_badge_once",
+		"Ради значка Oblivion меняет «О себе» не чаще одного раза за "
+		"запуск. Перезапустите Oblivion и попробуйте снова.",
+	},
+	{
+		"lng_oblivion_badge_wait",
+		"Telegram просит подождать, прежде чем снова менять профиль. "
+		"Попробуйте позже.",
+	},
+	{
+		"lng_oblivion_badge_failed",
+		"Не удалось связаться с Telegram. Попробуйте позже.",
+	},
+	{
+		"lng_oblivion_badge_rejected",
+		"Telegram не принял изменение «О себе», поэтому значок остался "
+		"выключенным. Если текст «О себе» почти достиг лимита длины, "
+		"сократите его и попробуйте снова после перезапуска Oblivion.",
+	},
+	{
+		"lng_oblivion_badge_busy",
+		"Секунду, предыдущее изменение ещё сохраняется.",
+	},
+	// Oblivion round 4: listen together.
+	{ "lng_oblivion_listen_settings", "Слушать вместе" },
+	{
+		"lng_oblivion_listen_settings_about",
+		"Можно запустить совместное прослушивание трека в чате или "
+		"присоединиться к чужому сеансу. Работает только между "
+		"пользователями Oblivion: состояние воспроизведения хранится "
+		"в обычном сообщении чата, которое приложение ведущего "
+		"редактирует, пока играет музыка.",
+	},
+	{ "lng_oblivion_listen_menu", "Слушать вместе в этом чате" },
+	{ "lng_oblivion_listen_message", "Слушаем вместе: {track}" },
+	{
+		"lng_oblivion_listen_message_ended",
+		"Совместное прослушивание завершено: {track}",
+	},
+	{ "lng_oblivion_listen_start_title", "Слушать вместе" },
+	{
+		"lng_oblivion_listen_start_text",
+		"В чат «{chat}» будет отправлено сообщение «Слушаем вместе: "
+		"{track}».",
+	},
+	{
+		"lng_oblivion_listen_start_text_about",
+		"Участники чата, у которых установлен Oblivion, смогут "
+		"присоединиться и слушать трек одновременно с вами. Управлять "
+		"воспроизведением будете только\xC2\xA0" "вы.",
+	},
+	{
+		"lng_oblivion_listen_start_text_send",
+		"В этом чате такого трека ещё нет, поэтому сам трек тоже будет "
+		"туда отправлен.",
+	},
+	{
+		"lng_oblivion_listen_start_text_online",
+		"Пока идёт сеанс, приложение редактирует это сообщение, поэтому "
+		"вас могут увидеть в сети, хотя сообщения отправляются без "
+		"появления в сети.",
+	},
+	{ "lng_oblivion_listen_start_button", "Начать" },
+	{ "lng_oblivion_listen_start_button_send", "Отправить и начать" },
+	{ "lng_oblivion_listen_join", "Присоединиться" },
+	{ "lng_oblivion_listen_leave", "Выйти" },
+	{ "lng_oblivion_listen_end", "Завершить" },
+	{ "lng_oblivion_listen_send", "Отправить в чат" },
+	{ "lng_oblivion_listen_bar_title", "Слушаем вместе" },
+	{ "lng_oblivion_listen_bar_title_offer", "{name} слушает музыку" },
+	{
+		"lng_oblivion_listen_bar_title_joined",
+		"Слушаем вместе · ведёт {name}",
+	},
+	{
+		"lng_oblivion_listen_bar_title_host",
+		"Слушаем вместе · вы ведущий",
+	},
+	{
+		"lng_oblivion_listen_bar_title_starting",
+		"Запускаем совместное прослушивание…",
+	},
+	{
+		"lng_oblivion_listen_bar_title_ended",
+		"Совместное прослушивание завершено",
+	},
+	{ "lng_oblivion_listen_bar_track_unknown", "Трек из этого чата" },
+	{ "lng_oblivion_listen_bar_paused", "пауза" },
+	{ "lng_oblivion_listen_bar_loading", "загрузка…" },
+	{ "lng_oblivion_listen_bar_own_pause", "у вас на паузе" },
+	{ "lng_oblivion_listen_bar_waiting", "Ждём ведущего…" },
+	{
+		"lng_oblivion_listen_bar_unavailable",
+		"Этот трек не найден в чате",
+	},
+	{ "lng_oblivion_listen_bar_away", "нет в этом чате" },
+	{ "lng_oblivion_listen_bar_sending", "отправляется…" },
+	{
+		"lng_oblivion_listen_bar_host_away",
+		"Ведущий слушает трек, которого нет в этом чате",
+	},
+	{
+		"lng_oblivion_listen_error_off",
+		"Совместное прослушивание выключено в настройках Oblivion.",
+	},
+	{
+		"lng_oblivion_listen_error_chat",
+		"Слушать вместе можно в личных чатах и в группах без тем.",
+	},
+	{
+		"lng_oblivion_listen_error_rights",
+		"Вы не можете отправлять сообщения в этот чат.",
+	},
+	{
+		"lng_oblivion_listen_error_paid",
+		"Сообщения в этот чат платные, начать там совместное "
+		"прослушивание нельзя.",
+	},
+	{ "lng_oblivion_listen_error_track", "Это не музыкальный трек." },
+	{
+		"lng_oblivion_listen_error_hosting",
+		"Вы уже ведёте совместное прослушивание. Сначала завершите его.",
+	},
+	{
+		"lng_oblivion_listen_error_send_track",
+		"Этот трек нельзя отправить в чат.",
+	},
+	{
+		"lng_oblivion_listen_error_start",
+		"Не удалось запустить совместное прослушивание.",
+	},
+	{
+		"lng_oblivion_listen_error_edit",
+		"Совместное прослушивание завершено: его сообщение больше "
+		"нельзя изменить.",
+	},
+	{
+		"lng_oblivion_listen_error_share_later",
+		"Трек ещё не отправлен в чат: Telegram не отвечает. Он "
+		"отправится сам, как только появится связь, повторять "
+		"отправку не нужно.",
+	},
+	{
+		"lng_oblivion_listen_error_share_failed",
+		"Не удалось отправить трек в чат. Можно попробовать ещё раз.",
+	},
+	{
+		"lng_oblivion_listen_error_slowmode",
+		"В этой группе включён медленный режим, поэтому трек и "
+		"сообщение сеанса нельзя отправить подряд. Сначала отправьте "
+		"трек в чат сами, а затем запустите совместное прослушивание.",
+	},
+	{
+		"lng_oblivion_listen_toast_away",
+		"Трека «{track}» нет в чате «{chat}». Слушатели на паузе, пока "
+		"вы не вернётесь к треку из этого чата или не отправите туда "
+		"этот.",
+	},
+	{ "lng_oblivion_listen_toast_stale", "Этот сеанс уже завершён." },
+	{
+		"lng_oblivion_listen_toast_hosting",
+		"Вы ведёте своё совместное прослушивание. Сначала завершите "
+		"его.",
+	},
+	{ "lng_oblivion_listen_toast_host", "Вы ведущий этого сеанса." },
+	{
+		"lng_oblivion_listen_toast_already",
+		"Вы уже слушаете вместе с этим ведущим.",
+	},
+	{
+		"lng_oblivion_listen_toast_ended",
+		"Совместное прослушивание завершено.",
+	},
+	{
+		"lng_oblivion_listen_toast_vanished",
+		"Ведущий пропал из сети, совместное прослушивание завершено.",
+	},
+	{
+		"lng_oblivion_listen_toast_left",
+		"Вы вышли из совместного прослушивания.",
+	},
+	// Oblivion round 4: lottie masks.
+	{ "lng_oblivion_lottie_mask_tool_select", "Выделение" },
+	{ "lng_oblivion_lottie_mask_tool_pen", "Перо: точки контура" },
+	{ "lng_oblivion_lottie_mask_mode", "Режим" },
+	{ "lng_oblivion_lottie_mask_mode_none", "Не действует" },
+	{ "lng_oblivion_lottie_mask_mode_add", "Сложение" },
+	{ "lng_oblivion_lottie_mask_mode_subtract", "Вычитание" },
+	{ "lng_oblivion_lottie_mask_mode_intersect", "Пересечение" },
+	{ "lng_oblivion_lottie_mask_mode_lighten", "Осветление" },
+	{ "lng_oblivion_lottie_mask_mode_darken", "Затемнение" },
+	{ "lng_oblivion_lottie_mask_mode_difference", "Разница" },
+	{
+		"lng_oblivion_lottie_mask_mode_skipped",
+		"Маски с таким режимом Telegram пропускает. Если других масок "
+		"у слоя нет, слой не рисуется вовсе.",
+	},
+	{ "lng_oblivion_lottie_mask_prop_feather", "Растушёвка маски" },
+	{ "lng_oblivion_lottie_mask_cmd_add_mask", "Новая маска" },
+	{ "lng_oblivion_lottie_mask_cmd_change_mask", "Изменение маски" },
+	{ "lng_oblivion_lottie_mask_cmd_matte", "Изменение маски по слою" },
+	{ "lng_oblivion_lottie_mask_cmd_parent", "Смена родителя" },
+	{ "lng_oblivion_lottie_mask_cmd_option", "Изменение параметра фигуры" },
+	{ "lng_oblivion_lottie_mask_cmd_gradient", "Изменение градиента" },
+	{ "lng_oblivion_lottie_mask_cmd_convert_paint", "Смена типа заливки" },
+	{ "lng_oblivion_lottie_mask_cmd_dashes", "Изменение пунктира" },
+	{ "lng_oblivion_lottie_mask_cmd_bake", "Скругление углов" },
+	{ "lng_oblivion_lottie_mask_cmd_add_path", "Новый контур" },
+	{ "lng_oblivion_lottie_mask_cmd_edit_path", "Изменение контура" },
+	{ "lng_oblivion_lottie_mask_issue_masks", "Использует маски." },
+	{
+		"lng_oblivion_lottie_mask_issue_mattes",
+		"Использует маски по слою — Telegram их рисует, но они "
+		"замедляют стикер.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_broken_mattes",
+		"У слоя с маской по слою нет слоя-маски над ним — Telegram "
+		"такой слой не нарисует.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_matte_links",
+		"Маска по слою ссылается не на соседний слой — Telegram возьмёт "
+		"тот слой, что лежит прямо над ним.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_masks_off",
+		"У слоя есть маски, но они выключены — Telegram их все "
+		"пропустит.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_modes",
+		"У некоторых масок режим, который Telegram пропускает: "
+		"«Не действует», «Осветление» или «Затемнение».",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_options",
+		"Непрозрачность, растушёвку и расширение масок Telegram "
+		"не учитывает — маска всегда сплошная, с чётким краем.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_inverted",
+		"Некоторые маски инвертированы флажком, который Telegram "
+		"не читает, — они работают как обычные.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_vertices",
+		"В ключевых кадрах контура разное число точек — лишние "
+		"Telegram отбросит.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_key_order",
+		"Файл записан в порядке, который Telegram читает неправильно: "
+		"часть фигур или поворотов слоёв пропадает.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_parents",
+		"У некоторых слоёв родитель указан неверно — Telegram такую "
+		"связь пропустит.",
+	},
+	{
+		"lng_oblivion_lottie_mask_issue_hang",
+		"В анимации есть значения, на которых Telegram зависает, "
+		"когда рисует стикер.",
+	},
+	{ "lng_oblivion_lottie_mask_fix_masks_on", "Включить маски" },
+	{ "lng_oblivion_lottie_mask_fix_modes", "Заменить режимы" },
+	{ "lng_oblivion_lottie_mask_fix_options", "Сбросить" },
+	{ "lng_oblivion_lottie_mask_fix_inverted", "Инвертировать режимом" },
+	{ "lng_oblivion_lottie_mask_fix_key_order", "Исправить порядок" },
+	{ "lng_oblivion_lottie_mask_fix_parents", "Убрать связи" },
+	{
+		"lng_oblivion_lottie_mask_fix_hang",
+		"Сделать значения безопасными",
+	},
+	{ "lng_oblivion_lottie_mask_category_file", "Файл" },
+	{
+		"lng_oblivion_lottie_mask_category_forbidden",
+		"Telegram не принимает в стикерах",
+	},
+	{
+		"lng_oblivion_lottie_mask_category_not_rendered",
+		"Telegram нарисует иначе",
+	},
+	{ "lng_oblivion_lottie_mask_category_advice", "Советы" },
+	{
+		"lng_oblivion_lottie_mask_note_rendered",
+		"Это запрещено правилами Telegram для анимированных стикеров, "
+		"даже если рисуется правильно.",
+	},
+	{
+		"lng_oblivion_lottie_mask_note_ignored",
+		"Telegram это ещё и не нарисует.",
+	},
+	{
+		"lng_oblivion_lottie_mask_note_fix_changes",
+		"Исправление изменит вид стикера в Telegram.",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_title",
+		"Перед тем как сделать стикер",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_pack_errors",
+		"Добавить такой стикер в набор пока нельзя. Сначала исправьте "
+		"проблемы ниже.",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_pack_warnings",
+		"Перед добавлением в набор посмотрите, что Telegram "
+		"не принимает или нарисует иначе.",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_tgs_errors",
+		"Файл .tgs — это стикер Telegram, а такой стикер Telegram "
+		"не примет.",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_tgs_warnings",
+		"Файл .tgs — это стикер Telegram. Вот что Telegram "
+		"не принимает или нарисует иначе.",
+	},
+	{
+		"lng_oblivion_lottie_mask_check_scope",
+		"Это касается только стикеров Telegram (.tgs). Экспорт в JSON, "
+		"видео и GIF сохраняет всё как есть.",
+	},
+	{ "lng_oblivion_lottie_mask_check_add", "Добавить в набор" },
+	{ "lng_oblivion_lottie_mask_check_add_anyway", "Всё равно добавить" },
+	{
+		"lng_oblivion_lottie_mask_check_save_anyway",
+		"Всё равно сохранить",
+	},
+	{ "lng_oblivion_lottie_mask_check_continue", "Продолжить" },
+	{
+		"lng_oblivion_lottie_mask_check_continue_anyway",
+		"Всё равно продолжить",
+	},
+	{ "lng_oblivion_lottie_mask_links", "Связи" },
+	{ "lng_oblivion_lottie_mask_parent", "Родитель" },
+	{ "lng_oblivion_lottie_mask_parent_none", "Нет" },
+	{ "lng_oblivion_lottie_mask_matte", "Маска по слою" },
+	{ "lng_oblivion_lottie_mask_matte_alpha", "Альфа" },
+	{ "lng_oblivion_lottie_mask_matte_alpha_inv", "Альфа (инв.)" },
+	{ "lng_oblivion_lottie_mask_matte_luma", "Яркость" },
+	{ "lng_oblivion_lottie_mask_matte_luma_inv", "Яркость (инв.)" },
+	{
+		"lng_oblivion_lottie_mask_matte_alpha_about",
+		"Этот слой виден только там, где слой-маска непрозрачен.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_alpha_inv_about",
+		"Этот слой виден только там, где слой-маска прозрачен.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_luma_about",
+		"Этот слой виден только там, где слой-маска светлый.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_luma_inv_about",
+		"Этот слой виден только там, где слой-маска тёмный.",
+	},
+	{ "lng_oblivion_lottie_mask_matte_layer", "Слой-маска" },
+	{
+		"lng_oblivion_lottie_mask_matte_for",
+		"Служит маской для слоя «{name}»",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_hint",
+		"Маска по слою показывает этот слой только там, где есть "
+		"другой слой. «Альфа» — где тот непрозрачен, «Яркость» — где "
+		"он светлый, «инв.» — наоборот.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_about",
+		"Слой-маска держится прямо над этим слоем и сам не рисуется. "
+		"Telegram такие маски рисует, но правила для анимированных "
+		"стикеров их не разрешают, и они замедляют стикер.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_broken",
+		"Над слоем нет слоя-маски, поэтому он не рисуется. Выберите "
+		"слой-маску.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_no_layer",
+		"Над этим слоем нет слоя, который можно сделать его маской.",
+	},
+	{
+		"lng_oblivion_lottie_mask_matte_bad_layer",
+		"Этот слой нельзя сделать маской: он сам под маской или уже "
+		"служит маской другому слою.",
+	},
+	{ "lng_oblivion_lottie_mask_masks", "Маски" },
+	{ "lng_oblivion_lottie_mask_add", "Добавить маску" },
+	{ "lng_oblivion_lottie_mask_add_to", "Маска для слоя «{name}»" },
+	{ "lng_oblivion_lottie_mask_enable", "Включить маски" },
+	{
+		"lng_oblivion_lottie_mask_masks_hint",
+		"Маска обрезает слой по контуру. Новая маска — прямоугольник "
+		"вокруг слоя, его точки двигаются пером.",
+	},
+	{
+		"lng_oblivion_lottie_mask_masks_list_hint",
+		"Маски действуют по очереди, начиная с первой. Нажмите "
+		"на название, чтобы открыть маску.",
+	},
+	{
+		"lng_oblivion_lottie_mask_masks_off",
+		"Маски этого слоя выключены и ничего не обрезают.",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_masks",
+		"Telegram не принимает маски в анимированных стикерах. "
+		"В экспорте в видео, GIF и JSON они работают.",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_options",
+		"Telegram рисует только контур маски: непрозрачность, "
+		"расширение и растушёвка не учитываются.",
+	},
+	{ "lng_oblivion_lottie_mask_invert", "Инвертировать" },
+	{
+		"lng_oblivion_lottie_mask_invert_failed",
+		"У этого режима нет обратного. Сначала выберите «Сложение» "
+		"или «Вычитание».",
+	},
+	{
+		"lng_oblivion_lottie_mask_inverted_flag",
+		"У маски стоит флажок инверсии, который Telegram не читает. "
+		"«Инвертировать» делает то же самое режимом.",
+	},
+	{
+		"lng_oblivion_lottie_mask_gradient_hint",
+		"Щёлкните под полосой, чтобы добавить цвет, над полосой — "
+		"прозрачность. Метки можно двигать, а чтобы убрать метку, "
+		"утащите её в сторону от полосы.",
+	},
+	{
+		"lng_oblivion_lottie_mask_gradient_no_stop",
+		"Нажмите на метку, чтобы изменить её",
+	},
+	{ "lng_oblivion_lottie_mask_gradient_remove", "Убрать" },
+	{ "lng_oblivion_lottie_mask_gradient_stop_color", "Цвет" },
+	{ "lng_oblivion_lottie_mask_gradient_stop_opacity", "Непрозрачность" },
+	{ "lng_oblivion_lottie_mask_gradient_stop_position", "Позиция" },
+	{ "lng_oblivion_lottie_mask_to_gradient", "Сделать градиентом" },
+	{ "lng_oblivion_lottie_mask_to_solid", "Сделать сплошным цветом" },
+	{
+		"lng_oblivion_lottie_mask_telegram_gradient_stroke",
+		"Telegram не принимает градиентные обводки в анимированных "
+		"стикерах.",
+	},
+	{ "lng_oblivion_lottie_mask_dashes", "Пунктир" },
+	{ "lng_oblivion_lottie_mask_dashes_pattern", "Узор" },
+	{ "lng_oblivion_lottie_mask_dashes_none", "Без пунктира" },
+	{ "lng_oblivion_lottie_mask_dashes_pairs#one", "{count} штрих" },
+	{ "lng_oblivion_lottie_mask_dashes_pairs#few", "{count} штриха" },
+	{ "lng_oblivion_lottie_mask_dashes_pairs#many", "{count} штрихов" },
+	{ "lng_oblivion_lottie_mask_dashes_pairs#other", "{count} штриха" },
+	{
+		"lng_oblivion_lottie_mask_trim_hint",
+		"Показывает только часть контуров, лежащих выше: от начала "
+		"до конца, в процентах их длины.",
+	},
+	{
+		"lng_oblivion_lottie_mask_repeater_hint",
+		"Повторяет всё, что лежит выше в группе: каждая копия "
+		"сдвигается, поворачивается и масштабируется чуть сильнее "
+		"предыдущей.",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_repeater",
+		"Telegram не принимает повторители в анимированных стикерах.",
+	},
+	{
+		"lng_oblivion_lottie_mask_bake",
+		"Превратить в настоящие скругления",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_round",
+		"Этот модификатор Telegram не рисует. Превратите его "
+		"в настоящие скругления контуров.",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_modifier",
+		"Этот модификатор Telegram не рисует.",
+	},
+	{
+		"lng_oblivion_lottie_mask_telegram_star",
+		"Telegram не принимает звёзды и многоугольники "
+		"в анимированных стикерах.",
+	},
+	{
+		"lng_oblivion_lottie_mask_convert_hint",
+		"У прямоугольника и эллипса нет точек. Преобразуйте фигуру "
+		"в контур, чтобы править точки пером.",
+	},
+	{
+		"lng_oblivion_lottie_mask_path_hint",
+		"Направление важно для обрезки контуров: она идёт от первой "
+		"точки.",
+	},
+	{ "lng_oblivion_lottie_mask_pen_edit", "Править точки" },
+	{ "lng_oblivion_lottie_mask_pen_convert", "Преобразовать в контур" },
+	{ "lng_oblivion_lottie_mask_pen_delete_point", "Удалить точку" },
+	{ "lng_oblivion_lottie_mask_pen_make_smooth", "Сделать гладкой" },
+	{ "lng_oblivion_lottie_mask_pen_make_corner", "Сделать угловой" },
+	{ "lng_oblivion_lottie_mask_pen_add_point", "Добавить точку здесь" },
+	{ "lng_oblivion_lottie_mask_pen_close", "Замкнуть контур" },
+	{ "lng_oblivion_lottie_mask_pen_open", "Разомкнуть контур" },
+	{ "lng_oblivion_lottie_mask_pen_reverse", "Развернуть направление" },
+	{
+		"lng_oblivion_lottie_mask_pen_min_points",
+		"В контуре должно остаться хотя бы две точки.",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_select",
+		"Выберите контур или маску, чтобы править точки",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_pick",
+		"Нажмите на обведённый контур или маску",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_new",
+		"Щёлкните в двух местах, чтобы начать новый контур",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_pick_or_new",
+		"Нажмите на обведённый контур или щёлкните в двух местах "
+		"для нового",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_second",
+		"Щёлкните там, где будет вторая точка",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_edit",
+		"Тяните точки и рычаги; щелчок по линии добавляет точку",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_continue",
+		"Щёлкайте, чтобы продолжить контур; нажмите на другой конец, "
+		"чтобы замкнуть",
+	},
+	{
+		"lng_oblivion_lottie_mask_pen_hint_shape",
+		"У этой фигуры нет точек: преобразуйте её в контур "
+		"(правый щелчок)",
+	},
+	// Oblivion round 4: lottie graph.
+	{ "lng_oblivion_lottie_graph_toggle", "График плавности" },
+	{ "lng_oblivion_lottie_graph_show", "График плавности" },
+	{ "lng_oblivion_lottie_graph_value", "Значение" },
+	{ "lng_oblivion_lottie_graph_speed", "Скорость" },
+	{ "lng_oblivion_lottie_graph_path", "По траектории" },
+	{ "lng_oblivion_lottie_graph_title", "{property} · {name}" },
+	{
+		"lng_oblivion_lottie_graph_empty",
+		"Раскройте слой слева и нажмите на название свойства "
+		"с ключевыми кадрами — здесь появится его график.",
+	},
+	{ "lng_oblivion_lottie_graph_key", "Ключ {value}" },
+	{ "lng_oblivion_lottie_graph_axis_value", "Значение" },
+	{ "lng_oblivion_lottie_graph_axis_progress", "Путь между ключами" },
+	{ "lng_oblivion_lottie_graph_axis_speed", "Единиц в секунду" },
+	{
+		"lng_oblivion_lottie_graph_axis_speed_progress",
+		"Ключей в секунду",
+	},
+	{
+		"lng_oblivion_lottie_graph_value_about",
+		"Как значение меняется со временем. Тяните круглые рычаги, "
+		"чтобы изменить плавность.",
+	},
+	{
+		"lng_oblivion_lottie_graph_value_progress_about",
+		"Это значение не число, поэтому график показывает путь "
+		"от одного ключевого кадра к следующему.",
+	},
+	{
+		"lng_oblivion_lottie_graph_speed_about",
+		"Как быстро меняется значение. Рычаг задаёт скорость у своего "
+		"ключевого кадра и то, как долго она держится.",
+	},
+	{
+		"lng_oblivion_lottie_graph_path_about",
+		"Значение движется по кривой и не может выйти за ключевые "
+		"кадры. Выключите, чтобы плавность могла «перелетать» значения.",
+	},
+	// Oblivion round 4 end.
+};
+
 [[nodiscard]] bool IsRussianCode(QString code) {
 	code = code.trimmed().toLower().replace('_', '-');
 	if (code.startsWith('-')) {
@@ -2239,6 +4525,7 @@ const std::vector<LangOverride> &RussianStrings() {
 		append(kLocalNames);
 		append(kTools);
 		append(kExtras);
+		append(kRound4);
 		return list;
 	}();
 	return result;

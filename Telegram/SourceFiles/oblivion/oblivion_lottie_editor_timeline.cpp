@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "oblivion/oblivion_lottie_doc.h"
 #include "oblivion/oblivion_lottie_editor.h"
+#include "oblivion/oblivion_lottie_editor_graph.h"
 #include "ui/effects/animation_value.h"
 #include "ui/layers/show.h"
 #include "ui/painter.h"
@@ -246,6 +247,12 @@ struct CopiedKeyframe {
 	return result;
 }
 
+// The easing graph instead of the tracks, kept for the app session.
+[[nodiscard]] bool &LastGraphShown() {
+	static auto result = false;
+	return result;
+}
+
 } // namespace
 
 struct TimelinePanel::Drag {
@@ -340,9 +347,60 @@ TimelinePanel::TimelinePanel(
 	}, lifetime());
 
 	_viewStart = _controller->firstFrame();
+
+	_graphEditor = Ui::CreateChild<GraphEditor>(this, controller);
+	_graphEditor->hide();
+	showGraph(LastGraphShown(), false);
 }
 
 TimelinePanel::~TimelinePanel() = default;
+
+bool TimelinePanel::graphShown() const {
+	return _graphShown;
+}
+
+void TimelinePanel::setGraphShown(bool shown) {
+	showGraph(shown, false);
+}
+
+not_null<GraphEditor*> TimelinePanel::graph() const {
+	return _graphEditor;
+}
+
+void TimelinePanel::showGraph(bool shown, bool remember) {
+	if (remember) {
+		LastGraphShown() = shown;
+	}
+	if (_drag) {
+		finishDrag(true);
+	}
+	if (!shown) {
+		_graphEditor->cancelDrag();
+	}
+	_graphShown = shown;
+	_graph->setActive(shown);
+	updateGraphGeometry();
+	_graphEditor->setVisible(shown);
+	update();
+}
+
+void TimelinePanel::updateGraphGeometry() {
+	if (!_graphEditor) {
+		return;
+	}
+	const auto names = namesWidth();
+	const auto top = rowsTop();
+	_graphEditor->setGeometry(
+		names,
+		top,
+		std::max(width() - names, 0),
+		std::max(height() - top, 0));
+	_graphEditor->setTimeView(
+		trackLeft() - names,
+		trackRight() - names,
+		_viewStart,
+		viewSpan());
+}
 
 void TimelinePanel::setupControls() {
 	const auto size = Scaled(kButtonSize);
@@ -429,6 +487,15 @@ void TimelinePanel::setupControls() {
 	_zoomOut->setClickedCallback([=] { zoomTime(1. / kTimeZoomStep); });
 	_zoomIn->setClickedCallback([=] { zoomTime(kTimeZoomStep); });
 	_zoomOut->setDisabled(true);
+
+	_graph = Ui::CreateChild<GlyphButton>(
+		this,
+		Glyph::Graph,
+		tr::lng_oblivion_lottie_graph_toggle(),
+		size);
+	_graph->setClickedCallback([=] {
+		showGraph(!_graphShown, true);
+	});
 	refreshPlayButton();
 }
 
@@ -455,6 +522,8 @@ void TimelinePanel::updateControlsGeometry() {
 	}
 	left += Scaled(kGroupSkip) - skip;
 	_loop->moveToLeft(left, top, width());
+	left += size + Scaled(kGroupSkip);
+	_graph->moveToLeft(left, top, width());
 
 	auto right = width() - padding + Scaled(4);
 	right -= size;
@@ -749,6 +818,7 @@ void TimelinePanel::setViewStart(double start) {
 		start,
 		first,
 		std::max(first, first + count - viewSpan()));
+	updateGraphGeometry();
 	update();
 }
 
@@ -1646,6 +1716,10 @@ void TimelinePanel::keyPressEvent(QKeyEvent *e) {
 	if (_drag && e->key() == Qt::Key_Escape) {
 		finishDrag(true);
 		return;
+	} else if (e->key() == Qt::Key_Escape
+		&& _graphShown
+		&& _graphEditor->cancelDrag()) {
+		return;
 	} else if ((e->modifiers() & Qt::ControlModifier)
 		&& e->key() == Qt::Key_A) {
 		selectAllKeyframes();
@@ -1742,6 +1816,15 @@ void TimelinePanel::showKeyframeMenu(int index, QPoint globalPosition) {
 			[=] { setEasing(preset); },
 			(current == preset) ? &st::mediaPlayerMenuCheck : nullptr);
 	}
+	_menu->addAction(
+		tr::lng_oblivion_lottie_graph_show(tr::now),
+		[=] {
+			if (!selected.empty()) {
+				_controller->setActiveProperty(selected.front().property);
+			}
+			showGraph(true, true);
+		},
+		&st::menuIconCustomize);
 	_menu->addSeparator();
 	if (selected.size() == 1
 		&& index >= 0
@@ -1887,7 +1970,7 @@ void TimelinePanel::paintTransport(QPainter &p, QRect clip) {
 			QString::number(_controller->currentFrame())),
 		lt_time,
 		FormatSeconds((fps > 0.) ? (index / fps) : 0.));
-	const auto left = _loop->x() + _loop->width() + Scaled(kGroupSkip);
+	const auto left = _graph->x() + _graph->width() + Scaled(kGroupSkip);
 	const auto right = _zoomOut->x() - Scaled(kGroupSkip);
 	if (right <= left) {
 		return;

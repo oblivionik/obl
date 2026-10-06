@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "main/main_session.h"
 
+#include "oblivion/oblivion_badge.h"
+#include "oblivion/oblivion_chat_stats.h"
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_online.h"
 #include "oblivion/oblivion_playlists.h"
@@ -276,6 +278,7 @@ Session::Session(
 	crl::on_main(this, [=] {
 		Oblivion::StartOnlineTracker(this);
 		Oblivion::StartProfileHistory(this);
+		Oblivion::Badge::Start(this);
 		Oblivion::CleanupVideoEditorTemp(this);
 	});
 }
@@ -323,6 +326,8 @@ void Session::finishLogout() {
 	Oblivion::ForgetDeleted(this);
 	Oblivion::ForgetOnlineJournal(this);
 	Oblivion::ForgetProfileHistory(this);
+	Oblivion::ForgetChatStats(this);
+	Oblivion::Badge::Forget(this);
 }
 
 Session::~Session() {

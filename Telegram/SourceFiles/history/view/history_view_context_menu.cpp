@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/view/history_view_context_menu.h"
 
 #include "oblivion/oblivion_deleted_store.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_media_save.h"
 #include "oblivion/oblivion_message_tools.h"
 #include "oblivion/oblivion_music_editor.h"
@@ -1671,6 +1672,10 @@ void FillContextMenuItems(
 			list->controller(),
 			item);
 		Oblivion::AddToPlaylistMenu(result, list->controller(), item);
+		Oblivion::Listen::AddStartAction( // Oblivion: listen together.
+			result,
+			list->controller(),
+			item);
 		if (!list->hasCopyMediaRestriction(item)) {
 			Oblivion::AddMusicEditorAction(
 				result,

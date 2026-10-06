@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_video_project.h"
 
 #include "oblivion/oblivion_audio.h"
+#include "oblivion/oblivion_video_editor.h"
 
 #include <QtGui/QPainter>
 #include <QtGui/QTransform>
@@ -556,6 +557,43 @@ QString FormatExtension(Format format) {
 	return u"mp4"_q;
 }
 
+QSize PreviewSize(QSize crop, int maxSide) {
+	return ScaledDown(crop, maxSide);
+}
+
+QImage ComposePreview(
+		const QImage &frame,
+		QSize canvas,
+		QRect crop,
+		QSize output,
+		int rotation) {
+	if (output.isEmpty()) {
+		return QImage();
+	}
+	auto result = Filled(output, QRgb(0xFF000000U));
+	if (frame.isNull() || canvas.isEmpty() || crop.isEmpty()) {
+		return result;
+	}
+	rotation = NormalizedRotation(rotation);
+	const auto rotated = rotation
+		? frame.transformed(QTransform().rotate(rotation))
+		: frame;
+
+	// Where the frame is in the canvas, then in the result.
+	const auto fitted = FitRect(QSizeF(rotated.size()), QSizeF(canvas));
+	const auto scaleX = output.width() / float64(crop.width());
+	const auto scaleY = output.height() / float64(crop.height());
+	const auto target = QRectF(
+		(fitted.x() - crop.x()) * scaleX,
+		(fitted.y() - crop.y()) * scaleY,
+		fitted.width() * scaleX,
+		fitted.height() * scaleY);
+	auto p = QPainter(&result);
+	p.setRenderHint(QPainter::SmoothPixmapTransform);
+	p.drawImage(target, rotated);
+	return result;
+}
+
 int ExportMaxSide(const ExportOptions &options) {
 	switch (options.format) {
 	case Format::Sticker: return VideoCore::kStickerSide;
@@ -717,6 +755,11 @@ ExportResult Export(
 		gif = std::make_unique<VideoCore::GifEncoder>(output);
 	}
 
+	// One for the whole result: the effects that remember the frames go
+	// on over the joints of the clips.
+	const auto effects = VideoFx::HasEnabled(state.fx);
+	VideoFx::Processor processor(effects ? state.fx : VideoFx::Stack());
+
 	const auto readShare = sticker ? kStickerReadShare : 1.;
 	auto outEnd = crl::time(0); // The end of the last frame of the result.
 	auto audioGiven = int64(0);
@@ -759,7 +802,7 @@ ExportResult Export(
 			if (duration <= 0) {
 				return true;
 			}
-			const auto image = Compose(
+			auto image = Compose(
 				std::move(frame.image),
 				placement,
 				output,
@@ -768,6 +811,14 @@ ExportResult Export(
 			if (image.isNull()) {
 				failed = true;
 				return false;
+			}
+			if (effects) {
+				// outEnd is still the time this frame starts at.
+				image = processor.process(std::move(image), outEnd);
+				if (image.isNull()) {
+					failed = true;
+					return false;
+				}
 			}
 			if (mp4) {
 				if (!mp4->add(image, duration)) {
@@ -1584,6 +1635,278 @@ bool RunSelfTest(QStringList &log) {
 			u"progress"_q,
 			u"%1 calls, the last one %2"_q.arg(calls).arg(last));
 	}
+
+	// Effects.
+	const auto effect = [](
+			VideoFx::Type type,
+			std::initializer_list<std::pair<const char*, float64>> values) {
+		auto result = VideoFx::MakeEntry(type);
+		for (const auto &[id, value] : values) {
+			const auto index = VideoFx::FindParam(
+				type,
+				QString::fromLatin1(id));
+			if (index >= 0 && index < int(result.values.size())) {
+				result.values[index] = value;
+			}
+		}
+		return VideoFx::Sanitized(std::move(result));
+	};
+
+	// The right half is reflected to the left (green over yellow on both
+	// sides), then what is brighter than the green becomes white and the
+	// rest black: a black top and a white bottom.
+	const auto twoEffects = VideoFx::Stack{
+		effect(VideoFx::Type::Mirror, { { "mode", 1. } }),
+		effect(VideoFx::Type::Threshold, {
+			{ "level", 63. },
+			{ "softness", 0. },
+		}),
+	};
+	const auto black = QRgb(0xFF000000U);
+	const auto white = QRgb(0xFFFFFFFFU);
+	const auto blackOverWhite = [&](const std::array<QRgb, 4> &corners) {
+		return TestNear(corners[0], black)
+			&& TestNear(corners[1], black)
+			&& TestNear(corners[2], white)
+			&& TestNear(corners[3], white);
+	};
+	{
+		auto first = State{ .clips = { { 0, 0, 500 } }, .speed = 150 };
+		first.fx = twoEffects;
+		const auto copy = first;
+		auto changed = first;
+		changed.fx[1].values[0] -= 1.;
+		auto off = first;
+		off.fx[0].enabled = false;
+		auto reordered = first;
+		std::swap(reordered.fx[0], reordered.fx[1]);
+		auto plain = first;
+		plain.fx.clear();
+
+		// The way a kept stack comes back.
+		auto restored = plain;
+		restored.fx = VideoFx::Deserialize(VideoFx::Serialize(first.fx));
+		check(
+			(copy == first)
+				&& (changed != first)
+				&& (off != first)
+				&& (reordered != first)
+				&& (plain != first)
+				&& (restored == first)
+				&& VideoFx::HasEnabled(first.fx)
+				&& !VideoFx::HasEnabled(plain.fx),
+			u"effects in the state of a project"_q,
+			u"%1 effects, %2 bytes"_q
+				.arg(first.fx.size())
+				.arg(VideoFx::Serialize(first.fx).size()));
+	}
+	{
+		// The left half of the frame turned by 90 degrees: the bottom half
+		// of the source, its left end up.
+		const auto frame = TestQuadrants(QSize(320, 240));
+		const auto whole = ComposePreview(
+			frame,
+			kTestSize,
+			QRect(QPoint(), kTestSize),
+			QSize(80, 60),
+			0);
+		const auto canvas = kTestSize.transposed();
+		const auto crop = CropRect(canvas, QRectF(0., 0., 0.5, 1.));
+		const auto output = PreviewSize(crop.size(), 80);
+		const auto turned = ComposePreview(frame, canvas, crop, output, 90);
+		const auto ok = (whole.size() == QSize(80, 60))
+			&& TestNear(whole.pixel(20, 15), kTestColors[0])
+			&& TestNear(whole.pixel(60, 45), kTestColors[3])
+			&& (crop == QRect(0, 0, 60, 160))
+			&& (output == QSize(30, 80))
+			&& (turned.size() == output)
+			&& TestNear(turned.pixel(15, 20), kTestColors[2])
+			&& TestNear(turned.pixel(15, 60), kTestColors[3])
+			&& (PreviewSize(QSize(60, 160), 1000) == QSize(60, 160))
+			&& ComposePreview(frame, canvas, crop, QSize(), 90).isNull();
+
+		// A portrait frame in the landscape canvas: bars on the sides.
+		const auto bars = ComposePreview(
+			TestQuadrants(QSize(120, 160)),
+			kTestSize,
+			QRect(QPoint(), kTestSize),
+			kTestSize,
+			0);
+		check(
+			ok
+				&& TestNear(bars.pixel(8, 60), black)
+				&& TestNear(bars.pixel(152, 60), black)
+				&& TestNear(bars.pixel(60, 30), kTestColors[0])
+				&& TestNear(bars.pixel(100, 90), kTestColors[3]),
+			u"frames for the preview of the effects"_q,
+			size(output)
+				+ ' '
+				+ (turned.isNull()
+					? QString()
+					: (TestColor(turned.pixel(15, 20))
+						+ ' '
+						+ TestColor(turned.pixel(15, 60)))));
+	}
+	{
+		const auto clean = run({});
+		const auto result = run({ .fx = twoEffects });
+		const auto corners = TestCorners(result.content);
+		const auto was = VideoCore::ReadFrame({ .content = clean.content });
+		const auto now = VideoCore::ReadFrame({ .content = result.content });
+		auto difference = 0.;
+		if (!was.isNull() && was.size() == now.size()) {
+			auto sum = int64(0);
+			for (auto y = 0; y != was.height(); ++y) {
+				for (auto x = 0; x != was.width(); ++x) {
+					const auto a = was.pixel(x, y);
+					const auto b = now.pixel(x, y);
+					sum += std::abs(qRed(a) - qRed(b))
+						+ std::abs(qGreen(a) - qGreen(b))
+						+ std::abs(qBlue(a) - qBlue(b));
+				}
+			}
+			difference = sum / (3. * was.width() * was.height());
+		}
+		check(
+			timed(result, kTestDuration)
+				&& result.size == clean.size
+				&& result.frames == clean.frames
+				&& result.audio
+				&& blackOverWhite(corners)
+				&& difference > 40.,
+			u"mp4 with two effects"_q,
+			describe(result)
+				+ u", "_q
+				+ colors(corners)
+				+ u", differs by %1"_q.arg(difference, 0, 'f', 1));
+	}
+	{
+		// Switched off, the effects change nothing.
+		auto stack = twoEffects;
+		for (auto &entry : stack) {
+			entry.enabled = false;
+		}
+		const auto result = run({ .fx = stack });
+		const auto corners = TestCorners(result.content);
+		check(
+			result.ok
+				&& TestNear(corners[0], kTestColors[0])
+				&& TestNear(corners[1], kTestColors[1])
+				&& TestNear(corners[2], kTestColors[2])
+				&& TestNear(corners[3], kTestColors[3]),
+			u"effects that are switched off"_q,
+			describe(result) + u", "_q + colors(corners));
+	}
+	{
+		// The effects are applied after the turn and the crop: the left
+		// half of the turned frame is the bottom half of the source, the
+		// blue over the yellow. Its bottom is reflected up, so the blue is
+		// gone, and the yellow is brighter than the level. Before the turn
+		// the same effects would leave the blue, black after the threshold.
+		const auto result = run({
+			.crop = QRectF(0., 0., 0.5, 1.),
+			.aspect = Aspect::Free,
+			.rotation = 90,
+			.fx = {
+				effect(VideoFx::Type::Mirror, { { "mode", 3. } }),
+				twoEffects[1],
+			},
+		});
+		const auto corners = TestCorners(result.content);
+		check(
+			result.ok
+				&& result.size == QSize(60, 160)
+				&& TestNear(corners[0], white)
+				&& TestNear(corners[1], white)
+				&& TestNear(corners[2], white)
+				&& TestNear(corners[3], white),
+			u"effects after the turn and the crop"_q,
+			describe(result) + u", "_q + colors(corners));
+	}
+	{
+		// A strobe, black for the first quarter of a second out of every
+		// half: the second clip starts at 300 ms of the result, where the
+		// time of the effects must go on and not start again.
+		const auto piece = crl::time(300);
+		const auto result = run({
+			.clips = { { 0, 0, piece }, { 0, 0, piece } },
+			.fx = { effect(VideoFx::Type::Strobe, {
+				{ "frequency", 2. },
+				{ "duty", 50. },
+				{ "mode", 0. },
+			}) },
+		});
+		const auto at = [&](crl::time position) {
+			const auto frame = VideoCore::ReadFrame({
+				.content = result.content,
+				.from = position,
+			});
+			return frame.isNull()
+				? QRgb(0xFF808080U)
+				: frame.pixel(frame.width() / 4, frame.height() / 4);
+		};
+		const auto dark = at(110);
+		const auto shown = at(410);
+		const auto darkAgain = at(560);
+		check(
+			timed(result, 2 * piece)
+				&& TestNear(dark, black)
+				&& TestNear(shown, kTestColors[0])
+				&& TestNear(darkAgain, black),
+			u"effects get the time of the result"_q,
+			describe(result)
+				+ u", "_q
+				+ TestColor(dark)
+				+ ' '
+				+ TestColor(shown)
+				+ ' '
+				+ TestColor(darkAgain));
+	}
+	{
+		const auto telegram = run(
+			{ .fx = twoEffects },
+			{ .format = Format::GifVideo });
+		const auto file = run(
+			{ .fx = twoEffects },
+			{ .format = Format::Gif, .maxSide = 80 });
+		const auto fileCorners = TestCorners(file.content);
+		check(
+			telegram.ok
+				&& !telegram.audio
+				&& blackOverWhite(TestCorners(telegram.content))
+				&& file.ok
+				&& file.content.startsWith("GIF89a")
+				&& file.size == QSize(80, 60)
+				&& blackOverWhite(fileCorners),
+			u"GIF with effects"_q,
+			describe(file) + u", "_q + colors(fileCorners));
+	}
+	{
+		const auto sticker = run(
+			{ .clips = { { 0, 0, 400 } }, .fx = twoEffects },
+			{ .format = Format::Sticker });
+		const auto emoji = run(
+			{ .clips = { { 0, 0, 400 } }, .fx = twoEffects },
+			{ .format = Format::Emoji });
+		const auto stickerCorners = TestCorners(sticker.content);
+		const auto emojiCorners = TestCorners(emoji.content);
+		check(
+			sticker.ok
+				&& sticker.size == QSize(512, 384)
+				&& sticker.content.size() <= VideoCore::kStickerMaxBytes
+				&& blackOverWhite(stickerCorners)
+				&& emoji.ok
+				&& emoji.content.size() <= VideoCore::kEmojiMaxBytes
+				&& blackOverWhite(emojiCorners),
+			u"sticker and emoji with effects"_q,
+			describe(sticker)
+				+ u", "_q
+				+ colors(stickerCorners)
+				+ u"; "_q
+				+ describe(emoji)
+				+ u", "_q
+				+ colors(emojiCorners));
+	}
 	{
 		const auto wide = Project{
 			.sources = { Source{
@@ -1621,7 +1944,10 @@ bool RunSelfTest(QStringList &log) {
 				+ size(sticker)
 				+ u", about %1 bytes"_q.arg(estimate));
 	}
-	return passed;
+
+	// What the editor itself decides, without its widgets.
+	const auto editor = VideoEditorSelfTest(log);
+	return passed && editor;
 }
 
 } // namespace Oblivion::VideoEdit

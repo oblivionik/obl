@@ -30,7 +30,16 @@ class SessionController;
 // The packs of the account are listed by messages.getMyStickers. A pack is
 // viewed, reordered, renamed and deleted in the usual sticker set box, it
 // has all of that for the creator of the set.
+//
+// Many files at once, custom emoji sets included, are added by the batch
+// box of oblivion_sticker_batch.h: the list of the packs opens it by the
+// "Add several…" button, from the menu of a pack and for the files
+// dropped onto the list.
 namespace Oblivion {
+
+namespace StickerPacks {
+struct BatchBackend;
+} // namespace StickerPacks
 
 struct StickerSource {
 	enum class Type : uchar {
@@ -91,6 +100,15 @@ void AddToStickerPack(StickerSource source, Fn<void()> added = nullptr);
 // a pack, its "File" button saves the file (.png or .webp, .tgs, .webm)
 // or sends it to a chat as a document, the @Stickers bot takes only such.
 void ShowStickerConverter(not_null<Window::SessionController*> controller);
+
+// The session part of the batch box, for oblivion_sticker_batch.cpp only:
+// the own sets of the account of the window (sticker and custom emoji
+// ones), the box that asks for the name of a new set, the upload of one
+// sticker at a time (BatchBackend in oblivion_sticker_packs_core.h). What
+// it returns must not outlive the session: it is kept by a box of that
+// window and by nothing else.
+[[nodiscard]] StickerPacks::BatchBackend MakeStickerBatchBackend(
+	not_null<Window::SessionController*> controller);
 
 // Chat context menu hooks. "Make a sticker" for a photo or an image file
 // (the full size image is downloaded first, the background can be removed

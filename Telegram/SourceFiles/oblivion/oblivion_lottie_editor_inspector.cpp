@@ -11,10 +11,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "oblivion/oblivion_lottie_doc.h"
 #include "oblivion/oblivion_lottie_editor.h"
+#include "oblivion/oblivion_lottie_editor_masks.h"
 #include "oblivion/oblivion_lottie_editor_palette.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/abstract_button.h"
 #include "ui/effects/animation_value.h"
+#include "ui/layers/show.h"
 #include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "ui/widgets/checkbox.h"
@@ -55,8 +57,10 @@ constexpr auto kGradientHandle = 12;
 constexpr auto kGradientPointer = 3;
 // Room for the handles on one side of the bar.
 constexpr auto kGradientSide = kGradientHandle + kGradientPointer + 1;
-// Above the bar when there are no opacity stops (handles only below).
-constexpr auto kGradientCompactTop = 6;
+// A stop dragged this far away from its side of the bar is removed.
+constexpr auto kGradientRemoveDistance = 22;
+constexpr auto kStopPositionWidth = 52;
+constexpr auto kMaxDashPairs = 3;
 constexpr auto kTooltipDelay = 800;
 constexpr auto kDragThreshold = 3;
 constexpr auto kKeyframeEpsilon = 0.01;
@@ -69,6 +73,12 @@ constexpr auto kKeyframeEpsilon = 0.01;
 // hints that belong to a property start there too.
 [[nodiscard]] int PropertyLabelLeft() {
 	return Scaled(kPadding) / 2 + Scaled(kKeyframesWidth) + Scaled(kLabelSkip);
+}
+
+// The line of captions between the gradient bar and the fields of the
+// selected stop ("Color" / "Opacity", "Position").
+[[nodiscard]] int StopCaptionsHeight() {
+	return PanelSmallFont()->height + Scaled(2);
 }
 
 // The active tab gets a pill under its label (like the tabs of the emoji /
@@ -221,7 +231,14 @@ struct FieldOptions {
 	case PropertyRole::Points:
 		return { .step = 0.1, .min = 3., .max = 100., .decimals = 0, .integer = true };
 	case PropertyRole::Copies:
-		return { .step = 0.05, .min = 0., .max = 1000., .decimals = 1 };
+		return {
+			.step = 0.05,
+			.min = 0.,
+			.max = kMaxRepeaterCopies,
+			.decimals = 1,
+		};
+	case PropertyRole::MaskFeather:
+		return { .step = 0.5, .min = 0., .decimals = 1 };
 	case PropertyRole::TimeRemap:
 		return { .step = 0.01, .min = 0., .decimals = 2 };
 	default:
@@ -693,14 +710,31 @@ void ChoiceButton::onStateChanged(State was, StateChangeSource source) {
 }
 
 // Gradient stops editor: color stops below the bar, opacity stops above.
+// A click on a stop selects it (the row shows its color / opacity and its
+// position under the bar), a drag moves it, a drag away from the bar
+// removes it; a click on an empty place under / above the bar adds a
+// color / an opacity stop there; a double click on a color stop opens the
+// color picker.
 
 class GradientBar final : public Ui::RpWidget {
 public:
+	struct Stop {
+		bool opacity = false;
+		int index = -1;
+
+		friend inline bool operator==(
+			const Stop &a,
+			const Stop &b) = default;
+	};
 	struct Move {
 		bool opacity = false;
 		int index = 0;
 		double offset = 0.;
 		bool finished = false;
+	};
+	struct Add {
+		bool opacity = false;
+		double offset = 0.;
 	};
 
 	explicit GradientBar(QWidget *parent);
@@ -709,11 +743,20 @@ public:
 		std::vector<GradientStop> colors,
 		std::vector<GradientStop> opacities);
 	[[nodiscard]] bool busy() const;
-	[[nodiscard]] rpl::producer<Move> moves() const;
-	[[nodiscard]] rpl::producer<int> colorClicks() const;
 
-	// Opacity handles go above the bar, so the room for them is taken
-	// only when there are opacity stops.
+	[[nodiscard]] std::optional<Stop> selected() const;
+	void setSelected(std::optional<Stop> stop); // Doesn't fire.
+
+	[[nodiscard]] rpl::producer<Move> moves() const;
+	// The user selected a stop (or nothing).
+	[[nodiscard]] rpl::producer<> selections() const;
+	[[nodiscard]] rpl::producer<Add> adds() const;
+	// A stop was dragged away: after the moves of that drag, without a
+	// finished one.
+	[[nodiscard]] rpl::producer<Stop> removes() const;
+	[[nodiscard]] rpl::producer<int> colorEdits() const;
+
+	// Opacity handles go above the bar, color handles below it.
 	[[nodiscard]] int wantedHeight() const;
 
 protected:
@@ -721,32 +764,33 @@ protected:
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
+	void mouseDoubleClickEvent(QMouseEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 
 private:
-	struct Handle {
-		bool opacity = false;
-		int index = -1;
-
-		friend inline bool operator==(
-			const Handle &a,
-			const Handle &b) = default;
-	};
+	using Handle = Stop;
 
 	[[nodiscard]] QRect barRect() const;
 	[[nodiscard]] QRectF handleRect(bool opacity, double offset) const;
 	[[nodiscard]] std::optional<Handle> handleAt(QPoint position) const;
 	[[nodiscard]] double offsetAt(int x) const;
 	[[nodiscard]] std::vector<GradientStop> &stops(bool opacity);
+	[[nodiscard]] bool removable(const Handle &handle) const;
 
 	std::vector<GradientStop> _colors;
 	std::vector<GradientStop> _opacities;
 	std::optional<Handle> _over;
 	std::optional<Handle> _pressed;
+	std::optional<Handle> _selected;
 	QPoint _pressPosition;
+	bool _pressedEmpty = false;
 	bool _dragging = false;
+	bool _removing = false;
 	rpl::event_stream<Move> _moves;
-	rpl::event_stream<int> _colorClicks;
+	rpl::event_stream<> _selections;
+	rpl::event_stream<Add> _adds;
+	rpl::event_stream<Stop> _removes;
+	rpl::event_stream<int> _colorEdits;
 
 };
 
@@ -768,6 +812,10 @@ void GradientBar::setStops(
 	}
 	_colors = std::move(colors);
 	_opacities = std::move(opacities);
+	if (_selected
+		&& _selected->index >= int(stops(_selected->opacity).size())) {
+		_selected = std::nullopt;
+	}
 	update();
 }
 
@@ -775,25 +823,56 @@ bool GradientBar::busy() const {
 	return _dragging;
 }
 
+std::optional<GradientBar::Stop> GradientBar::selected() const {
+	return _selected;
+}
+
+void GradientBar::setSelected(std::optional<Stop> stop) {
+	if (stop
+		&& (stop->index < 0
+			|| stop->index >= int(stops(stop->opacity).size()))) {
+		stop = std::nullopt;
+	}
+	if (_selected != stop) {
+		_selected = stop;
+		update();
+	}
+}
+
 rpl::producer<GradientBar::Move> GradientBar::moves() const {
 	return _moves.events();
 }
 
-rpl::producer<int> GradientBar::colorClicks() const {
-	return _colorClicks.events();
+rpl::producer<> GradientBar::selections() const {
+	return _selections.events();
+}
+
+rpl::producer<GradientBar::Add> GradientBar::adds() const {
+	return _adds.events();
+}
+
+rpl::producer<GradientBar::Stop> GradientBar::removes() const {
+	return _removes.events();
+}
+
+rpl::producer<int> GradientBar::colorEdits() const {
+	return _colorEdits.events();
 }
 
 std::vector<GradientStop> &GradientBar::stops(bool opacity) {
 	return opacity ? _opacities : _colors;
 }
 
+bool GradientBar::removable(const Handle &handle) const {
+	// The last color stop stays, opacity stops may all go.
+	return handle.opacity || (_colors.size() > 1);
+}
+
 QRect GradientBar::barRect() const {
 	const auto side = Scaled(kGradientHandle) / 2 + Scaled(2);
 	return QRect(
 		side,
-		(_opacities.empty()
-			? Scaled(kGradientCompactTop)
-			: Scaled(kGradientSide)),
+		Scaled(kGradientSide),
 		std::max(width() - 2 * side, 1),
 		Scaled(kGradientBar));
 }
@@ -923,17 +1002,21 @@ void GradientBar::paintEvent(QPaintEvent *e) {
 		const auto &stop = list[index];
 		const auto rect = handleRect(opacity, stop.offset);
 		const auto handle = Handle{ opacity, index };
-		const auto active = (_pressed && *_pressed == handle)
-			|| (_over && *_over == handle);
+		const auto pressed = (_pressed && *_pressed == handle);
+		const auto active = pressed
+			|| (_selected && *_selected == handle);
+		const auto over = (_over && *_over == handle);
 		auto fill = stop.color;
 		if (opacity) {
 			const auto level = 1.
 				- std::clamp(double(stop.color.alphaF()), 0., 1.);
 			fill = QColor::fromRgbF(level, level, level);
 		}
+		// A stop that is being dragged away fades: releasing removes it.
+		p.setOpacity((pressed && _removing) ? 0.3 : 1.);
 		auto pen = QPen(active
 			? st::activeLineFg->c
-			: anim::with_alpha(st::windowFg->c, 0.45));
+			: anim::with_alpha(st::windowFg->c, over ? 0.8 : 0.45));
 		pen.setWidthF(active ? Scaled(2) : Scaled(15) / 10.);
 		p.setPen(pen);
 		p.setBrush(fill);
@@ -959,6 +1042,7 @@ void GradientBar::paintEvent(QPaintEvent *e) {
 		}
 		path.closeSubpath();
 		p.drawPath(path);
+		p.setOpacity(1.);
 	};
 	for (auto i = 0; i != int(_opacities.size()); ++i) {
 		paintHandle(true, i);
@@ -973,7 +1057,13 @@ void GradientBar::mousePressEvent(QMouseEvent *e) {
 		return;
 	}
 	_pressed = handleAt(e->pos());
+	_pressedEmpty = !_pressed;
 	_pressPosition = e->pos();
+	_removing = false;
+	if (_pressed && _selected != _pressed) {
+		_selected = _pressed;
+		_selections.fire({});
+	}
 	update();
 }
 
@@ -988,7 +1078,7 @@ void GradientBar::mouseMoveEvent(QMouseEvent *e) {
 		return;
 	}
 	if (!_dragging) {
-		if (std::abs(e->pos().x() - _pressPosition.x())
+		if ((e->pos() - _pressPosition).manhattanLength()
 			< Scaled(kDragThreshold)) {
 			return;
 		}
@@ -998,6 +1088,16 @@ void GradientBar::mouseMoveEvent(QMouseEvent *e) {
 	auto &list = stops(_pressed->opacity);
 	if (_pressed->index >= int(list.size())) {
 		return;
+	}
+	const auto bar = barRect();
+	const auto away = Scaled(kGradientSide) + Scaled(kGradientRemoveDistance);
+	const auto removing = removable(*_pressed)
+		&& ((e->pos().y() < bar.y() - away)
+			|| (e->pos().y() > bar.y() + bar.height() + away));
+	if (_removing != removing) {
+		_removing = removing;
+		setCursor(removing ? style::cur_default : style::cur_sizehor);
+		update();
 	}
 	const auto offset = offsetAt(e->pos().x());
 	if (list[_pressed->index].offset != offset) {
@@ -1012,14 +1112,36 @@ void GradientBar::mouseMoveEvent(QMouseEvent *e) {
 }
 
 void GradientBar::mouseReleaseEvent(QMouseEvent *e) {
-	if (e->button() != Qt::LeftButton || !_pressed) {
+	if (e->button() != Qt::LeftButton) {
+		return;
+	}
+	const auto empty = base::take(_pressedEmpty);
+	if (!_pressed) {
+		// A click on an empty place adds a stop there.
+		const auto bar = barRect();
+		const auto extra = Scaled(kGradientHandle) / 2;
+		const auto moved = (e->pos() - _pressPosition).manhattanLength();
+		if (empty
+			&& moved < Scaled(kDragThreshold)
+			&& rect().contains(e->pos())
+			&& e->pos().x() >= bar.x() - extra
+			&& e->pos().x() <= bar.x() + bar.width() + extra) {
+			_adds.fire({
+				.opacity = (e->pos().y() < bar.y() + bar.height() / 2),
+				.offset = offsetAt(e->pos().x()),
+			});
+		}
 		return;
 	}
 	const auto pressed = *base::take(_pressed);
+	const auto removing = base::take(_removing);
 	if (_dragging) {
 		_dragging = false;
 		const auto &list = stops(pressed.opacity);
-		if (pressed.index < int(list.size())) {
+		if (removing) {
+			_selected = std::nullopt;
+			_removes.fire_copy(pressed);
+		} else if (pressed.index < int(list.size())) {
 			_moves.fire({
 				.opacity = pressed.opacity,
 				.index = pressed.index,
@@ -1027,12 +1149,24 @@ void GradientBar::mouseReleaseEvent(QMouseEvent *e) {
 				.finished = true,
 			});
 		}
-	} else if (!pressed.opacity && handleAt(e->pos()) == pressed) {
-		_colorClicks.fire_copy(pressed.index);
 	}
 	_over = handleAt(e->pos());
 	setCursor(_over ? style::cur_pointer : style::cur_default);
 	update();
+}
+
+void GradientBar::mouseDoubleClickEvent(QMouseEvent *e) {
+	if (e->button() != Qt::LeftButton) {
+		return;
+	}
+	const auto handle = handleAt(e->pos());
+	if (handle && !handle->opacity) {
+		if (_selected != handle) {
+			_selected = handle;
+			_selections.fire({});
+		}
+		_colorEdits.fire_copy(handle->index);
+	}
 }
 
 void GradientBar::leaveEventHook(QEvent *e) {
@@ -1442,6 +1576,42 @@ enum class SpecKind : uchar {
 	Number,
 	Check,
 	Hint,
+	Actions,
+};
+
+// What a dropdown row reads and writes.
+enum class ChoiceKind : uchar {
+	Member, // A plain JSON number (the star type).
+	LineCap,
+	LineJoin,
+	FillRule,
+	GradientType,
+	TrimMode,
+	DashCount, // Dash and gap pairs of a stroke, 0 for a solid line.
+	MaskMode,
+	MatteMode,
+	MatteSource, // RowSpec::nodes: the layers to choose from.
+	Parent, // RowSpec::nodes, the first one is 0 ("none").
+};
+
+enum class ActionKind : uchar {
+	AddMask,
+	EnableMasks, // "hasMask" of a layer whose masks are switched off.
+	EditPoints, // The pen tool for the path item / the mask.
+	InvertMask,
+	Select, // Another node (a mask from the list of its layer).
+	ConvertPaint, // value: the target ShapeType.
+	ConvertToPath,
+	SetPathClosed, // value: 1 to close, 0 to open.
+	ReversePath,
+	BakeCorners,
+};
+
+struct ActionSpec {
+	ActionKind kind = ActionKind::Select;
+	QString text;
+	NodeId node = 0;
+	int value = 0;
 };
 
 enum class NumberKind : uchar {
@@ -1479,12 +1649,16 @@ struct RowSpec {
 	int dimensions = 1;
 	int colorStops = 0;
 	bool animatable = true;
+	bool dashOffset = false; // See PropertyInfo::dashOffset.
 	std::vector<double> defaults; // Not stored transform values.
 
 	// Choice, member number.
 	QByteArray member;
 	std::vector<ChoiceOption> options;
 	double fallback = 0.;
+	ChoiceKind choice = ChoiceKind::Member;
+	std::vector<NodeId> nodes; // Layer pickers: a node per option.
+	bool selectable = false; // A click on the label selects the node.
 
 	NumberKind number = NumberKind::InPoint;
 	CheckKind check = CheckKind::ScaleContent;
@@ -1493,26 +1667,51 @@ struct RowSpec {
 	QStringList info;
 	// Hint: starts at the property labels (explains the row above).
 	bool indented = false;
+	// Hint: something Telegram does not accept or does not draw.
+	bool warning = false;
+
+	std::vector<ActionSpec> actions;
 };
 
+// The number of gradient stops (and so of the numbers of the value) is
+// not a part of it: stops are added and removed in the row that shows
+// them, it must not be rebuilt for that.
 [[nodiscard]] QByteArray Signature(const std::vector<RowSpec> &specs) {
 	auto result = QByteArray();
 	for (const auto &spec : specs) {
+		const auto dimensions = (spec.type == PropertyType::Gradient)
+			? 0
+			: spec.dimensions;
 		result += QByteArray::number(int(spec.kind))
 			+ ':' + QByteArray::number(spec.node)
 			+ ':' + QByteArray::number(spec.count)
 			+ ':' + QByteArray::number(spec.ref.node)
 			+ ':' + spec.ref.path
 			+ ':' + QByteArray::number(int(spec.type))
-			+ ':' + QByteArray::number(spec.dimensions)
-			+ ':' + QByteArray::number(spec.colorStops)
+			+ ':' + QByteArray::number(dimensions)
 			+ ':' + spec.member
 			+ ':' + QByteArray::number(int(spec.number))
 			+ ':' + QByteArray::number(int(spec.check))
+			+ ':' + QByteArray::number(int(spec.choice))
 			+ ':' + spec.text.toUtf8()
 			+ ':' + spec.info.join(QChar('\n')).toUtf8()
 			+ ':' + (spec.indented ? '1' : '0')
-			+ ';';
+			+ (spec.warning ? '1' : '0')
+			+ (spec.selectable ? '1' : '0')
+			+ (spec.dashOffset ? '1' : '0');
+		for (const auto &option : spec.options) {
+			result += '|' + option.text.toUtf8();
+		}
+		for (const auto node : spec.nodes) {
+			result += '#' + QByteArray::number(node);
+		}
+		for (const auto &action : spec.actions) {
+			result += '@' + QByteArray::number(int(action.kind))
+				+ '.' + QByteArray::number(action.node)
+				+ '.' + QByteArray::number(action.value)
+				+ '.' + action.text.toUtf8();
+		}
+		result += ';';
 	}
 	return result;
 }
@@ -1524,6 +1723,10 @@ public:
 	virtual void refresh() {
 	}
 	virtual void commitEditing() {
+	}
+	// The gradient row: selects a stop as a click on it does.
+	virtual bool selectGradientStop(int index, bool opacity) {
+		return false;
 	}
 
 };
@@ -1673,9 +1876,15 @@ void SectionRow::paintEvent(QPaintEvent *e) {
 }
 
 // indented: a hint for the property row above it, starts at the labels.
+// warning: about something Telegram does not accept or does not draw.
 class InfoRow final : public InspectorRow {
 public:
-	InfoRow(QWidget *parent, QString text, bool hint, bool indented);
+	InfoRow(
+		QWidget *parent,
+		QString text,
+		bool hint,
+		bool indented,
+		bool warning = false);
 
 protected:
 	int resizeGetHeight(int newWidth) override;
@@ -1688,14 +1897,21 @@ private:
 	const QString _text;
 	const bool _hint = false;
 	const bool _indented = false;
+	const bool _warning = false;
 
 };
 
-InfoRow::InfoRow(QWidget *parent, QString text, bool hint, bool indented)
+InfoRow::InfoRow(
+	QWidget *parent,
+	QString text,
+	bool hint,
+	bool indented,
+	bool warning)
 : InspectorRow(parent)
 , _text(BindShortWords(std::move(text)))
 , _hint(hint)
-, _indented(indented) {
+, _indented(indented)
+, _warning(warning) {
 }
 
 const style::font &InfoRow::font() const {
@@ -1721,7 +1937,7 @@ int InfoRow::resizeGetHeight(int newWidth) {
 void InfoRow::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	p.setFont(font());
-	p.setPen(st::windowSubTextFg);
+	p.setPen(_warning ? st::attentionButtonFg : st::windowSubTextFg);
 	const auto rect = textRect(width());
 	p.drawText(
 		QRect(rect.x(), rect.y(), rect.width(), height() - rect.y()),
@@ -1935,6 +2151,7 @@ public:
 
 	void refresh() override;
 	void commitEditing() override;
+	bool selectGradientStop(int index, bool opacity) override;
 
 protected:
 	int editorWidth() const override;
@@ -1954,12 +2171,24 @@ private:
 		double frame) const;
 	[[nodiscard]] int fieldCount() const;
 	void setupEditors();
+	void setupStopEditors();
 	void startDrag();
 	void applyNumber(int index, double value, bool drag);
 	void applyHex(const QString &text);
 	void pickColor();
 	void pickStopColor(int index);
 	void moveStop(const GradientBar::Move &move);
+
+	// The selected gradient stop: its color / opacity and position.
+	[[nodiscard]] GradientStop *selectedStop(GradientData &data) const;
+	void refreshStop();
+	void layoutStop(QRect area);
+	void selectNearestStop(bool opacity, double offset);
+	void addStop(const GradientBar::Add &add);
+	void removeStop(GradientBar::Stop stop);
+	void applyStopHex(const QString &text);
+	void applyStopOpacity(double percent, bool drag);
+	void applyStopPosition(double percent);
 
 	const not_null<EditorController*> _controller;
 	const RowSpec _spec;
@@ -1968,9 +2197,18 @@ private:
 	SwatchButton *_swatch = nullptr;
 	ValueField *_hex = nullptr;
 	GradientBar *_gradient = nullptr;
+	SwatchButton *_stopSwatch = nullptr;
+	ValueField *_stopHex = nullptr;
+	ValueField *_stopOpacity = nullptr;
+	ValueField *_stopPosition = nullptr;
+	Ui::LinkButton *_stopDelete = nullptr;
+	GradientData _gradientData; // At the current frame.
+	GradientData _stopBaseline; // At the start of an opacity drag.
+	QRect _stopRect;
 	QString _valueText;
 	QRect _valueRect;
 	LiveSession _drag; // One undo step per drag, whatever pauses.
+	LiveSession _stopDrag;
 	double _dragFrame = 0.;
 	int _colorStops = 0;
 	bool _expression = false;
@@ -1986,6 +2224,7 @@ PropertyRow::PropertyRow(
 , _controller(controller)
 , _spec(spec)
 , _drag(controller, Command::SetValue)
+, _stopDrag(controller, Command::Gradient)
 , _colorStops(spec.colorStops) {
 	if (_spec.animatable) {
 		_keyframes = Ui::CreateChild<KeyframeControl>(
@@ -2009,7 +2248,10 @@ void PropertyRow::setupEditors() {
 	switch (_spec.type) {
 	case PropertyType::Scalar:
 	case PropertyType::Vector: {
-		const auto options = OptionsFor(_spec.role);
+		// The offset of a dash pattern may be negative, unlike the lengths.
+		const auto options = _spec.dashOffset
+			? FieldOptions{ .step = 0.25, .decimals = 2 }
+			: OptionsFor(_spec.role);
 		for (auto i = 0; i != fieldCount(); ++i) {
 			const auto field = Ui::CreateChild<ValueField>(this, options);
 			field->dragged() | rpl::on_next([=](double value) {
@@ -2040,13 +2282,79 @@ void PropertyRow::setupEditors() {
 		_gradient->moves() | rpl::on_next([=](GradientBar::Move move) {
 			moveStop(move);
 		}, _gradient->lifetime());
-		_gradient->colorClicks() | rpl::on_next([=](int index) {
+		_gradient->colorEdits() | rpl::on_next([=](int index) {
+			refreshStop();
 			pickStopColor(index);
 		}, _gradient->lifetime());
+		_gradient->selections() | rpl::on_next([=] {
+			refreshStop();
+		}, _gradient->lifetime());
+		_gradient->adds() | rpl::on_next([=](GradientBar::Add add) {
+			addStop(add);
+		}, _gradient->lifetime());
+		_gradient->removes() | rpl::on_next([=](GradientBar::Stop stop) {
+			removeStop(stop);
+		}, _gradient->lifetime());
+		setupStopEditors();
 	} break;
 	case PropertyType::Path:
 		break;
 	}
+}
+
+void PropertyRow::setupStopEditors() {
+	const auto percent = FieldOptions{
+		.suffix = u"%"_q,
+		.step = 0.5,
+		.min = 0.,
+		.max = 100.,
+		.decimals = 1,
+	};
+	_stopSwatch = Ui::CreateChild<SwatchButton>(this);
+	_stopSwatch->setClickedCallback([=] {
+		const auto selected = _gradient->selected();
+		if (selected && !selected->opacity) {
+			pickStopColor(selected->index);
+		}
+	});
+	_stopHex = Ui::CreateChild<ValueField>(this, FieldOptions{ .text = true });
+	_stopHex->textSubmitted() | rpl::on_next([=](QString text) {
+		applyStopHex(text);
+	}, _stopHex->lifetime());
+
+	_stopOpacity = Ui::CreateChild<ValueField>(this, percent);
+	_stopOpacity->dragged() | rpl::on_next([=](double value) {
+		applyStopOpacity(value, true);
+	}, _stopOpacity->lifetime());
+	_stopOpacity->dragFinished() | rpl::on_next([=] {
+		_stopDrag.finish();
+		refresh();
+	}, _stopOpacity->lifetime());
+	_stopOpacity->numberSubmitted() | rpl::on_next([=](double value) {
+		applyStopOpacity(value, false);
+	}, _stopOpacity->lifetime());
+
+	// The stops are kept in order, so the position is applied when the
+	// drag ends: the stop may get another place in the list.
+	auto position = percent;
+	position.liveDrag = false;
+	_stopPosition = Ui::CreateChild<ValueField>(this, position);
+	rpl::merge(
+		_stopPosition->dragFinished(),
+		_stopPosition->numberSubmitted()
+	) | rpl::on_next([=](double value) {
+		applyStopPosition(value);
+	}, _stopPosition->lifetime());
+
+	_stopDelete = Ui::CreateChild<Ui::LinkButton>(
+		this,
+		tr::lng_oblivion_lottie_mask_gradient_remove(tr::now));
+	_stopDelete->setClickedCallback([=] {
+		if (const auto selected = _gradient->selected()) {
+			removeStop(*selected);
+		}
+	});
+	refreshStop();
 }
 
 int PropertyRow::editorWidth() const {
@@ -2120,7 +2428,15 @@ int PropertyRow::layoutEditor(QRect area, bool secondLine) {
 	case PropertyType::Gradient: {
 		const auto height = _gradient->wantedHeight();
 		_gradient->setGeometry(area.x(), area.y(), area.width(), height);
-		return height;
+		// Under the bar: a line of captions for the fields of the selected
+		// stop (see paintEvent()), then the fields.
+		const auto captions = StopCaptionsHeight();
+		layoutStop(QRect(
+			area.x(),
+			area.y() + height + captions,
+			area.width(),
+			fieldHeight));
+		return height + captions + fieldHeight;
 	}
 	case PropertyType::Path:
 		_valueRect = QRect(area.x(), area.y(), area.width(), fieldHeight);
@@ -2174,13 +2490,9 @@ void PropertyRow::refresh() {
 	} break;
 	case PropertyType::Gradient:
 		if (value) {
-			_gradient->setStops(
-				ColorStops(*value, _colorStops),
-				OpacityStops(*value, _colorStops));
-			if (_gradient->height() != _gradient->wantedHeight()
-				&& width() > 0) {
-				resizeToWidth(width());
-			}
+			_gradientData = DecodeGradient(*value, _colorStops);
+			_gradient->setStops(_gradientData.colors, _gradientData.alphas);
+			refreshStop();
 		}
 		break;
 	case PropertyType::Path: {
@@ -2208,6 +2520,11 @@ void PropertyRow::commitEditing() {
 	}
 	if (_hex) {
 		_hex->commitEditing();
+	}
+	for (const auto field : { _stopHex, _stopOpacity, _stopPosition }) {
+		if (field) {
+			field->commitEditing();
+		}
 	}
 }
 
@@ -2239,6 +2556,43 @@ void PropertyRow::paintEvent(QPaintEvent *e) {
 			_valueRect,
 			Qt::AlignRight | Qt::AlignVCenter,
 			st::normalFont->elided(_valueText, _valueRect.width()));
+	} else if (_spec.type == PropertyType::Gradient
+		&& _gradient
+		&& !_stopRect.isEmpty()) {
+		auto p = QPainter(this);
+		const auto &font = PanelSmallFont();
+		const auto captions = StopCaptionsHeight();
+		p.setFont(font);
+		p.setPen(st::windowSubTextFg);
+		const auto selected = _gradient->selected();
+		if (!selected) {
+			// Nothing is selected on the bar: what the place under it is
+			// for (in the middle of the captions and the fields lines).
+			p.drawText(
+				_stopRect.adjusted(0, -captions, 0, 0),
+				Qt::AlignLeft | Qt::AlignVCenter,
+				font->elided(
+					tr::lng_oblivion_lottie_mask_gradient_no_stop(tr::now),
+					_stopRect.width()));
+		} else if (_stopPosition && !_stopPosition->isHidden()) {
+			// Two numbers in percent next to each other say nothing by
+			// themselves: each field of the stop gets a caption above it.
+			const auto baseline = _stopRect.y() - captions + font->ascent;
+			const auto positionLeft = _stopPosition->x();
+			const auto first = selected->opacity
+				? tr::lng_oblivion_lottie_mask_gradient_stop_opacity(tr::now)
+				: tr::lng_oblivion_lottie_mask_gradient_stop_color(tr::now);
+			p.drawText(
+				_stopRect.x(),
+				baseline,
+				font->elided(
+					first,
+					std::max(positionLeft - _stopRect.x() - Scaled(6), 0)));
+			p.drawText(
+				positionLeft,
+				baseline,
+				tr::lng_oblivion_lottie_mask_gradient_stop_position(tr::now));
+		}
 	}
 }
 
@@ -2363,7 +2717,198 @@ void PropertyRow::moveStop(const GradientBar::Move &move) {
 	if (move.finished) {
 		_drag.finish();
 		refresh();
+		// The stops were put in order, the moved one may have a new index.
+		selectNearestStop(move.opacity, move.offset);
 	}
+}
+
+bool PropertyRow::selectGradientStop(int index, bool opacity) {
+	if (!_gradient) {
+		return false;
+	}
+	_gradient->setSelected(GradientBar::Stop{ opacity, index });
+	refreshStop();
+	return true;
+}
+
+GradientStop *PropertyRow::selectedStop(GradientData &data) const {
+	const auto selected = _gradient ? _gradient->selected() : std::nullopt;
+	if (!selected) {
+		return nullptr;
+	}
+	auto &list = selected->opacity ? data.alphas : data.colors;
+	return (selected->index >= 0 && selected->index < int(list.size()))
+		? &list[selected->index]
+		: nullptr;
+}
+
+void PropertyRow::refreshStop() {
+	if (!_gradient || !_stopSwatch) {
+		return;
+	}
+	const auto selected = _gradient->selected();
+	const auto stop = selectedStop(_gradientData);
+	const auto color = stop && !selected->opacity;
+	const auto opacity = stop && selected->opacity;
+	_stopSwatch->setVisible(color);
+	_stopHex->setVisible(color);
+	_stopOpacity->setVisible(opacity);
+	_stopPosition->setVisible(stop != nullptr);
+	_stopDelete->setVisible(opacity
+		|| (color && _gradientData.colors.size() > 1));
+	if (stop) {
+		_stopPosition->setNumber(stop->offset * 100.);
+		if (color) {
+			_stopSwatch->setColor(stop->color);
+			_stopHex->setText(ColorHex(stop->color));
+		} else {
+			_stopOpacity->setNumber(stop->color.alphaF() * 100.);
+		}
+	}
+	update();
+}
+
+void PropertyRow::layoutStop(QRect area) {
+	_stopRect = area;
+	if (!_stopSwatch) {
+		return;
+	}
+	const auto fieldHeight = area.height();
+	const auto skip = Scaled(kFieldSkip);
+	auto right = area.x() + area.width();
+	_stopDelete->moveToLeft(
+		right - _stopDelete->width(),
+		area.y() + (fieldHeight - _stopDelete->height()) / 2,
+		width());
+	right -= _stopDelete->width() + Scaled(kSwatchSkip);
+	const auto position = Scaled(kStopPositionWidth);
+	_stopPosition->setGeometry(
+		std::max(right - position, area.x()),
+		area.y(),
+		position,
+		fieldHeight);
+	right -= position + skip;
+	const auto size = Scaled(kSwatchSize);
+	_stopSwatch->setGeometry(
+		area.x(),
+		area.y() + (fieldHeight - size) / 2,
+		size,
+		size);
+	const auto hexLeft = area.x() + size + Scaled(kSwatchSkip);
+	_stopHex->setGeometry(
+		hexLeft,
+		area.y(),
+		std::max(right - hexLeft, 0),
+		fieldHeight);
+	_stopOpacity->setGeometry(
+		area.x(),
+		area.y(),
+		std::clamp(right - area.x(), 0, Scaled(kFieldWidth)),
+		fieldHeight);
+}
+
+void PropertyRow::selectNearestStop(bool opacity, double offset) {
+	const auto shape = _spec.ref.node;
+	const auto data = _controller->document().gradientAt(
+		shape,
+		_controller->localFrame(shape));
+	if (!data) {
+		return;
+	}
+	_gradientData = *data;
+	_gradient->setStops(_gradientData.colors, _gradientData.alphas);
+	const auto &list = opacity ? _gradientData.alphas : _gradientData.colors;
+	auto best = -1;
+	auto distance = 0.;
+	for (auto i = 0; i != int(list.size()); ++i) {
+		const auto delta = std::abs(list[i].offset - offset);
+		if (best < 0 || delta < distance) {
+			best = i;
+			distance = delta;
+		}
+	}
+	_gradient->setSelected((best >= 0)
+		? std::make_optional(GradientBar::Stop{ opacity, best })
+		: std::nullopt);
+	refreshStop();
+}
+
+void PropertyRow::addStop(const GradientBar::Add &add) {
+	_controller->setActiveProperty(_spec.ref);
+	if (_controller->addGradientStop(
+			_spec.ref.node,
+			add.offset,
+			add.opacity)) {
+		selectNearestStop(add.opacity, add.offset);
+	}
+}
+
+void PropertyRow::removeStop(GradientBar::Stop stop) {
+	// The drag that took the stop away has moved it first.
+	_drag.cancel();
+	_controller->setActiveProperty(_spec.ref);
+	_controller->removeGradientStop(_spec.ref.node, stop.index, stop.opacity);
+	_gradient->setSelected(std::nullopt);
+	refresh();
+}
+
+void PropertyRow::applyStopHex(const QString &text) {
+	auto data = _gradientData;
+	const auto stop = selectedStop(data);
+	const auto color = ParseColorHex(text);
+	if (!stop || !color.isValid()) {
+		refreshStop();
+		return;
+	}
+	stop->color = color;
+	_controller->setActiveProperty(_spec.ref);
+	_controller->setGradient(_spec.ref.node, data);
+}
+
+void PropertyRow::applyStopOpacity(double percent, bool drag) {
+	const auto alpha = std::clamp(percent / 100., 0., 1.);
+	const auto shape = _spec.ref.node;
+	if (!drag) {
+		auto data = _gradientData;
+		if (const auto stop = selectedStop(data)) {
+			stop->color = QColor(0, 0, 0);
+			stop->color.setAlphaF(float(alpha));
+			_controller->setActiveProperty(_spec.ref);
+			_controller->setGradient(shape, data);
+		}
+		return;
+	}
+	if (!_stopDrag.active()) {
+		_controller->setPlaying(false);
+		_controller->setActiveProperty(_spec.ref);
+		_stopDrag.begin();
+		_dragFrame = _controller->localFrame(shape);
+		_stopBaseline = _gradientData;
+	}
+	auto data = _stopBaseline;
+	if (const auto stop = selectedStop(data)) {
+		stop->color = QColor(0, 0, 0);
+		stop->color.setAlphaF(float(alpha));
+		_stopDrag.apply(SetGradient(
+			_stopDrag.baseline(),
+			shape,
+			data,
+			_dragFrame));
+	}
+}
+
+void PropertyRow::applyStopPosition(double percent) {
+	auto data = _gradientData;
+	const auto selected = _gradient->selected();
+	const auto stop = selectedStop(data);
+	if (!stop || !selected) {
+		return;
+	}
+	const auto offset = std::clamp(percent / 100., 0., 1.);
+	stop->offset = offset;
+	_controller->setActiveProperty(_spec.ref);
+	_controller->setGradient(_spec.ref.node, data);
+	selectNearestStop(selected->opacity, offset);
 }
 
 // A plain number: layer timing, composition settings, JSON members.
@@ -2472,7 +3017,163 @@ int NumberRow::layoutEditor(QRect area, bool secondLine) {
 	return Scaled(kFieldHeight);
 }
 
-// A plain JSON enum member as a dropdown.
+// A dropdown: a plain JSON enum member, an option of a shape item (caps,
+// corners, gradient type...), a mask mode, a track matte, a layer picker.
+
+void ToastIn(not_null<EditorController*> controller, const QString &text) {
+	if (const auto show = controller->uiShow()) {
+		show->showToast(text);
+	}
+}
+
+// What the options of a row stand for, in the order of the dropdown.
+[[nodiscard]] const std::vector<MaskMode> &MaskModeOptions() {
+	static const auto result = std::vector<MaskMode>{
+		MaskMode::Add,
+		MaskMode::Subtract,
+		MaskMode::Intersect,
+		MaskMode::Difference,
+		MaskMode::None,
+		MaskMode::Lighten,
+		MaskMode::Darken,
+	};
+	return result;
+}
+
+[[nodiscard]] const std::vector<MatteMode> &MatteModeOptions() {
+	static const auto result = std::vector<MatteMode>{
+		MatteMode::None,
+		MatteMode::Alpha,
+		MatteMode::AlphaInverted,
+		MatteMode::Luma,
+		MatteMode::LumaInverted,
+	};
+	return result;
+}
+
+// The index of the current option, -1 for none of them.
+[[nodiscard]] int CurrentChoice(const Document &document, const RowSpec &spec) {
+	const auto node = document.node(spec.node);
+	if (!node) {
+		return -1;
+	}
+	const auto indexIn = [](const auto &list, const auto &value) {
+		const auto i = ranges::find(list, value);
+		return (i != end(list)) ? int(i - begin(list)) : -1;
+	};
+	switch (spec.choice) {
+	case ChoiceKind::Member: {
+		const auto value = document.json(spec.node)
+			.get(spec.member)
+			.toNumber(spec.fallback);
+		auto index = -1;
+		auto distance = 0.;
+		for (auto i = 0; i != int(spec.options.size()); ++i) {
+			const auto delta = std::abs(spec.options[i].value - value);
+			if (index < 0 || delta < distance) {
+				index = i;
+				distance = delta;
+			}
+		}
+		return index;
+	}
+	case ChoiceKind::LineCap: return int(node->lineCap);
+	case ChoiceKind::LineJoin: return int(node->lineJoin);
+	case ChoiceKind::FillRule: return int(node->fillRule);
+	case ChoiceKind::GradientType: return int(node->gradientType);
+	case ChoiceKind::TrimMode: return int(node->trimMode);
+	case ChoiceKind::DashCount:
+		return std::min(
+			int(DashesOf(document, spec.node).dashes.size()),
+			int(spec.options.size()) - 1);
+	case ChoiceKind::MaskMode:
+		return indexIn(MaskModeOptions(), node->maskMode);
+	case ChoiceKind::MatteMode:
+		return indexIn(MatteModeOptions(), node->matte);
+	case ChoiceKind::MatteSource:
+		return node->matteLayer ? indexIn(spec.nodes, node->matteLayer) : -1;
+	case ChoiceKind::Parent:
+		return indexIn(spec.nodes, node->parentLayer);
+	}
+	return -1;
+}
+
+void ApplyChoice(
+		not_null<EditorController*> controller,
+		const RowSpec &spec,
+		int index) {
+	const auto &document = controller->document();
+	const auto node = document.node(spec.node);
+	if (!node || index < 0 || index >= int(spec.options.size())) {
+		return;
+	}
+	const auto id = spec.node;
+	switch (spec.choice) {
+	case ChoiceKind::Member:
+		controller->perform(Command::SetValue, SetNodeMember(
+			document,
+			id,
+			spec.member,
+			Json::Value::FromNumber(spec.options[index].value)));
+		break;
+	case ChoiceKind::LineCap:
+		controller->setLineCap(id, LineCap(index));
+		break;
+	case ChoiceKind::LineJoin:
+		controller->setLineJoin(id, LineJoin(index));
+		break;
+	case ChoiceKind::FillRule:
+		controller->setFillRule(id, FillRule(index));
+		break;
+	case ChoiceKind::GradientType:
+		controller->setGradientType(id, GradientType(index));
+		break;
+	case ChoiceKind::TrimMode:
+		controller->setTrimMode(id, TrimMode(index));
+		break;
+	case ChoiceKind::DashCount:
+		controller->setDashCount(id, index);
+		break;
+	case ChoiceKind::MaskMode:
+		if (index < int(MaskModeOptions().size())) {
+			controller->setMaskMode(id, MaskModeOptions()[index]);
+		}
+		break;
+	case ChoiceKind::MatteMode: {
+		if (index >= int(MatteModeOptions().size())) {
+			break;
+		}
+		const auto mode = MatteModeOptions()[index];
+		if (mode != node->matte
+			&& !controller->setTrackMatte(id, mode)
+			&& mode != MatteMode::None) {
+			ToastIn(
+				controller,
+				tr::lng_oblivion_lottie_mask_matte_no_layer(tr::now));
+		}
+	} break;
+	case ChoiceKind::MatteSource:
+		if (index < int(spec.nodes.size())
+			&& spec.nodes[index] != node->matteLayer
+			&& !controller->setTrackMatte(
+				id,
+				(node->matte != MatteMode::None)
+					? node->matte
+					: MatteMode::Alpha,
+				spec.nodes[index])) {
+			ToastIn(
+				controller,
+				tr::lng_oblivion_lottie_mask_matte_bad_layer(tr::now));
+		}
+		break;
+	case ChoiceKind::Parent:
+		if (index < int(spec.nodes.size())
+			&& spec.nodes[index] != node->parentLayer) {
+			controller->setLayerParent(id, spec.nodes[index]);
+		}
+		break;
+	}
+}
 
 class ChoiceRow final : public LabeledRow {
 public:
@@ -2487,6 +3188,7 @@ protected:
 	int editorWidth() const override;
 	int compactEditorWidth() const override;
 	int layoutEditor(QRect area, bool secondLine) override;
+	void labelClicked() override;
 
 private:
 	const not_null<EditorController*> _controller;
@@ -2513,14 +3215,9 @@ ChoiceRow::ChoiceRow(
 , _spec(spec)
 , _button(Ui::CreateChild<ChoiceButton>(this, OptionTexts(spec.options))) {
 	_button->chosen() | rpl::on_next([=](int index) {
-		if (index < 0 || index >= int(_spec.options.size())) {
-			return;
-		}
-		_controller->perform(Command::SetValue, SetNodeMember(
-			_controller->document(),
-			_spec.node,
-			_spec.member,
-			Json::Value::FromNumber(_spec.options[index].value)));
+		ApplyChoice(_controller, _spec, index);
+		// The model may have refused (a track matte without a layer).
+		refresh();
 	}, _button->lifetime());
 }
 
@@ -2529,28 +3226,26 @@ void ChoiceRow::refresh() {
 	if (!document.contains(_spec.node)) {
 		return;
 	}
-	const auto value = document.json(_spec.node)
-		.get(_spec.member)
-		.toNumber(_spec.fallback);
-	auto index = -1;
-	auto distance = 0.;
-	for (auto i = 0; i != int(_spec.options.size()); ++i) {
-		const auto delta = std::abs(_spec.options[i].value - value);
-		if (index < 0 || delta < distance) {
-			index = i;
-			distance = delta;
-		}
+	_button->setIndex(CurrentChoice(document, _spec));
+}
+
+void ChoiceRow::labelClicked() {
+	if (_spec.selectable && _controller->document().contains(_spec.node)) {
+		_controller->select(_spec.node);
 	}
-	_button->setIndex(index);
 }
 
 int ChoiceRow::editorWidth() const {
-	// At least the value area, so dropdowns line up with the fields.
-	return std::max(_button->fullWidth(), Scaled(kValueAreaWidth));
+	// Always the value area: every dropdown starts where the fields and
+	// the other dropdowns start, whatever its options are. Long options
+	// (layer names) are elided in the button, the menu shows them whole.
+	return Scaled(kValueAreaWidth);
 }
 
 int ChoiceRow::compactEditorWidth() const {
-	return _button->fullWidth();
+	// Long options (layer names, track matte modes) are elided in the
+	// button before the label is.
+	return std::min(_button->fullWidth(), Scaled(kValueAreaWidth));
 }
 
 int ChoiceRow::layoutEditor(QRect area, bool secondLine) {
@@ -2564,6 +3259,119 @@ int ChoiceRow::layoutEditor(QRect area, bool secondLine) {
 		width,
 		Scaled(kFieldHeight));
 	return Scaled(kFieldHeight);
+}
+
+// Links for what is not a value: "Add mask", "Edit points", "Convert to
+// gradient"... They start at the property labels and wrap.
+
+void RunAction(
+		not_null<EditorController*> controller,
+		const ActionSpec &action) {
+	const auto &document = controller->document();
+	const auto id = action.node;
+	if (!document.contains(id)) {
+		return;
+	}
+	controller->setPlaying(false);
+	switch (action.kind) {
+	case ActionKind::AddMask:
+		controller->addMask(
+			id,
+			DefaultMaskPath(document, id, controller->currentFrame()),
+			MaskMode::Add,
+			NewMaskName(document, id));
+		break;
+	case ActionKind::EnableMasks:
+		controller->perform(
+			Command::ChangeMask,
+			EnableLayerMasks(document, id));
+		break;
+	case ActionKind::EditPoints:
+		SetCurrentTool(controller, CanvasTool::Pen);
+		break;
+	case ActionKind::InvertMask:
+		if (!controller->invertMask(id)) {
+			ToastIn(
+				controller,
+				tr::lng_oblivion_lottie_mask_invert_failed(tr::now));
+		}
+		break;
+	case ActionKind::Select:
+		controller->select(id);
+		break;
+	case ActionKind::ConvertPaint:
+		controller->convertPaint(id, ShapeType(action.value));
+		break;
+	case ActionKind::ConvertToPath: {
+		auto edit = ConvertToPath(document, id, controller->localFrame(id));
+		auto created = edit.created;
+		if (controller->perform(Command::EditPath, std::move(edit))
+			&& !created.empty()) {
+			controller->setSelection(std::move(created));
+		}
+	} break;
+	case ActionKind::SetPathClosed:
+		controller->setPathClosed(
+			PathPropertyOf(document, id),
+			action.value != 0);
+		break;
+	case ActionKind::ReversePath:
+		controller->reversePath(PathPropertyOf(document, id));
+		break;
+	case ActionKind::BakeCorners:
+		controller->bakeRoundCorners(id);
+		break;
+	}
+}
+
+class ActionsRow final : public InspectorRow {
+public:
+	ActionsRow(
+		QWidget *parent,
+		not_null<EditorController*> controller,
+		const RowSpec &spec);
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+
+private:
+	std::vector<not_null<Ui::LinkButton*>> _links;
+	const bool _indented = false;
+
+};
+
+ActionsRow::ActionsRow(
+	QWidget *parent,
+	not_null<EditorController*> controller,
+	const RowSpec &spec)
+: InspectorRow(parent)
+, _indented(spec.indented) {
+	for (const auto &action : spec.actions) {
+		const auto link = Ui::CreateChild<Ui::LinkButton>(this, action.text);
+		link->setClickedCallback([=] {
+			RunAction(controller, action);
+		});
+		_links.push_back(link);
+	}
+}
+
+int ActionsRow::resizeGetHeight(int newWidth) {
+	const auto padding = Scaled(kPadding);
+	const auto left = _indented ? PropertyLabelLeft() : padding;
+	const auto right = newWidth - padding;
+	const auto skip = Scaled(14);
+	const auto line = st::normalFont->height + Scaled(6);
+	auto x = left;
+	auto y = Scaled(4);
+	for (const auto &link : _links) {
+		if (x > left && x + link->width() > right) {
+			x = left;
+			y += line;
+		}
+		link->moveToLeft(x, y + (line - link->height()) / 2, newWidth);
+		x += link->width() + skip;
+	}
+	return y + line + Scaled(4);
 }
 
 // Specs.
@@ -2581,6 +3389,7 @@ void AppendProperty(
 		.dimensions = info.dimensions,
 		.colorStops = info.colorStops,
 		.animatable = animatable,
+		.dashOffset = info.dashOffset,
 	});
 }
 
@@ -2731,65 +3540,389 @@ void AppendTransform(
 	}
 }
 
+// A dropdown of one of the typed kinds, the option order is the order of
+// the enum (see CurrentChoice() / ApplyChoice()).
+void AppendTyped(
+		std::vector<RowSpec> &result,
+		NodeId node,
+		ChoiceKind kind,
+		QString label,
+		std::vector<QString> texts) {
+	auto options = std::vector<ChoiceOption>();
+	for (auto &text : texts) {
+		options.push_back({ double(options.size()), std::move(text) });
+	}
+	result.push_back({
+		.kind = SpecKind::Choice,
+		.text = std::move(label),
+		.node = node,
+		.options = std::move(options),
+		.choice = kind,
+	});
+}
+
+void AppendHint(
+		std::vector<RowSpec> &result,
+		QString text,
+		bool warning = false,
+		bool indented = true) {
+	result.push_back({
+		.kind = SpecKind::Hint,
+		.text = std::move(text),
+		.indented = indented,
+		.warning = warning,
+	});
+}
+
+void AppendActions(
+		std::vector<RowSpec> &result,
+		std::vector<ActionSpec> actions,
+		bool indented = true) {
+	if (actions.empty()) {
+		return;
+	}
+	result.push_back({
+		.kind = SpecKind::Actions,
+		.indented = indented,
+		.actions = std::move(actions),
+	});
+}
+
+void AppendAction(
+		std::vector<RowSpec> &result,
+		ActionKind kind,
+		QString text,
+		NodeId node,
+		int value = 0) {
+	auto actions = std::vector<ActionSpec>();
+	actions.push_back({
+		.kind = kind,
+		.text = std::move(text),
+		.node = node,
+		.value = value,
+	});
+	AppendActions(result, std::move(actions));
+}
+
+// A property the renderer has a default for while it is not in the file
+// (mask opacity, trim offset...): shown with the default, the first edit
+// creates it.
+void AppendOptional(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		NodeId node,
+		QByteArray path,
+		PropertyRole role,
+		PropertyType type) {
+	const auto ref = PropertyRef{ node, std::move(path) };
+	if (ranges::contains(result, ref, &RowSpec::ref)) {
+		return;
+	}
+	const auto value = document.defaultValue(ref);
+	if (!value || value->numbers.empty()) {
+		return;
+	}
+	result.push_back({
+		.kind = SpecKind::Property,
+		.text = PropertyRoleText(role),
+		.ref = ref,
+		.type = type,
+		.role = role,
+		.dimensions = int(value->numbers.size()),
+		.defaults = value->numbers,
+	});
+}
+
 void AppendStrokeStyle(
 		std::vector<RowSpec> &result,
 		const Document &document,
 		const NodeInfo &node) {
-	const auto &json = document.json(node.id);
-	AppendChoice(
+	AppendTyped(
 		result,
 		node.id,
+		ChoiceKind::LineCap,
 		tr::lng_oblivion_lottie_inspector_caps(tr::now),
-		"lc",
 		{
-			{ 1., tr::lng_oblivion_lottie_inspector_cap_butt(tr::now) },
-			{ 2., tr::lng_oblivion_lottie_inspector_cap_round(tr::now) },
-			{ 3., tr::lng_oblivion_lottie_inspector_cap_square(tr::now) },
-		},
-		2.);
-	AppendChoice(
+			tr::lng_oblivion_lottie_inspector_cap_butt(tr::now),
+			tr::lng_oblivion_lottie_inspector_cap_round(tr::now),
+			tr::lng_oblivion_lottie_inspector_cap_square(tr::now),
+		});
+	AppendTyped(
 		result,
 		node.id,
+		ChoiceKind::LineJoin,
 		tr::lng_oblivion_lottie_inspector_joins(tr::now),
-		"lj",
 		{
-			{ 1., tr::lng_oblivion_lottie_inspector_join_miter(tr::now) },
-			{ 2., tr::lng_oblivion_lottie_inspector_join_round(tr::now) },
-			{ 3., tr::lng_oblivion_lottie_inspector_join_bevel(tr::now) },
-		},
-		2.);
-	if (json.get("lj").toInt(2) == 1) {
+			tr::lng_oblivion_lottie_inspector_join_miter(tr::now),
+			tr::lng_oblivion_lottie_inspector_join_round(tr::now),
+			tr::lng_oblivion_lottie_inspector_join_bevel(tr::now),
+		});
+	if (node.lineJoin == LineJoin::Miter) {
 		AppendNumber(result, node.id, NumberKind::Member, "ml", 4.);
 	}
 }
 
-void AppendFillRule(std::vector<RowSpec> &result, const NodeInfo &node) {
-	AppendChoice(
+// Dashes of a stroke: how many dash and gap pairs, then their lengths
+// and the offset (every one of them can be animated).
+void AppendDashes(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		const NodeInfo &node,
+		const std::vector<PropertyInfo> &properties) {
+	AppendSection(result, tr::lng_oblivion_lottie_mask_dashes(tr::now));
+	auto texts = std::vector<QString>{
+		tr::lng_oblivion_lottie_mask_dashes_none(tr::now),
+	};
+	const auto pairs = std::max(
+		int(DashesOf(document, node.id).dashes.size()),
+		kMaxDashPairs);
+	for (auto i = 1; i <= pairs; ++i) {
+		texts.push_back(tr::lng_oblivion_lottie_mask_dashes_pairs(
+			tr::now,
+			lt_count,
+			i));
+	}
+	AppendTyped(
 		result,
 		node.id,
+		ChoiceKind::DashCount,
+		tr::lng_oblivion_lottie_mask_dashes_pattern(tr::now),
+		std::move(texts));
+	// Several pairs: "Dash 1", "Gap 1", "Dash 2"... so that two rows don't
+	// have the same name. The offset is one for the whole pattern.
+	const auto dashText = tr::lng_oblivion_lottie_prop_dash(tr::now);
+	const auto gapText = tr::lng_oblivion_lottie_prop_gap(tr::now);
+	const auto numbered = (DashesOf(document, node.id).dashes.size() > 1);
+	auto dashIndex = 0;
+	auto gapIndex = 0;
+	for (const auto &info : properties) {
+		if (info.role != PropertyRole::Dash) {
+			continue;
+		}
+		AppendProperty(result, info);
+		if (!numbered) {
+			continue;
+		}
+		auto &text = result.back().text;
+		if (text == dashText) {
+			text += QChar(' ') + QString::number(++dashIndex);
+		} else if (text == gapText) {
+			text += QChar(' ') + QString::number(++gapIndex);
+		}
+	}
+}
+
+void AppendFillRule(std::vector<RowSpec> &result, const NodeInfo &node) {
+	AppendTyped(
+		result,
+		node.id,
+		ChoiceKind::FillRule,
 		tr::lng_oblivion_lottie_inspector_fill_rule(tr::now),
-		"r",
 		{
-			{ 1., tr::lng_oblivion_lottie_inspector_rule_nonzero(tr::now) },
-			{ 2., tr::lng_oblivion_lottie_inspector_rule_evenodd(tr::now) },
-		},
-		1.);
+			tr::lng_oblivion_lottie_inspector_rule_nonzero(tr::now),
+			tr::lng_oblivion_lottie_inspector_rule_evenodd(tr::now),
+		});
+}
+
+// Short names for the track matte dropdown. Its label already says what
+// it is, and the whole option has to fit in the button: the full names of
+// the two inverted modes are cut down to the same "Inverted…" there.
+[[nodiscard]] QString MatteOptionText(MatteMode mode) {
+	switch (mode) {
+	case MatteMode::None:
+		break;
+	case MatteMode::Alpha:
+		return tr::lng_oblivion_lottie_mask_matte_alpha(tr::now);
+	case MatteMode::AlphaInverted:
+		return tr::lng_oblivion_lottie_mask_matte_alpha_inv(tr::now);
+	case MatteMode::Luma:
+		return tr::lng_oblivion_lottie_mask_matte_luma(tr::now);
+	case MatteMode::LumaInverted:
+		return tr::lng_oblivion_lottie_mask_matte_luma_inv(tr::now);
+	}
+	return MatteModeText(mode);
+}
+
+// What the chosen track matte mode does, in plain words (the short names
+// of the dropdown are terms).
+[[nodiscard]] QString MatteOptionAbout(MatteMode mode) {
+	switch (mode) {
+	case MatteMode::None:
+		break;
+	case MatteMode::Alpha:
+		return tr::lng_oblivion_lottie_mask_matte_alpha_about(tr::now);
+	case MatteMode::AlphaInverted:
+		return tr::lng_oblivion_lottie_mask_matte_alpha_inv_about(tr::now);
+	case MatteMode::Luma:
+		return tr::lng_oblivion_lottie_mask_matte_luma_about(tr::now);
+	case MatteMode::LumaInverted:
+		return tr::lng_oblivion_lottie_mask_matte_luma_inv_about(tr::now);
+	}
+	return QString();
+}
+
+// A layer picker: `first` (may be 0 for "none") and then the layers of the
+// composition of the node that pass the filter.
+void AppendLayerPicker(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		const NodeInfo &node,
+		ChoiceKind kind,
+		QString label,
+		std::optional<QString> none,
+		Fn<bool(const NodeInfo &other)> filter) {
+	auto spec = RowSpec{
+		.kind = SpecKind::Choice,
+		.text = std::move(label),
+		.node = node.id,
+		.choice = kind,
+	};
+	if (none) {
+		spec.options.push_back({ 0., *none });
+		spec.nodes.push_back(0);
+	}
+	const auto composition = (node.composition == document.rootId())
+		? NodeId(0)
+		: node.composition;
+	for (const auto id : document.layers(composition)) {
+		const auto other = document.node(id);
+		if (!other || id == node.id || !filter(*other)) {
+			continue;
+		}
+		spec.options.push_back({
+			double(spec.options.size()),
+			NodeDisplayName(document, id),
+		});
+		spec.nodes.push_back(id);
+	}
+	result.push_back(std::move(spec));
+}
+
+void AppendLayerLinks(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		const NodeInfo &node) {
+	AppendSection(result, tr::lng_oblivion_lottie_mask_links(tr::now));
+	const auto id = node.id;
+	AppendLayerPicker(
+		result,
+		document,
+		node,
+		ChoiceKind::Parent,
+		tr::lng_oblivion_lottie_mask_parent(tr::now),
+		tr::lng_oblivion_lottie_mask_parent_none(tr::now),
+		[&](const NodeInfo &other) {
+			return (other.id == node.parentLayer)
+				|| CanSetLayerParent(document, id, other.id);
+		});
+
+	auto modes = std::vector<QString>();
+	for (const auto mode : MatteModeOptions()) {
+		modes.push_back(MatteOptionText(mode));
+	}
+	AppendTyped(
+		result,
+		id,
+		ChoiceKind::MatteMode,
+		tr::lng_oblivion_lottie_mask_matte(tr::now),
+		std::move(modes));
+	if (node.matte != MatteMode::None) {
+		AppendLayerPicker(
+			result,
+			document,
+			node,
+			ChoiceKind::MatteSource,
+			tr::lng_oblivion_lottie_mask_matte_layer(tr::now),
+			std::nullopt,
+			[&](const NodeInfo &other) {
+				// A layer that is under a matte itself or already cuts
+				// another layer can't be taken.
+				return (other.id == node.matteLayer)
+					|| ((other.matte == MatteMode::None)
+						&& !other.matteTarget);
+			});
+		if (!node.matteLayer) {
+			AppendHint(
+				result,
+				tr::lng_oblivion_lottie_mask_matte_broken(tr::now),
+				true);
+		} else {
+			// What exactly is shown in this mode, then how it works.
+			const auto about = MatteOptionAbout(node.matte);
+			if (!about.isEmpty()) {
+				AppendHint(result, about);
+			}
+			AppendHint(
+				result,
+				tr::lng_oblivion_lottie_mask_matte_about(tr::now));
+		}
+	} else {
+		AppendHint(result, tr::lng_oblivion_lottie_mask_matte_hint(tr::now));
+	}
+}
+
+void AppendLayerMasks(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		const NodeInfo &node) {
+	AppendSection(result, tr::lng_oblivion_lottie_mask_masks(tr::now));
+	auto modes = std::vector<QString>();
+	for (const auto mode : MaskModeOptions()) {
+		modes.push_back(MaskModeText(mode));
+	}
+	for (const auto mask : node.masks) {
+		AppendTyped(
+			result,
+			mask,
+			ChoiceKind::MaskMode,
+			NodeDisplayName(document, mask),
+			modes);
+		result.back().selectable = true;
+	}
+	auto actions = std::vector<ActionSpec>();
+	actions.push_back({
+		.kind = ActionKind::AddMask,
+		.text = tr::lng_oblivion_lottie_mask_add(tr::now),
+		.node = node.id,
+	});
+	const auto switchedOff = LayerMasksSwitchedOff(document, node.id);
+	if (switchedOff) {
+		actions.push_back({
+			.kind = ActionKind::EnableMasks,
+			.text = tr::lng_oblivion_lottie_mask_enable(tr::now),
+			.node = node.id,
+		});
+	}
+	AppendActions(result, std::move(actions));
+	if (node.masks.empty()) {
+		AppendHint(result, tr::lng_oblivion_lottie_mask_masks_hint(tr::now));
+	} else {
+		if (switchedOff) {
+			AppendHint(
+				result,
+				tr::lng_oblivion_lottie_mask_masks_off(tr::now),
+				true);
+		}
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_masks_list_hint(tr::now));
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_telegram_masks(tr::now),
+			true);
+	}
 }
 
 void AppendLayer(
 		std::vector<RowSpec> &result,
 		const Document &document,
 		const NodeInfo &node) {
-	if (node.parentLayer) {
-		AppendInfo(result, tr::lng_oblivion_lottie_layers_parent(
+	if (node.matteTarget) {
+		AppendInfo(result, tr::lng_oblivion_lottie_mask_matte_for(
 			tr::now,
 			lt_name,
-			NodeDisplayName(document, node.parentLayer)));
-	}
-	if (node.matte != MatteMode::None) {
-		AppendInfo(result, MatteModeText(node.matte));
-	}
-	if (node.matteSource) {
+			NodeDisplayName(document, node.matteTarget)));
+	} else if (node.matteSource) {
 		AppendInfo(
 			result,
 			tr::lng_oblivion_lottie_inspector_matte_source(tr::now));
@@ -2820,6 +3953,112 @@ void AppendLayer(
 			}
 		}
 	}
+	AppendLayerLinks(result, document, node);
+	AppendLayerMasks(result, document, node);
+}
+
+void AppendMask(
+		std::vector<RowSpec> &result,
+		const Document &document,
+		const NodeInfo &node) {
+	AppendSection(
+		result,
+		tr::lng_oblivion_lottie_inspector_parameters(tr::now));
+	auto modes = std::vector<QString>();
+	for (const auto mode : MaskModeOptions()) {
+		modes.push_back(MaskModeText(mode));
+	}
+	AppendTyped(
+		result,
+		node.id,
+		ChoiceKind::MaskMode,
+		tr::lng_oblivion_lottie_mask_mode(tr::now),
+		std::move(modes));
+	const auto drawn = (node.maskMode == MaskMode::Add)
+		|| (node.maskMode == MaskMode::Subtract)
+		|| (node.maskMode == MaskMode::Intersect)
+		|| (node.maskMode == MaskMode::Difference);
+	if (!drawn) {
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_mode_skipped(tr::now),
+			true);
+	}
+	const auto properties = document.properties(node.id);
+	for (const auto &info : properties) {
+		if (info.role == PropertyRole::MaskPath) {
+			AppendProperty(result, info);
+		}
+	}
+	const auto layer = document.node(node.layer);
+	const auto first = layer
+		&& !layer->masks.empty()
+		&& (layer->masks.front() == node.id);
+	auto actions = std::vector<ActionSpec>();
+	actions.push_back({
+		.kind = ActionKind::EditPoints,
+		.text = tr::lng_oblivion_lottie_mask_pen_edit(tr::now),
+		.node = node.id,
+	});
+	if (InvertedMaskMode(node.maskMode, first)) {
+		actions.push_back({
+			.kind = ActionKind::InvertMask,
+			.text = tr::lng_oblivion_lottie_mask_invert(tr::now),
+			.node = node.id,
+		});
+	}
+	AppendActions(result, std::move(actions));
+	if (node.maskInverted) {
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_inverted_flag(tr::now),
+			true);
+	}
+	for (const auto &info : properties) {
+		if (info.role != PropertyRole::MaskPath) {
+			AppendProperty(result, info);
+		}
+	}
+	AppendOptional(
+		result,
+		document,
+		node.id,
+		"o",
+		PropertyRole::MaskOpacity,
+		PropertyType::Scalar);
+	AppendOptional(
+		result,
+		document,
+		node.id,
+		"x",
+		PropertyRole::MaskExpansion,
+		PropertyType::Scalar);
+	AppendOptional(
+		result,
+		document,
+		node.id,
+		"f",
+		PropertyRole::MaskFeather,
+		PropertyType::Vector);
+	AppendHint(
+		result,
+		tr::lng_oblivion_lottie_mask_telegram_options(tr::now),
+		true);
+	if (LayerMasksSwitchedOff(document, node.layer)) {
+		AppendAction(
+			result,
+			ActionKind::EnableMasks,
+			tr::lng_oblivion_lottie_mask_enable(tr::now),
+			node.layer);
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_masks_off(tr::now),
+			true);
+	}
+	AppendHint(
+		result,
+		tr::lng_oblivion_lottie_mask_telegram_masks(tr::now),
+		true);
 }
 
 void AppendShape(
@@ -2846,39 +4085,65 @@ void AppendShape(
 			}
 		}
 	};
+	const auto notDash = [](const PropertyInfo &info) {
+		return (info.role != PropertyRole::Dash);
+	};
+	const auto optional = [&](
+			const char *path,
+			PropertyRole role,
+			PropertyType type = PropertyType::Scalar) {
+		AppendOptional(result, document, node.id, path, role, type);
+	};
+	const auto convert = [&](ShapeType type, QString text) {
+		AppendAction(
+			result,
+			ActionKind::ConvertPaint,
+			std::move(text),
+			node.id,
+			int(type));
+	};
 	switch (node.shapeType) {
 	case ShapeType::Fill:
 		append(nullptr);
+		optional("o", PropertyRole::Opacity);
 		AppendFillRule(result, node);
+		convert(
+			ShapeType::GradientFill,
+			tr::lng_oblivion_lottie_mask_to_gradient(tr::now));
 		break;
 	case ShapeType::Stroke:
-		append(nullptr);
+		append(notDash);
+		optional("o", PropertyRole::Opacity);
 		AppendStrokeStyle(result, document, node);
+		convert(
+			ShapeType::GradientStroke,
+			tr::lng_oblivion_lottie_mask_to_gradient(tr::now));
+		AppendDashes(result, document, node, properties);
 		break;
 	case ShapeType::GradientFill:
 	case ShapeType::GradientStroke: {
-		const auto radial = (json.get("t").toInt(1) == 2);
-		AppendChoice(
+		const auto radial = (node.gradientType == GradientType::Radial);
+		const auto stroke = (node.shapeType == ShapeType::GradientStroke);
+		AppendTyped(
 			result,
 			node.id,
+			ChoiceKind::GradientType,
 			tr::lng_oblivion_lottie_inspector_gradient_type(tr::now),
-			"t",
 			{
-				{
-					1.,
-					tr::lng_oblivion_lottie_inspector_gradient_linear(tr::now),
-				},
-				{
-					2.,
-					tr::lng_oblivion_lottie_inspector_gradient_radial(tr::now),
-				},
-			},
-			1.);
+				tr::lng_oblivion_lottie_inspector_gradient_linear(tr::now),
+				tr::lng_oblivion_lottie_inspector_gradient_radial(tr::now),
+			});
 		append([=](const PropertyInfo &info) {
-			return radial
-				|| (info.role != PropertyRole::HighlightLength
-					&& info.role != PropertyRole::HighlightAngle);
+			return (info.role != PropertyRole::Dash)
+				&& (radial
+					|| (info.role != PropertyRole::HighlightLength
+						&& info.role != PropertyRole::HighlightAngle));
 		});
+		optional("o", PropertyRole::Opacity);
+		if (radial) {
+			optional("h", PropertyRole::HighlightLength);
+			optional("a", PropertyRole::HighlightAngle);
+		}
 		// The hint explains the stops bar, so it goes right under it.
 		const auto bar = ranges::find(
 			result,
@@ -2886,13 +4151,13 @@ void AppendShape(
 			&RowSpec::type);
 		const auto hint = RowSpec{
 			.kind = SpecKind::Hint,
-			.text = tr::lng_oblivion_lottie_inspector_gradient_hint(tr::now),
+			.text = tr::lng_oblivion_lottie_mask_gradient_hint(tr::now),
 			.indented = (bar != end(result)),
 		};
 		if (bar != end(result)) {
 			result.insert(bar + 1, hint);
 		}
-		if (node.shapeType == ShapeType::GradientStroke) {
+		if (stroke) {
 			AppendStrokeStyle(result, document, node);
 		} else {
 			AppendFillRule(result, node);
@@ -2900,26 +4165,119 @@ void AppendShape(
 		if (!hint.indented) {
 			result.push_back(hint);
 		}
+		convert(
+			stroke ? ShapeType::Stroke : ShapeType::Fill,
+			tr::lng_oblivion_lottie_mask_to_solid(tr::now));
+		if (stroke) {
+			AppendHint(
+				result,
+				tr::lng_oblivion_lottie_mask_telegram_gradient_stroke(
+					tr::now),
+				true);
+			AppendDashes(result, document, node, properties);
+		}
 	} break;
 	case ShapeType::TrimPaths:
 		append(nullptr);
-		AppendChoice(
+		optional("s", PropertyRole::TrimStart);
+		optional("e", PropertyRole::TrimEnd);
+		optional("o", PropertyRole::TrimOffset);
+		AppendTyped(
 			result,
 			node.id,
+			ChoiceKind::TrimMode,
 			tr::lng_oblivion_lottie_inspector_trim_mode(tr::now),
-			"m",
 			{
-				{
-					1.,
-					tr::lng_oblivion_lottie_inspector_trim_together(tr::now),
-				},
-				{
-					2.,
-					tr::lng_oblivion_lottie_inspector_trim_individually(
-						tr::now),
-				},
-			},
-			1.);
+				tr::lng_oblivion_lottie_inspector_trim_together(tr::now),
+				tr::lng_oblivion_lottie_inspector_trim_individually(tr::now),
+			});
+		AppendHint(result, tr::lng_oblivion_lottie_mask_trim_hint(tr::now));
+		break;
+	case ShapeType::Repeater:
+		append(nullptr);
+		optional("c", PropertyRole::Copies);
+		optional("o", PropertyRole::Offset);
+		optional("tr.a", PropertyRole::Anchor, PropertyType::Vector);
+		optional("tr.p", PropertyRole::Position, PropertyType::Vector);
+		optional("tr.s", PropertyRole::Scale, PropertyType::Vector);
+		optional("tr.r", PropertyRole::Rotation);
+		optional("tr.so", PropertyRole::StartOpacity);
+		optional("tr.eo", PropertyRole::EndOpacity);
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_repeater_hint(tr::now));
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_telegram_repeater(tr::now),
+			true);
+		break;
+	case ShapeType::RoundCorners:
+		append(nullptr);
+		optional("r", PropertyRole::Radius);
+		AppendAction(
+			result,
+			ActionKind::BakeCorners,
+			tr::lng_oblivion_lottie_mask_bake(tr::now),
+			node.id);
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_telegram_round(tr::now),
+			true);
+		break;
+	case ShapeType::Rectangle:
+	case ShapeType::Ellipse:
+		append(nullptr);
+		if (node.shapeType == ShapeType::Rectangle) {
+			optional("r", PropertyRole::Roundness);
+		}
+		if (CanConvertToPath(document, node.id)) {
+			AppendAction(
+				result,
+				ActionKind::ConvertToPath,
+				tr::lng_oblivion_lottie_mask_pen_convert(tr::now),
+				node.id);
+			AppendHint(
+				result,
+				tr::lng_oblivion_lottie_mask_convert_hint(tr::now));
+		}
+		break;
+	case ShapeType::Path: {
+		append(nullptr);
+		const auto value = document.baseValue(
+			PropertyRef{ node.id, QByteArray("ks") });
+		const auto closed = value && value->path && value->path->closed;
+		auto actions = std::vector<ActionSpec>();
+		actions.push_back({
+			.kind = ActionKind::EditPoints,
+			.text = tr::lng_oblivion_lottie_mask_pen_edit(tr::now),
+			.node = node.id,
+		});
+		actions.push_back({
+			.kind = ActionKind::SetPathClosed,
+			.text = (closed
+				? tr::lng_oblivion_lottie_mask_pen_open(tr::now)
+				: tr::lng_oblivion_lottie_mask_pen_close(tr::now)),
+			.node = node.id,
+			.value = closed ? 0 : 1,
+		});
+		actions.push_back({
+			.kind = ActionKind::ReversePath,
+			.text = tr::lng_oblivion_lottie_mask_pen_reverse(tr::now),
+			.node = node.id,
+		});
+		AppendActions(result, std::move(actions));
+		AppendHint(result, tr::lng_oblivion_lottie_mask_path_hint(tr::now));
+	} break;
+	case ShapeType::MergePaths:
+	case ShapeType::OffsetPath:
+	case ShapeType::PuckerBloat:
+	case ShapeType::Twist:
+	case ShapeType::ZigZag:
+		append(nullptr);
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_telegram_modifier(tr::now),
+			true);
 		break;
 	case ShapeType::Star: {
 		const auto polygon = (json.get("sy").toInt(1) == 2);
@@ -2941,6 +4299,10 @@ void AppendShape(
 				|| (info.role != PropertyRole::InnerRadius
 					&& info.role != PropertyRole::InnerRoundness);
 		});
+		AppendHint(
+			result,
+			tr::lng_oblivion_lottie_mask_telegram_star(tr::now),
+			true);
 	} break;
 	default:
 		append(nullptr);
@@ -3011,6 +4373,9 @@ void AppendComposition(
 		break;
 	case NodeKind::Shape:
 		AppendShape(result, document, *node);
+		break;
+	case NodeKind::Mask:
+		AppendMask(result, document, *node);
 		break;
 	default: {
 		const auto properties = document.properties(node->id);
@@ -3113,14 +4478,16 @@ void AppendComposition(
 		return {
 			.label = tr::lng_oblivion_lottie_inspector_miter(tr::now),
 			.options = { .step = 0.05, .min = 0., .max = 100., .decimals = 2 },
-			.command = Command::SetValue,
+			.command = Command::ShapeOption,
 			.value = [=](const Document &document) -> std::optional<double> {
 				if (!document.contains(id)) {
 					return std::nullopt;
 				}
 				return document.json(id).get(member).toNumber(fallback);
 			},
-			.edit = setMember(member, 0.),
+			.edit = [=](const Document &document, double value) {
+				return SetMiterLimit(document, id, std::max(value, 0.));
+			},
 		};
 	}
 	case NumberKind::Width:
@@ -3205,11 +4572,16 @@ public:
 
 	[[nodiscard]] rpl::producer<> scrollToTopRequests() const;
 
+	// Selects a stop of the gradient row, now or as soon as the rows of
+	// the selection are built.
+	void selectGradientStop(int index, bool opacity);
+
 private:
 	void scheduleSync();
 	void sync();
 	void rebuild(std::vector<RowSpec> &&specs);
 	void refreshRows();
+	void applyPendingStop();
 	[[nodiscard]] object_ptr<InspectorRow> createRow(const RowSpec &spec);
 
 	const not_null<EditorController*> _controller;
@@ -3217,6 +4589,7 @@ private:
 	QByteArray _signature;
 	NodeId _shown = 0;
 	bool _syncScheduled = false;
+	std::optional<std::pair<int, bool>> _pendingStop;
 	rpl::event_stream<> _scrollToTopRequests;
 
 };
@@ -3280,6 +4653,27 @@ void InspectorPanel::Content::sync() {
 		_shown = shown;
 		_scrollToTopRequests.fire({});
 	}
+	applyPendingStop();
+}
+
+void InspectorPanel::Content::selectGradientStop(int index, bool opacity) {
+	_pendingStop = std::make_pair(index, opacity);
+	if (!_syncScheduled) {
+		applyPendingStop();
+	}
+}
+
+void InspectorPanel::Content::applyPendingStop() {
+	if (!_pendingStop) {
+		return;
+	}
+	const auto [index, opacity] = *_pendingStop;
+	for (const auto row : _rows) {
+		if (row->selectGradientStop(index, opacity)) {
+			_pendingStop = std::nullopt;
+			return;
+		}
+	}
 }
 
 object_ptr<InspectorRow> InspectorPanel::Content::createRow(const RowSpec &spec) {
@@ -3294,7 +4688,14 @@ object_ptr<InspectorRow> InspectorPanel::Content::createRow(const RowSpec &spec)
 	case SpecKind::Info:
 		return object_ptr<InfoRow>(this, spec.text, false, false);
 	case SpecKind::Hint:
-		return object_ptr<InfoRow>(this, spec.text, true, spec.indented);
+		return object_ptr<InfoRow>(
+			this,
+			spec.text,
+			true,
+			spec.indented,
+			spec.warning);
+	case SpecKind::Actions:
+		return object_ptr<ActionsRow>(this, _controller, spec);
 	case SpecKind::Section:
 		return object_ptr<SectionRow>(this, spec.text);
 	case SpecKind::Property:
@@ -3405,6 +4806,10 @@ InspectorPanel::Tab InspectorPanel::tab() const {
 	return _tab;
 }
 
+void InspectorPanel::selectGradientStop(int index, bool opacity) {
+	_content->selectGradientStop(index, opacity);
+}
+
 void InspectorPanel::showTab(Tab tab, bool remember) {
 	_tab = tab;
 	if (remember) {
@@ -3486,7 +4891,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 
 	RegisterScene(
 		u"lottie_inspector_stroke"_q,
-		QSize(320, 560),
+		QSize(320, 700),
 		CreateInspectorScene,
 		[](not_null<QWidget*> widget) {
 			const auto controller = SceneController(widget);
@@ -3503,7 +4908,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 
 	RegisterScene(
 		u"lottie_inspector_gradient"_q,
-		QSize(320, 620),
+		QSize(320, 700),
 		CreateInspectorScene,
 		[](not_null<QWidget*> widget) {
 			const auto controller = SceneController(widget);
@@ -3511,6 +4916,145 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 					controller->document(),
 					ShapeType::GradientFill)) {
 				controller->select(gradient);
+			}
+		});
+
+	// The stops editor: an opacity stop above the bar, a color stop
+	// selected (its color, hex and position under the bar).
+	RegisterScene(
+		u"lottie_inspector_gradient_editor"_q,
+		QSize(320, 700),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			const auto host = static_cast<PanelSceneHost*>(widget.get());
+			if (const auto gradient = FindShapeOfType(
+					controller->document(),
+					ShapeType::GradientFill)) {
+				controller->addGradientStop(gradient, 0.35, true);
+				controller->addGradientStop(gradient, 0.6, false);
+				controller->select(gradient);
+				controller->setActiveProperty(
+					PropertyRef{ gradient, QByteArray("g.k") });
+				static_cast<InspectorPanel*>(
+					host->panel().get())->selectGradientStop(1);
+			}
+		});
+
+	// The same editor with a half transparent opacity stop selected: the
+	// transparency pattern in the bar, the opacity and the position of
+	// the stop with their captions.
+	RegisterScene(
+		u"lottie_inspector_gradient_opacity"_q,
+		QSize(320, 700),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			const auto host = static_cast<PanelSceneHost*>(widget.get());
+			if (const auto gradient = FindShapeOfType(
+					controller->document(),
+					ShapeType::GradientFill)) {
+				controller->addGradientStop(gradient, 0.35, true);
+				auto data = controller->document().gradientAt(
+					gradient,
+					controller->localFrame(gradient));
+				if (data && data->alphas.size() > 1) {
+					data->alphas[1].color = QColor(0, 0, 0);
+					data->alphas[1].color.setAlphaF(0.4f);
+					controller->setGradient(gradient, *data);
+				}
+				controller->select(gradient);
+				controller->setActiveProperty(
+					PropertyRef{ gradient, QByteArray("g.k") });
+				static_cast<InspectorPanel*>(
+					host->panel().get())->selectGradientStop(1, true);
+			}
+		});
+
+	// A mask: mode, path with "Edit points" / "Invert", the options
+	// Telegram ignores with the warnings.
+	RegisterScene(
+		u"lottie_inspector_mask"_q,
+		QSize(320, 600),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			const auto &document = controller->document();
+			if (const auto layer = FindNodeByName(
+					document,
+					u"BOARD FRONT"_q,
+					NodeKind::Layer)) {
+				controller->addMask(
+					layer,
+					DefaultMaskPath(
+						document,
+						layer,
+						controller->currentFrame()),
+					MaskMode::Add,
+					NewMaskName(document, layer));
+				const auto mask = controller->primarySelection();
+				controller->setValue(
+					PropertyRef{ mask, QByteArray("o") },
+					PropValue::Scalar(70.));
+			}
+		});
+
+	// A layer: the parent picker, a track matte with its layer, the list
+	// of masks.
+	RegisterScene(
+		u"lottie_inspector_layer_links"_q,
+		QSize(320, 960),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			const auto &document = controller->document();
+			if (const auto layer = FindNodeByName(
+					document,
+					u"Blue"_q,
+					NodeKind::Layer)) {
+				// Two masks with different modes: the list is a list.
+				for (const auto mode : { MaskMode::Add, MaskMode::Subtract }) {
+					controller->addMask(
+						layer,
+						DefaultMaskPath(
+							document,
+							layer,
+							controller->currentFrame()),
+						mode,
+						NewMaskName(document, layer));
+				}
+				controller->setTrackMatte(layer, MatteMode::Alpha);
+				controller->select(layer);
+			}
+		});
+
+	// A stroke with a dash pattern (a dash-dot line, so that the four
+	// lengths are not the same number).
+	RegisterScene(
+		u"lottie_inspector_dashes"_q,
+		QSize(320, 660),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			if (const auto stroke = FindShapeOfType(
+					controller->document(),
+					ShapeType::Stroke)) {
+				controller->setDashes(stroke, { 24., 8., 4., 8. });
+				controller->select(stroke);
+			}
+		});
+
+	// A path item: its points, the pen actions.
+	RegisterScene(
+		u"lottie_inspector_path"_q,
+		QSize(320, 420),
+		CreateInspectorScene,
+		[](not_null<QWidget*> widget) {
+			const auto controller = SceneController(widget);
+			if (const auto path = FindShapeOfType(
+					controller->document(),
+					ShapeType::Path)) {
+				controller->select(path);
 			}
 		});
 

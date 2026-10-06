@@ -21,6 +21,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 //
 // Frame indices are rlottie frame numbers counted from "ip":
 // [0, Info::frames), every frame of 60 fps animations included.
+//
+// Renderer safety: a few values make rlottie loop forever (an easing below
+// zero on a motion path keyframe, negative or too short stroke dashes,
+// trim values far below zero, huge repeater / star counts, see
+// LottieEdit::RenderSafeJson() in oblivion_lottie_doc.h). Everything that
+// is drawn here (RenderFrame(), Renderer, ExportSvg()) gets a copy with
+// such values clamped, so a broken file can't hang the caller's thread;
+// the bytes the caller holds are never changed. A file that may have such
+// values and is not valid JSON is not drawn at all (rlottie would draw the
+// part before the error, unchecked).
 namespace Oblivion::Lottie {
 
 // .tgs (gzip) or plain Lottie JSON bytes -> JSON bytes, empty on error.

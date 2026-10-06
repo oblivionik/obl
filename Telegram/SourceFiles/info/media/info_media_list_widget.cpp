@@ -66,6 +66,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/weak_ptr.h"
 #include "base/call_delayed.h"
 #include "media/player/media_player_instance.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_music_editor.h"
 #include "oblivion/oblivion_playlists.h"
 #include "boxes/delete_messages_box.h"
@@ -1474,6 +1475,10 @@ void ListWidget::showContextMenu(
 	if (overSelected != SelectionState::OverSelectedItems) {
 		if (const auto message = MessageByGlobalId(globalId)) {
 			Oblivion::AddToPlaylistMenu(
+				_contextMenu.get(),
+				_controller->parentController(),
+				message);
+			Oblivion::Listen::AddStartAction( // Oblivion: listen together.
 				_contextMenu.get(),
 				_controller->parentController(),
 				message);

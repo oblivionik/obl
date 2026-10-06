@@ -20,6 +20,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item_components.h"
 #include "history/history_item_edition.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_settings.h"
 #include "ui/image/image.h"
 #include "settings.h"
@@ -1010,6 +1011,13 @@ void EditHistory::remember(
 		|| (was.text == now.text)
 		|| was.text.startsWith(DeletedMark())
 		|| (now.text == DeletedMark() + was.text)) {
+		return;
+	} else if (Listen::IsControlEdit(item, was, now)) {
+		// Round 4, listen together: the host of a session edits its
+		// control message when the track changes and when the session
+		// ends, these are not edits made by a person. Only an edit from
+		// one valid state of a session to its next one is left out, an
+		// ordinary message can't be hidden by a link added to it.
 		return;
 	}
 	const auto edited = item->Get<HistoryMessageEdited>();

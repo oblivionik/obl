@@ -298,6 +298,32 @@ QString FileName(Format format) {
 	return QString();
 }
 
+int SideFor(PackKind kind) {
+	return (kind == PackKind::Emoji) ? kEmojiSide : kStickerSide;
+}
+
+int MaxInSet(PackKind kind) {
+	return (kind == PackKind::Emoji) ? kMaxEmojiInSet : kMaxStickers;
+}
+
+QSize FitSize(QSize source, PackKind kind) {
+	if (source.width() <= 0 || source.height() <= 0) {
+		return QSize();
+	}
+	const auto side = SideFor(kind);
+	return source.scaled(
+		QSize(side, side),
+		Qt::KeepAspectRatio
+	).expandedTo(QSize(1, 1));
+}
+
+QSize CanvasSize(QSize source, PackKind kind) {
+	const auto fitted = FitSize(source, kind);
+	return (fitted.isEmpty() || kind != PackKind::Emoji)
+		? fitted
+		: QSize(kEmojiSide, kEmojiSide);
+}
+
 QRect OpaqueBounds(const QImage &image, int threshold) {
 	if (image.isNull()) {
 		return QRect();
@@ -416,8 +442,8 @@ bool WebpSupported() {
 	return result;
 }
 
-Prepared EncodeStatic(const QImage &composed) {
-	if (composed.isNull() || !WebpSupported()) {
+Prepared EncodeStatic(const QImage &composed, int maxBytes) {
+	if (composed.isNull() || !WebpSupported() || maxBytes <= 0) {
 		return Prepared();
 	}
 	const auto image = HasTransparency(composed)
@@ -430,7 +456,7 @@ Prepared EncodeStatic(const QImage &composed) {
 		auto bytes = WriteWebp(image, quality);
 		if (bytes.isEmpty()) {
 			return Prepared();
-		} else if (bytes.size() <= kStaticMaxBytes) {
+		} else if (bytes.size() <= maxBytes) {
 			return Prepared{
 				.format = Format::Static,
 				.bytes = std::move(bytes),
@@ -443,6 +469,53 @@ Prepared EncodeStatic(const QImage &composed) {
 
 Prepared PrepareStatic(const QImage &image, StaticOptions options) {
 	return EncodeStatic(ComposeSticker(image, options));
+}
+
+QImage ComposeEmoji(const QImage &image) {
+	if (image.isNull() || image.width() <= 0 || image.height() <= 0) {
+		return QImage();
+	}
+	auto source = Premultiplied(image);
+	if (source.isNull()) {
+		return QImage();
+	}
+	const auto bounds = OpaqueBounds(source);
+	if (!bounds.isEmpty() && bounds != source.rect()) {
+		source = source.copy(bounds);
+	}
+	const auto fitted = FitSize(source.size(), PackKind::Emoji);
+	const auto scaled = (source.size() == fitted)
+		? source
+		: Premultiplied(source.scaled(
+			fitted,
+			Qt::IgnoreAspectRatio,
+			Qt::SmoothTransformation));
+	if (scaled.isNull()) {
+		return QImage();
+	} else if (scaled.size() == QSize(kEmojiSide, kEmojiSide)) {
+		return scaled;
+	}
+	auto result = QImage(
+		QSize(kEmojiSide, kEmojiSide),
+		QImage::Format_ARGB32_Premultiplied);
+	if (result.isNull()) {
+		return QImage();
+	}
+	result.fill(Qt::transparent);
+	{
+		auto p = QPainter(&result);
+		p.setCompositionMode(QPainter::CompositionMode_Source);
+		p.drawImage(
+			QPoint(
+				(kEmojiSide - scaled.width()) / 2,
+				(kEmojiSide - scaled.height()) / 2),
+			scaled);
+	}
+	return result;
+}
+
+Prepared PrepareEmoji(const QImage &image) {
+	return EncodeStatic(ComposeEmoji(image), kEmojiStaticMaxBytes);
 }
 
 LottieCheck CheckLottie(const QByteArray &tgsOrJson) {
@@ -490,14 +563,21 @@ Prepared PrepareAnimated(const LottieCheck &check) {
 	};
 }
 
-VideoCheck CheckVideoSticker(const QByteArray &webm) {
+VideoCheck CheckVideoFor(PackKind kind, const QByteArray &webm) {
 	auto result = VideoCheck();
 	if (webm.isEmpty()) {
 		return result;
 	}
 	result.info = VideoCore::ReadClipInfo(QString(), webm);
 	const auto &info = result.info;
+	const auto emoji = (kind == PackKind::Emoji);
 	const auto longer = std::max(info.size.width(), info.size.height());
+	const auto dimensions = emoji
+		? (info.size == QSize(kEmojiSide, kEmojiSide))
+		: (longer == kStickerSide);
+	const auto maxBytes = emoji
+		? VideoCore::kEmojiMaxBytes
+		: VideoCore::kStickerMaxBytes;
 	result.problem = !info.valid()
 		? VideoProblem::Unreadable
 		: (!IsMatroska(webm) || !webm.left(64).contains("webm"))
@@ -506,16 +586,24 @@ VideoCheck CheckVideoSticker(const QByteArray &webm) {
 		? VideoProblem::Codec
 		: info.hasAudio
 		? VideoProblem::Audio
-		: (longer != kStickerSide)
+		: !dimensions
 		? VideoProblem::Dimensions
 		: (info.duration > VideoCore::kStickerMaxDuration)
 		? VideoProblem::Duration
 		: (info.fps > VideoCore::kStickerMaxFps + kFrameRateSlack)
 		? VideoProblem::FrameRate
-		: (webm.size() > VideoCore::kStickerMaxBytes)
+		: (webm.size() > maxBytes)
 		? VideoProblem::FileSize
 		: VideoProblem::None;
 	return result;
+}
+
+VideoCheck CheckVideoSticker(const QByteArray &webm) {
+	return CheckVideoFor(PackKind::Stickers, webm);
+}
+
+VideoCheck CheckVideoEmoji(const QByteArray &webm) {
+	return CheckVideoFor(PackKind::Emoji, webm);
 }
 
 Prepared PrepareVideo(const QByteArray &webm, const VideoCheck &check) {
@@ -607,8 +695,27 @@ FileKind DetectFileKind(const QString &name, const QByteArray &content) {
 		u"webm"_q,
 		u"gif"_q,
 	};
-	return ranges::contains(kVideo, extension)
-		? FileKind::Video
+	if (ranges::contains(kVideo, extension)) {
+		return FileKind::Video;
+	}
+
+	// The callers show only the beginning of a big file: not every reader
+	// knows an image by that (an animated WebP is read as a whole). The
+	// loader of the images decides then, it gets the file itself.
+	static const auto kImage = std::array{
+		u"png"_q,
+		u"jpg"_q,
+		u"jpeg"_q,
+		u"webp"_q,
+		u"bmp"_q,
+		u"heic"_q,
+		u"heif"_q,
+		u"avif"_q,
+		u"tif"_q,
+		u"tiff"_q,
+	};
+	return ranges::contains(kImage, extension)
+		? FileKind::Image
 		: FileKind::Unknown;
 }
 
@@ -1551,6 +1658,14 @@ bool RunSelfTest(QStringList &log) {
 			DetectFileKind(u"notes.txt"_q, QByteArray("hello"))
 				== FileKind::Unknown,
 			u"DetectFileKind of a text file"_q);
+		check(
+			(DetectFileKind(u"big.WEBP"_q, QByteArray("hello"))
+				== FileKind::Image)
+				&& (DetectFileKind(u"scan.tiff"_q, QByteArray("hello"))
+					== FileKind::Image)
+				&& (DetectFileKind(u"webp"_q, QByteArray("hello"))
+					== FileKind::Unknown),
+			u"DetectFileKind of an image by the extension"_q);
 		auto mp4 = QByteArray(32, char(0));
 		mp4.replace(4, 8, "ftypisom");
 		check(

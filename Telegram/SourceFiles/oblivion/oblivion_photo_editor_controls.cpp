@@ -46,6 +46,8 @@ constexpr auto kSliderTrackHeight = 4;
 constexpr auto kSliderKnobRadius = 7;
 constexpr auto kSliderKnobOverGrow = 2;
 constexpr auto kSliderTickHeight = 10;
+constexpr auto kSliderValueMinWidth = 28;
+constexpr auto kSliderValuePadding = 6;
 
 constexpr auto kChipHeight = 30;
 constexpr auto kChipPadding = 14;
@@ -58,6 +60,7 @@ constexpr auto kTabInset = 4;
 constexpr auto kTabTextSkip = 2;
 constexpr auto kTabTextPadding = 8;
 constexpr auto kTabMinContent = 32;
+constexpr auto kTabCompactWidth = 40;
 constexpr auto kTabRadius = 10;
 constexpr auto kTabSlideDuration = crl::time(200);
 
@@ -96,6 +99,8 @@ constexpr auto kStripScrollDuration = crl::time(220);
 constexpr auto kHintMinWidth = 100;
 constexpr auto kDimmedOpacity = 0.4;
 constexpr auto kHintOpacity = 0.8;
+
+constexpr auto kCardProperty = "oblivion_photo_card";
 
 [[nodiscard]] QColor TextColor() {
 	return st::groupCallMembersFg->c;
@@ -184,6 +189,21 @@ QString FormatDecimal(double value, int decimals) {
 	return result;
 }
 
+void MarkAsCard(not_null<QWidget*> widget) {
+	widget->setProperty(kCardProperty, true);
+}
+
+bool InsideCard(not_null<const QWidget*> widget) {
+	for (auto parent = widget->parentWidget()
+		; parent
+		; parent = parent->parentWidget()) {
+		if (parent->property(kCardProperty).toBool()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 QString WithShortcut(const QString &text, const QKeySequence &keys) {
 	return tr::lng_oblivion_photo_ui_shortcut(
 		tr::now,
@@ -194,7 +214,21 @@ QString WithShortcut(const QString &text, const QKeySequence &keys) {
 }
 
 void PaintIcon(QPainter &p, const IconRef &icon, QRect rect, QColor color) {
-	if (!icon.icon) {
+	if (icon.paint) {
+		const auto side = Px(24);
+		p.save();
+		p.setRenderHint(QPainter::Antialiasing);
+		icon.paint(
+			p,
+			QRectF(
+				rect.x() + (rect.width() - side) / 2.,
+				rect.y() + (rect.height() - side) / 2.,
+				side,
+				side),
+			color);
+		p.restore();
+		return;
+	} else if (!icon.icon) {
 		return;
 	}
 	if (!icon.mirrored && !icon.rotation) {
@@ -392,8 +426,11 @@ void PanelButton::paintEvent(QPaintEvent *e) {
 		p.setPen(Qt::NoPen);
 		// A secondary button is a darker well on the panel, like the chips
 		// and the tab highlight: the lighter menu color was barely visible.
+		// On a card, which is that dark itself, it is a lighter plate.
 		auto bg = _primary
 			? (isOver() ? st::activeButtonBgOver : st::activeButtonBg)->c
+			: InsideCard(this)
+			? (isOver() ? st::groupCallMembersBgOver : st::groupCallMembersBg)->c
 			: isOver()
 			? anim::color(st::groupCallBg, st::groupCallMembersBg, 0.4)
 			: st::groupCallBg->c;
@@ -530,7 +567,8 @@ ValueSlider::ValueSlider(QWidget *parent, SliderArgs &&args)
 , _default(std::clamp(args.defaultValue, _min, _max))
 , _value(std::clamp(args.value, _min, _max))
 , _format(std::move(args.format))
-, _track(args.track) {
+, _track(args.track)
+, _logarithmic(args.logarithmic && (_min > 0)) {
 	std::move(args.label) | rpl::on_next([=](QString value) {
 		_label = std::move(value);
 		update();
@@ -566,6 +604,26 @@ rpl::producer<SliderChange> ValueSlider::changes() const {
 	return _changes.events();
 }
 
+void ValueSlider::setValueClickable(bool clickable) {
+	_valueClickable = clickable;
+}
+
+rpl::producer<> ValueSlider::valueClicks() const {
+	return _valueClicks.events();
+}
+
+QRect ValueSlider::valueRect() const {
+	const auto font = st::normalFont;
+	const auto text = _format ? _format(_value) : QString::number(_value);
+	const auto width = std::max(font->width(text), Px(kSliderValueMinWidth));
+	const auto skip = Px(kSliderValuePadding);
+	return QRect(
+		this->width() - width - skip,
+		Px(kSliderTextTop) - skip / 2,
+		width + skip,
+		font->height + skip);
+}
+
 int ValueSlider::resizeGetHeight(int newWidth) {
 	return Px(kSliderHeight);
 }
@@ -586,12 +644,19 @@ int ValueSlider::valueFromX(int x) const {
 		(x - track.x()) / float64(track.width()),
 		0.,
 		1.);
+	if (_logarithmic) {
+		const auto value = _min * std::pow(_max / float64(_min), ratio);
+		return std::clamp(int(std::lround(value)), _min, _max);
+	}
 	return _min + int(std::round(ratio * (_max - _min)));
 }
 
 int ValueSlider::xFromValue(int value) const {
 	const auto track = trackRect();
-	const auto ratio = (value - _min) / float64(_max - _min);
+	const auto ratio = _logarithmic
+		? (std::log(std::clamp(value, _min, _max) / float64(_min))
+			/ std::log(_max / float64(_min)))
+		: ((value - _min) / float64(_max - _min));
 	return track.x() + int(std::round(ratio * track.width()));
 }
 
@@ -671,12 +736,12 @@ void ValueSlider::paintEvent(QPaintEvent *e) {
 
 	paintTrack(p, track, alpha);
 
-	// The center mark only on bipolar sliders, where the fill starts from
-	// it: on a one-sided slider a mark at the default value looked like a
-	// stray glitch next to the knob.
-	const auto origin = (_min < 0 && _max > 0) ? 0 : _min;
-	if (_default == origin && _default > _min && _default < _max) {
-		const auto x = xFromValue(_default);
+	// The mark only on bipolar sliders, at the zero the fill starts from,
+	// whatever the default is (a vignette starts at -30): on a one-sided
+	// slider a mark at the default value looked like a stray glitch next
+	// to the knob.
+	if (_min < 0 && _max > 0) {
+		const auto x = xFromValue(0);
 		const auto tick = Px(kSliderTickHeight);
 		p.setPen(Qt::NoPen);
 		p.setBrush(anim::with_alpha(SubTextColor(), alpha));
@@ -708,6 +773,9 @@ void ValueSlider::paintEvent(QPaintEvent *e) {
 void ValueSlider::mousePressEvent(QMouseEvent *e) {
 	if (e->button() != Qt::LeftButton) {
 		return;
+	} else if (_valueClickable && valueRect().contains(e->pos())) {
+		_valuePressed = true;
+		return;
 	}
 	_pressed = true;
 	_pressValue = _value;
@@ -728,6 +796,11 @@ void ValueSlider::mousePressEvent(QMouseEvent *e) {
 
 void ValueSlider::mouseMoveEvent(QMouseEvent *e) {
 	if (!_pressed) {
+		if (_valueClickable && !_valuePressed) {
+			setCursor(valueRect().contains(e->pos())
+				? style::cur_text
+				: style::cur_pointer);
+		}
 		return;
 	} else if (!_moved && e->pos().x() == _pressX) {
 		return;
@@ -737,15 +810,25 @@ void ValueSlider::mouseMoveEvent(QMouseEvent *e) {
 }
 
 void ValueSlider::mouseReleaseEvent(QMouseEvent *e) {
-	if (!_pressed || e->button() != Qt::LeftButton) {
+	if (_valuePressed && e->button() == Qt::LeftButton) {
+		_valuePressed = false;
+		if (valueRect().contains(e->pos())) {
+			_valueClicks.fire({});
+		}
+		return;
+	} else if (!_pressed || e->button() != Qt::LeftButton) {
 		return;
 	}
-	if (_grabbed && !_moved && e->pos().x() == _pressX) {
-		// A click on the knob: nothing changed.
-		_changes.fire({ .value = _value, .finished = true });
-	} else {
-		updateFromX(e->pos().x() - _grabOffset, true);
-	}
+	// A click on the knob changes nothing and tells about nothing: the
+	// value that is shown may be a rounded one, and whoever took it for a
+	// change would shift what it stands for and add an undo step.
+	const auto click = _grabbed && !_moved && (e->pos().x() == _pressX);
+	const auto x = e->pos().x() - _grabOffset;
+
+	// Not held anymore already when the last change is told about: who
+	// refuses or limits it puts the right value back with setValue() from
+	// there, and that is ignored while the slider is held. The change is
+	// told about last, nothing here is touched after it.
 	_grabOffset = 0;
 	_grabbed = false;
 	_pressed = false;
@@ -753,10 +836,16 @@ void ValueSlider::mouseReleaseEvent(QMouseEvent *e) {
 		_overAnimation.start([=] { update(); }, 1., 0., kSwitchDuration);
 	}
 	update();
+	if (!click) {
+		updateFromX(x, true);
+	}
 }
 
 void ValueSlider::mouseDoubleClickEvent(QMouseEvent *e) {
 	if (e->button() != Qt::LeftButton) {
+		return;
+	} else if (_valueClickable && valueRect().contains(e->pos())) {
+		_valuePressed = true;
 		return;
 	}
 	_pressed = false;
@@ -841,10 +930,17 @@ void ChipsFlow::Chip::paintEvent(QPaintEvent *e) {
 				radius - half,
 				radius - half);
 		} else {
+			const auto over = isOver() && _available;
 			p.setPen(Qt::NoPen);
-			p.setBrush((isOver() && _available)
-				? st::groupCallMembersBgRipple
-				: st::groupCallBg);
+			if (InsideCard(this)) {
+				p.setBrush(over
+					? st::groupCallMembersBgOver
+					: st::groupCallMembersBg);
+			} else {
+				p.setBrush(over
+					? st::groupCallMembersBgRipple
+					: st::groupCallBg);
+			}
 			p.drawRoundedRect(rect(), radius, radius);
 		}
 	}
@@ -945,30 +1041,113 @@ void TabBar::refreshWidths() {
 	const auto minimal = Px(kTabMinContent);
 	auto natural = std::vector<int>(count);
 	auto sum = 0;
+	auto visible = 0;
+	auto last = -1;
 	for (auto i = 0; i != count; ++i) {
+		if (!_tabs[i].visible) {
+			continue;
+		}
 		natural[i] = std::max(font->width(_tabs[i].text), minimal)
 			+ 2 * padding;
 		sum += natural[i];
+		++visible;
+		last = i;
 	}
 	auto widths = std::vector<int>(count);
-	if (sum >= total) {
-		// Not enough space: shrink proportionally, labels get elided.
+	_compact = (sum > total) && (visible > 1);
+	if (!visible) {
+		return;
+	} else if (_compact) {
+		// Not enough space for every label: icons, and the active tab
+		// (or the last one, if a hidden tab is active) shows its label.
+		// That tab is as wide as the longest label needs, whichever tab
+		// it is, and the icons share the rest: they keep their step when
+		// another tab is chosen and don't huddle at one side of a single
+		// very wide tab (it took all the free space before).
+		const auto icon = std::min(Px(kTabCompactWidth), total / visible);
+		const auto wide = (_active >= 0
+			&& _active < count
+			&& _tabs[_active].visible)
+			? _active
+			: last;
+		auto longest = 0;
 		for (auto i = 0; i != count; ++i) {
-			widths[i] = sum ? (natural[i] * total / sum) : (total / count);
+			if (_tabs[i].visible) {
+				longest = std::max(longest, natural[i]);
+			}
+		}
+		const auto others = visible - 1;
+		const auto wideWidth = std::clamp(
+			longest + 2 * Px(kTabInset),
+			icon,
+			total - icon * others);
+		const auto shared = total - wideWidth;
+		auto index = 0;
+		for (auto i = 0; i != count; ++i) {
+			if (!_tabs[i].visible) {
+				widths[i] = 0;
+			} else if (i == wide) {
+				widths[i] = wideWidth;
+			} else {
+				widths[i] = shared / others
+					+ ((index < shared % others) ? 1 : 0);
+				++index;
+			}
 		}
 	} else {
 		// Every tab gets an equal share of the free space.
 		const auto extra = total - sum;
+		auto index = 0;
 		for (auto i = 0; i != count; ++i) {
+			if (!_tabs[i].visible) {
+				continue;
+			}
 			widths[i] = natural[i]
-				+ extra / count
-				+ ((i < extra % count) ? 1 : 0);
+				+ extra / visible
+				+ ((index < extra % visible) ? 1 : 0);
+			++index;
 		}
 	}
 	for (auto i = 0; i != count; ++i) {
 		_lefts[i + 1] = _lefts[i] + widths[i];
 	}
-	_lefts[count] = total; // Rounding leftovers go to the last tab.
+	for (auto i = last + 1; i <= count; ++i) {
+		_lefts[i] = total; // Rounding leftovers go to the last tab.
+	}
+}
+
+void TabBar::setTabVisible(int index, bool visible) {
+	if (index < 0
+		|| index >= int(_tabs.size())
+		|| _tabs[index].visible == visible) {
+		return;
+	}
+	_tabs[index].visible = visible;
+	refreshWidths();
+	update();
+}
+
+bool TabBar::tabVisible(int index) const {
+	return (index >= 0)
+		&& (index < int(_tabs.size()))
+		&& _tabs[index].visible;
+}
+
+QString TabBar::tooltipText() const {
+	return (_compact
+		&& _over >= 0
+		&& _over != _active
+		&& _over < int(_tabs.size()))
+		? _tabs[_over].text
+		: QString();
+}
+
+QPoint TabBar::tooltipPos() const {
+	return QCursor::pos();
+}
+
+bool TabBar::tooltipWindowActive() const {
+	return Ui::AppInFocus() && Ui::InFocusChain(window());
 }
 
 void TabBar::setActive(int index, anim::type animated) {
@@ -976,13 +1155,17 @@ void TabBar::setActive(int index, anim::type animated) {
 	if (_active == index) {
 		return;
 	}
-	const auto from = _slide.value(float64(_active));
+	// Where the highlight is painted now, before the tabs change widths.
+	const auto from = highlightRect();
+	_previous = _active;
 	_active = index;
-	if (animated == anim::type::normal) {
+	refreshWidths();
+	if (animated == anim::type::normal && !from.isEmpty()) {
+		_slideFrom = from;
 		_slide.start(
 			[=] { update(); },
-			from,
-			float64(index),
+			0.,
+			1.,
 			kTabSlideDuration,
 			anim::easeOutCirc);
 	} else {
@@ -990,6 +1173,13 @@ void TabBar::setActive(int index, anim::type animated) {
 	}
 	update();
 	_activeChanges.fire_copy(index);
+}
+
+void TabBar::finishAnimating() {
+	if (_slide.animating()) {
+		_slide.stop();
+		update();
+	}
 }
 
 int TabBar::active() const {
@@ -1016,26 +1206,30 @@ QRect TabBar::tabRect(int index) const {
 		height());
 }
 
-QRectF TabBar::highlightRect(float64 position) const {
-	const auto count = int(_tabs.size());
-	if (!count) {
+QRectF TabBar::highlightRect() const {
+	const auto tab = tabRect(_active);
+	const auto inset = Px(kTabInset);
+	if (tab.width() <= 2 * inset) {
 		return QRectF();
 	}
-	position = std::clamp(position, 0., float64(count - 1));
-	const auto from = int(std::floor(position));
-	const auto till = std::min(from + 1, count - 1);
-	const auto progress = position - from;
-	const auto a = QRectF(tabRect(from));
-	const auto b = QRectF(tabRect(till));
-	const auto left = a.x() + (b.x() - a.x()) * progress;
-	const auto right = a.x() + a.width()
-		+ ((b.x() + b.width()) - (a.x() + a.width())) * progress;
-	const auto inset = Px(kTabInset);
+	const auto target = QRectF(tab).marginsRemoved(
+		{ qreal(inset), qreal(inset), qreal(inset), qreal(inset) });
+	const auto progress = _slide.value(1.);
+	if (progress >= 1. || _slideFrom.isEmpty()) {
+		return target;
+	}
+	const auto between = [&](float64 from, float64 to) {
+		return from + (to - from) * progress;
+	};
+	const auto left = between(_slideFrom.x(), target.x());
+	const auto right = between(
+		_slideFrom.x() + _slideFrom.width(),
+		target.x() + target.width());
 	return QRectF(
-		left + inset,
-		inset,
-		std::max(right - left - 2 * inset, 0.),
-		height() - 2 * inset);
+		left,
+		target.y(),
+		std::max(right - left, 0.),
+		target.height());
 }
 
 int TabBar::tabAt(QPoint point) const {
@@ -1056,20 +1250,26 @@ void TabBar::paintEvent(QPaintEvent *e) {
 	if (_tabs.empty()) {
 		return;
 	}
-	const auto position = _slide.value(float64(_active));
+	const auto progress = std::clamp(_slide.value(1.), 0., 1.);
 	const auto count = int(_tabs.size());
-	const auto highlight = highlightRect(position);
-	p.setPen(Qt::NoPen);
-	p.setBrush(st::groupCallBg);
-	p.drawRoundedRect(highlight, Px(kTabRadius), Px(kTabRadius));
+	const auto highlight = highlightRect();
+	if (!highlight.isEmpty()) {
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::groupCallBg);
+		p.drawRoundedRect(highlight, Px(kTabRadius), Px(kTabRadius));
+	}
 
 	const auto iconSize = Px(24);
 	for (auto i = 0; i != count; ++i) {
 		const auto rect = tabRect(i);
-		const auto activeness = std::clamp(
-			1. - std::abs(position - i),
-			0.,
-			1.);
+		if (rect.isEmpty()) {
+			continue;
+		}
+		const auto activeness = (i == _active)
+			? progress
+			: (i == _previous)
+			? (1. - progress)
+			: 0.;
 		const auto base = (i == _over) ? TextColor() : SubTextColor();
 		const auto color = anim::color(base, AccentColor(), activeness);
 		PaintIcon(
@@ -1081,6 +1281,9 @@ void TabBar::paintEvent(QPaintEvent *e) {
 				iconSize,
 				iconSize),
 			color);
+		if (_compact && i != _active) {
+			continue;
+		}
 		const auto &font = SmallFont();
 		p.setFont(font);
 		p.setPen(color);
@@ -1100,6 +1303,11 @@ void TabBar::mouseMoveEvent(QMouseEvent *e) {
 		setCursor((over >= 0 && over != _active)
 			? style::cur_pointer
 			: style::cur_default);
+		if (tooltipText().isEmpty()) {
+			Ui::Tooltip::Hide();
+		} else {
+			Ui::Tooltip::Show(kTooltipDelay, this);
+		}
 		update();
 	}
 }
@@ -1118,6 +1326,7 @@ void TabBar::mouseReleaseEvent(QMouseEvent *e) {
 }
 
 void TabBar::leaveEventHook(QEvent *e) {
+	Ui::Tooltip::Hide();
 	if (_over >= 0) {
 		_over = -1;
 		update();
@@ -1195,8 +1404,12 @@ void SwitchHeader::paintEvent(QPaintEvent *e) {
 	auto hq = PainterHighQualityEnabler(p);
 	const auto progress = _toggle.value(_checked ? 1. : 0.);
 
+	// The header of a card keeps the padding of the card itself. A plain
+	// toggle row starts at the left edge, in line with the labels of the
+	// sliders above and below it (its owner gives the row margins).
+	const auto shift = _withMenu ? 0 : Px(kSwitchLeft);
 	const auto switchRect = QRectF(
-		Px(kSwitchLeft),
+		Px(kSwitchLeft) - shift,
 		(height() - Px(kSwitchHeight)) / 2.,
 		Px(kSwitchWidth),
 		Px(kSwitchHeight));
@@ -1225,9 +1438,9 @@ void SwitchHeader::paintEvent(QPaintEvent *e) {
 		}
 	}
 
-	const auto left = Px(kSwitchTextLeft);
+	const auto left = Px(kSwitchTextLeft) - shift;
 	const auto right = _withMenu ? menu.x() : width();
-	const auto available = right - left - Px(kChipSkip);
+	const auto available = right - left - (_withMenu ? Px(kChipSkip) : 0);
 	const auto &font = _withMenu ? st::semiboldFont : st::normalFont;
 	p.setFont(font);
 	p.setPen(_withMenu

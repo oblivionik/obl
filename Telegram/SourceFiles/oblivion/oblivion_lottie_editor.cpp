@@ -71,6 +71,7 @@ constexpr auto kToolbarHeight = 48;
 constexpr auto kToolbarPadding = 8;
 constexpr auto kToolbarSkip = 6;
 constexpr auto kToolbarGroupSkip = 14;
+constexpr auto kToolbarNameRoom = 130;
 constexpr auto kSplitterGrab = 7;
 constexpr auto kLayersDefault = 250;
 constexpr auto kLayersMin = 170;
@@ -92,6 +93,11 @@ constexpr auto kZoomStep = 1.25;
 constexpr auto kTooltipDelay = 800;
 constexpr auto kMaxExportSide = 4096;
 constexpr auto kNudgeLarge = 10.;
+
+// The letters on the V and P keys of the Russian layout: the tool
+// shortcuts work without switching the keyboard.
+constexpr auto kCyrillicOnV = 0x041C;
+constexpr auto kCyrillicOnP = 0x0417;
 
 // Panel sizes and the last window geometry, kept for the app session.
 struct SessionLayout {
@@ -518,6 +524,8 @@ QString PropertyRoleText(PropertyRole role) {
 		return tr::lng_oblivion_lottie_prop_radius(tr::now);
 	case PropertyRole::Amount:
 		return tr::lng_oblivion_lottie_prop_amount(tr::now);
+	case PropertyRole::MaskFeather:
+		return tr::lng_oblivion_lottie_mask_prop_feather(tr::now);
 	case PropertyRole::Other: break;
 	}
 	return tr::lng_oblivion_lottie_prop_other(tr::now);
@@ -530,9 +538,12 @@ QString PropertyText(const PropertyInfo &info) {
 			: info.name.trimmed();
 	} else if (info.role == PropertyRole::Dash) {
 		// Dash items: "n" is "d" (dash), "g" (gap) or "o" (offset), the
-		// exporters put "dash" / "gap" / "offset" into "nm".
+		// exporters put "dash" / "gap" / "offset" into "nm". The last
+		// item is the offset for the renderer whatever its name says.
 		const auto name = info.name.trimmed().toLower();
-		if (name == u"g"_q || name.startsWith(u"gap"_q)) {
+		if (info.dashOffset) {
+			return tr::lng_oblivion_lottie_prop_dash_offset(tr::now);
+		} else if (name == u"g"_q || name.startsWith(u"gap"_q)) {
 			return tr::lng_oblivion_lottie_prop_gap(tr::now);
 		} else if (name == u"o"_q || name.startsWith(u"offset"_q)) {
 			return tr::lng_oblivion_lottie_prop_dash_offset(tr::now);
@@ -635,6 +646,28 @@ QString CommandText(Command command) {
 		return tr::lng_oblivion_lottie_cmd_autofix(tr::now);
 	case Command::Optimize:
 		return tr::lng_oblivion_lottie_cmd_optimize(tr::now);
+	case Command::AddMask:
+		return tr::lng_oblivion_lottie_mask_cmd_add_mask(tr::now);
+	case Command::ChangeMask:
+		return tr::lng_oblivion_lottie_mask_cmd_change_mask(tr::now);
+	case Command::TrackMatte:
+		return tr::lng_oblivion_lottie_mask_cmd_matte(tr::now);
+	case Command::Parent:
+		return tr::lng_oblivion_lottie_mask_cmd_parent(tr::now);
+	case Command::ShapeOption:
+		return tr::lng_oblivion_lottie_mask_cmd_option(tr::now);
+	case Command::Gradient:
+		return tr::lng_oblivion_lottie_mask_cmd_gradient(tr::now);
+	case Command::ConvertPaint:
+		return tr::lng_oblivion_lottie_mask_cmd_convert_paint(tr::now);
+	case Command::Dashes:
+		return tr::lng_oblivion_lottie_mask_cmd_dashes(tr::now);
+	case Command::BakeCorners:
+		return tr::lng_oblivion_lottie_mask_cmd_bake(tr::now);
+	case Command::AddPath:
+		return tr::lng_oblivion_lottie_mask_cmd_add_path(tr::now);
+	case Command::EditPath:
+		return tr::lng_oblivion_lottie_mask_cmd_edit_path(tr::now);
 	}
 	return tr::lng_oblivion_lottie_cmd_change(tr::now);
 }
@@ -696,7 +729,10 @@ QString IssueText(const Document &document, const Issue &issue) {
 	case IssueType::MissingTgsMarker:
 		return tr::lng_oblivion_lottie_issue_marker(tr::now);
 	case IssueType::Masks:
-		return tr::lng_oblivion_lottie_issue_masks(tr::now);
+		// Listed under "Telegram does not accept in stickers" since the
+		// issues are grouped: the older "they slow the sticker down" text
+		// would argue with that title.
+		return tr::lng_oblivion_lottie_mask_issue_masks(tr::now);
 	case IssueType::Effects:
 		return tr::lng_oblivion_lottie_issue_effects(tr::now);
 	case IssueType::Solids:
@@ -719,8 +755,44 @@ QString IssueText(const Document &document, const Issue &issue) {
 		return tr::lng_oblivion_lottie_issue_edge(tr::now);
 	case IssueType::AutoOrient:
 		return tr::lng_oblivion_lottie_issue_auto_orient(tr::now);
+	case IssueType::TrackMattes:
+		return tr::lng_oblivion_lottie_mask_issue_mattes(tr::now);
+	case IssueType::BrokenMattes:
+		return tr::lng_oblivion_lottie_mask_issue_broken_mattes(tr::now);
+	case IssueType::MatteLinks:
+		return tr::lng_oblivion_lottie_mask_issue_matte_links(tr::now);
+	case IssueType::MasksOff:
+		return tr::lng_oblivion_lottie_mask_issue_masks_off(tr::now);
+	case IssueType::MaskModes:
+		return tr::lng_oblivion_lottie_mask_issue_modes(tr::now);
+	case IssueType::MaskOptions:
+		return tr::lng_oblivion_lottie_mask_issue_options(tr::now);
+	case IssueType::MaskInverted:
+		return tr::lng_oblivion_lottie_mask_issue_inverted(tr::now);
+	case IssueType::PathVertices:
+		return tr::lng_oblivion_lottie_mask_issue_vertices(tr::now);
+	case IssueType::KeyOrder:
+		return tr::lng_oblivion_lottie_mask_issue_key_order(tr::now);
+	case IssueType::ParentLinks:
+		return tr::lng_oblivion_lottie_mask_issue_parents(tr::now);
+	case IssueType::RendererHang:
+		return tr::lng_oblivion_lottie_mask_issue_hang(tr::now);
 	}
 	return tr::lng_oblivion_lottie_issue_invalid(tr::now);
+}
+
+QString IssueCategoryText(IssueCategory category) {
+	switch (category) {
+	case IssueCategory::File:
+		return tr::lng_oblivion_lottie_mask_category_file(tr::now);
+	case IssueCategory::Forbidden:
+		return tr::lng_oblivion_lottie_mask_category_forbidden(tr::now);
+	case IssueCategory::NotRendered:
+		return tr::lng_oblivion_lottie_mask_category_not_rendered(tr::now);
+	case IssueCategory::Advice:
+		return tr::lng_oblivion_lottie_mask_category_advice(tr::now);
+	}
+	return QString();
 }
 
 QString IssueFixText(IssueType type) {
@@ -752,6 +824,20 @@ QString IssueFixText(IssueType type) {
 		return tr::lng_oblivion_lottie_fix_solids(tr::now);
 	case IssueType::AutoOrient:
 		return tr::lng_oblivion_lottie_fix_auto_orient(tr::now);
+	case IssueType::MasksOff:
+		return tr::lng_oblivion_lottie_mask_fix_masks_on(tr::now);
+	case IssueType::MaskModes:
+		return tr::lng_oblivion_lottie_mask_fix_modes(tr::now);
+	case IssueType::MaskOptions:
+		return tr::lng_oblivion_lottie_mask_fix_options(tr::now);
+	case IssueType::MaskInverted:
+		return tr::lng_oblivion_lottie_mask_fix_inverted(tr::now);
+	case IssueType::KeyOrder:
+		return tr::lng_oblivion_lottie_mask_fix_key_order(tr::now);
+	case IssueType::ParentLinks:
+		return tr::lng_oblivion_lottie_mask_fix_parents(tr::now);
+	case IssueType::RendererHang:
+		return tr::lng_oblivion_lottie_mask_fix_hang(tr::now);
 	case IssueType::InvalidComposition:
 	case IssueType::Masks:
 	case IssueType::TimeStretch:
@@ -760,6 +846,10 @@ QString IssueFixText(IssueType type) {
 	case IssueType::StarShapes:
 	case IssueType::GradientStrokes:
 	case IssueType::OutOfCanvas:
+	case IssueType::TrackMattes:
+	case IssueType::BrokenMattes:
+	case IssueType::MatteLinks:
+	case IssueType::PathVertices:
 		break;
 	}
 	return QString();
@@ -1146,6 +1236,50 @@ void PaintGlyph(QPainter &p, Glyph glyph, const QRectF &rect, QColor color) {
 			at(-6, 0),
 		}));
 		break;
+	case Glyph::Graph: {
+		// An ease in-out curve between two keyframe dots.
+		auto path = QPainterPath();
+		path.moveTo(at(-6.5, 5.5));
+		path.cubicTo(at(-0.5, 5.5), at(0.5, -5.5), at(6.5, -5.5));
+		p.setPen(stroke(1.7));
+		p.setBrush(Qt::NoBrush);
+		p.drawPath(path);
+		p.setPen(Qt::NoPen);
+		p.setBrush(color);
+		p.drawEllipse(at(-6.5, 5.5), 2. * u, 2. * u);
+		p.drawEllipse(at(6.5, -5.5), 2. * u, 2. * u);
+	} break;
+	case Glyph::Cursor:
+		p.setPen(stroke(1.5));
+		p.setBrush(color);
+		p.drawPolygon(QPolygonF({
+			at(-5, -7.5),
+			at(5.5, 2),
+			at(0.5, 2.6),
+			at(3.2, 8),
+			at(1, 9),
+			at(-1.8, 3.6),
+			at(-5, 7),
+		}));
+		break;
+	case Glyph::Pen: {
+		// A pen nib over a curve with a point.
+		p.setPen(stroke(1.5));
+		p.setBrush(Qt::NoBrush);
+		p.drawPolygon(QPolygonF({
+			at(1.5, -8),
+			at(8, -1.5),
+			at(3.5, 1.5),
+			at(-6, 4),
+			at(-8, 8),
+			at(-4, 6),
+			at(-1.5, -3.5),
+		}));
+		p.drawLine(at(-7.2, 7.2), at(-1.2, 1.2));
+		p.setPen(Qt::NoPen);
+		p.setBrush(color);
+		p.drawEllipse(at(0.2, -0.2), 1.6 * u, 1.6 * u);
+	} break;
 	}
 	p.restore();
 }
@@ -1588,6 +1722,8 @@ private:
 	const not_null<GlyphButton*> _zoomOut;
 	const not_null<ZoomLabel*> _zoom;
 	const not_null<GlyphButton*> _zoomIn;
+	GlyphButton *_toolSelect = nullptr;
+	GlyphButton *_toolPen = nullptr;
 	CanvasPanel *_canvas = nullptr;
 	base::unique_qptr<Ui::RoundButton> _status;
 	Ui::RoundButton *_done = nullptr;
@@ -1659,6 +1795,28 @@ EditorWidget::Toolbar::Toolbar(
 	_undo->setClickedCallback([=] { _controller->undo(); });
 	_redo->setClickedCallback([=] { _controller->redo(); });
 
+	const auto toolButton = [&](Glyph glyph, CanvasTool tool, int key) {
+		const auto result = Ui::CreateChild<GlyphButton>(
+			this,
+			glyph,
+			rpl::single(WithShortcut(
+				CanvasToolText(tool),
+				QKeySequence(key))),
+			Scaled(36));
+		result->setClickedCallback([=] {
+			SetCurrentTool(_controller, tool);
+		});
+		return result;
+	};
+	_toolSelect = toolButton(Glyph::Cursor, CanvasTool::Select, Qt::Key_V);
+	_toolPen = toolButton(Glyph::Pen, CanvasTool::Pen, Qt::Key_P);
+	CurrentToolValue(
+		_controller
+	) | rpl::on_next([=](CanvasTool tool) {
+		_toolSelect->setActive(tool == CanvasTool::Select);
+		_toolPen->setActive(tool == CanvasTool::Pen);
+	}, lifetime());
+
 	if (!doneText.isEmpty()) {
 		_done = Ui::CreateChild<Ui::RoundButton>(
 			this,
@@ -1714,10 +1872,17 @@ void EditorWidget::Toolbar::showExportMenu() {
 	_menu->addAction(
 		tr::lng_oblivion_packs_add_title(tr::now),
 		[=] {
-			auto source = StickerSource::FromLottie(
-				_controller->document().toJson());
-			source.name = _controller->name();
-			AddToStickerPack(std::move(source));
+			// What Telegram would reject or draw differently is shown
+			// first, the pack box comes after "Add anyway".
+			CheckBeforeSticker(
+				_controller,
+				ValidationPurpose::StickerPack,
+				crl::guard(this, [=] {
+					auto source = StickerSource::FromLottie(
+						_controller->document().toJson());
+					source.name = _controller->name();
+					AddToStickerPack(std::move(source));
+				}));
 		},
 		&st::menuIconStickerAdd);
 	_menu->addSeparator();
@@ -1898,6 +2063,10 @@ void EditorWidget::Toolbar::refreshStatus(Status status, int count) {
 }
 
 void EditorWidget::Toolbar::updateLayout() {
+	if (!_toolSelect || !_toolPen) {
+		// Called by the first buttons while the constructor still runs.
+		return;
+	}
 	const auto padding = Scaled(kToolbarPadding);
 	const auto skip = Scaled(kToolbarSkip);
 	const auto group = Scaled(kToolbarGroupSkip);
@@ -1928,19 +2097,27 @@ void EditorWidget::Toolbar::updateLayout() {
 	}
 	// Canvas controls, the least important ones are dropped first when the
 	// window is too narrow (the name / info text is dropped before them).
+	const auto tools = _toolSelect->width() + _toolPen->width() + group;
 	const auto full = _zoomIn->width()
 		+ _zoom->width()
 		+ _zoomOut->width()
 		+ skip
 		+ _background->width()
-		+ group;
+		+ group
+		+ tools;
 	const auto withoutLabel = full - _zoom->width();
-	const auto showLabel = (right - full >= left);
+	// The zoom percent gives its place to the name of the animation.
+	const auto showLabel = (right - full >= left + Scaled(kToolbarNameRoom));
 	const auto showControls = (right - withoutLabel >= left);
+	// The tools stay when the view controls don't fit: they have shortcuts
+	// (V / P), but the buttons are how people find them.
+	const auto showTools = showControls || (right - tools >= left);
 	_zoom->setVisible(showLabel);
 	_zoomIn->setVisible(showControls);
 	_zoomOut->setVisible(showControls);
 	_background->setVisible(showControls);
+	_toolSelect->setVisible(showTools);
+	_toolPen->setVisible(showTools);
 	if (showControls) {
 		right -= _zoomIn->width();
 		centered(_zoomIn, right);
@@ -1952,6 +2129,13 @@ void EditorWidget::Toolbar::updateLayout() {
 		centered(_zoomOut, right);
 		right -= skip + _background->width();
 		centered(_background, right);
+		right -= group;
+	}
+	if (showTools) {
+		right -= _toolPen->width();
+		centered(_toolPen, right);
+		right -= _toolSelect->width();
+		centered(_toolSelect, right);
 		right -= group;
 	}
 	_infoLeft = left;
@@ -2392,6 +2576,20 @@ bool EditorWidget::handleKey(not_null<QKeyEvent*> e) {
 		return shift ? false : _timeline->jumpToKeyframe(-1);
 	case Qt::Key_K:
 		return shift ? false : _timeline->jumpToKeyframe(1);
+	case Qt::Key_V:
+	case Qt::Key_P:
+	case kCyrillicOnV:
+	case kCyrillicOnP:
+		if (shift) {
+			return false;
+		} else if (!dragging) {
+			SetCurrentTool(
+				_controller,
+				(key == Qt::Key_P || key == kCyrillicOnP)
+					? CanvasTool::Pen
+					: CanvasTool::Select);
+		}
+		return true;
 	case Qt::Key_Space:
 		_controller->togglePlaying();
 		return true;
@@ -2411,7 +2609,9 @@ bool EditorWidget::handleKey(not_null<QKeyEvent*> e) {
 		return true;
 	case Qt::Key_Delete:
 	case Qt::Key_Backspace:
-		if (!dragging) {
+		// One press deletes one thing: a held key would go on from the
+		// selected keyframes to the layers that own them.
+		if (!dragging && !e->isAutoRepeat()) {
 			_controller->deleteSelection();
 		}
 		return true;
@@ -2474,15 +2674,75 @@ private:
 
 };
 
+// A tinted panel with a wrapped text at the top of the check box: what the
+// check means for the thing the user is about to do.
+class NoticeRow final : public Ui::RpWidget {
+public:
+	NoticeRow(QWidget *parent, QString text, bool attention)
+	: RpWidget(parent)
+	, _text(std::move(text))
+	, _attention(attention) {
+	}
+
+protected:
+	int resizeGetHeight(int newWidth) override {
+		const auto padding = Scaled(12);
+		const auto inner = std::max(newWidth - 2 * padding, 1);
+		const auto height = QFontMetrics(st::semiboldFont->f).boundingRect(
+			QRect(0, 0, inner, 1 << 20),
+			Qt::TextWordWrap,
+			_text).height();
+		return height + 2 * Scaled(10);
+	}
+
+	void paintEvent(QPaintEvent *e) override {
+		auto p = QPainter(this);
+		auto hq = PainterHighQualityEnabler(p);
+		const auto color = _attention
+			? st::attentionButtonFg->c
+			: st::windowActiveTextFg->c;
+		p.setPen(Qt::NoPen);
+		p.setBrush(anim::with_alpha(color, 0.1));
+		p.drawRoundedRect(QRectF(rect()), Scaled(8), Scaled(8));
+		const auto padding = Scaled(12);
+		p.setFont(st::semiboldFont);
+		p.setPen(_attention ? st::attentionButtonFg : st::windowBoldFg);
+		p.drawText(
+			rect().marginsRemoved(
+				QMargins(padding, Scaled(10), padding, Scaled(10))),
+			Qt::TextWordWrap,
+			_text);
+	}
+
+private:
+	const QString _text;
+	const bool _attention = false;
+
+};
+
+// A secondary line under an issue (what Telegram does with the feature,
+// what a fix changes).
+[[nodiscard]] const style::FlatLabel &IssueNoteStyle() {
+	static const auto result = [] {
+		auto st = st::boxLabel;
+		st.textFg = st::windowSubTextFg;
+		return st;
+	}();
+	return result;
+}
+
 void FillValidationBox(
 		not_null<Ui::GenericBox*> box,
-		not_null<EditorController*> controller) {
+		not_null<EditorController*> controller,
+		std::shared_ptr<ValidationArgs> args) {
 	const auto content = box->verticalLayout();
 	content->clear();
 	box->clearButtons();
 
 	const auto document = controller->document();
 	const auto result = Validate(document);
+	const auto purpose = args->purpose;
+	const auto warns = NeedsStickerWarning(result);
 	const auto defer = [=](Fn<void()> callback) {
 		// The box is rebuilt on document changes, so the clicked link
 		// must not be destroyed while its click is being handled.
@@ -2508,6 +2768,34 @@ void FillValidationBox(
 		}
 	};
 
+	// Before a sticker goes somewhere: what the list below means for it.
+	if (purpose != ValidationPurpose::Check && warns) {
+		const auto blocked = !result.ok()
+			&& (purpose == ValidationPurpose::StickerPack);
+		const auto text = blocked
+			? tr::lng_oblivion_lottie_mask_check_pack_errors(tr::now)
+			: !result.ok()
+			? tr::lng_oblivion_lottie_mask_check_tgs_errors(tr::now)
+			: (purpose == ValidationPurpose::StickerPack)
+			? tr::lng_oblivion_lottie_mask_check_pack_warnings(tr::now)
+			: tr::lng_oblivion_lottie_mask_check_tgs_warnings(tr::now);
+		// The buttons below are "continue" and "cancel", a third one does
+		// not fit next to them, so the fix is a link under the notice.
+		// (With nothing to continue with it is a button, see below.)
+		const auto fixLink = result.hasFixable() && !blocked;
+		content->add(
+			object_ptr<NoticeRow>(content, text, !result.ok()),
+			(st::boxRowPadding
+				+ QMargins(0, Scaled(4), 0, Scaled(fixLink ? 4 : 8))));
+		if (fixLink) {
+			const auto links = content->add(
+				object_ptr<LinksRow>(content),
+				st::boxRowPadding + QMargins(0, Scaled(4), 0, Scaled(4)));
+			links->add(
+				tr::lng_oblivion_lottie_editor_validate_fix_all(tr::now),
+				defer([=] { fix({}); }));
+		}
+	}
 	if (result.issues.empty()) {
 		Ui::AddSkip(content);
 		content->add(
@@ -2524,10 +2812,13 @@ void FillValidationBox(
 		0,
 		0,
 		0);
-	const auto addGroup = [&](IssueSeverity severity, QString title) {
+	const auto addGroup = [&](
+			Fn<bool(const Issue&)> filter,
+			QString title,
+			QString about = QString()) {
 		auto first = true;
 		for (const auto &issue : result.issues) {
-			if (issue.severity != severity) {
+			if (!filter(issue)) {
 				continue;
 			}
 			if (first) {
@@ -2536,6 +2827,14 @@ void FillValidationBox(
 					content,
 					rpl::single(title),
 					titleShift);
+				if (!about.isEmpty()) {
+					content->add(
+						object_ptr<Ui::FlatLabel>(
+							content,
+							about,
+							IssueNoteStyle()),
+						st::boxRowPadding + QMargins(0, 0, 0, Scaled(10)));
+				}
 			}
 			// An issue and its actions are one group: the links are close
 			// to the text, the groups are separated by a larger gap.
@@ -2545,12 +2844,34 @@ void FillValidationBox(
 					IssueText(document, issue),
 					st::boxLabel),
 				st::boxRowPadding);
+			const auto fixText = issue.fixable
+				? IssueFixText(issue.type)
+				: QString();
+			auto notes = QStringList();
+			if (issue.category == IssueCategory::Forbidden
+				&& issue.severity == IssueSeverity::Warning
+				&& !issue.rendered) {
+				notes.push_back(
+					tr::lng_oblivion_lottie_mask_note_ignored(tr::now));
+			}
+			if (!fixText.isEmpty() && issue.fixChangesPicture) {
+				notes.push_back(
+					tr::lng_oblivion_lottie_mask_note_fix_changes(tr::now));
+			}
+			if (!notes.isEmpty()) {
+				content->add(
+					object_ptr<Ui::FlatLabel>(
+						content,
+						notes.join(QChar(' ')),
+						IssueNoteStyle()),
+					st::boxRowPadding + QMargins(0, Scaled(2), 0, 0));
+			}
 			const auto links = content->add(
 				object_ptr<LinksRow>(content),
 				st::boxRowPadding + QMargins(0, Scaled(2), 0, Scaled(12)));
-			if (issue.fixable && !IssueFixText(issue.type).isEmpty()) {
+			if (!fixText.isEmpty()) {
 				const auto type = issue.type;
-				links->add(IssueFixText(type), defer([=] {
+				links->add(fixText, defer([=] {
 					fix({ type });
 				}));
 			}
@@ -2565,12 +2886,30 @@ void FillValidationBox(
 			}
 		}
 	};
+	const auto warning = [](IssueCategory category) {
+		return [=](const Issue &issue) {
+			return (issue.severity == IssueSeverity::Warning)
+				&& (issue.category == category);
+		};
+	};
+	addGroup([](const Issue &issue) {
+		return (issue.severity == IssueSeverity::Error);
+	}, tr::lng_oblivion_lottie_editor_validate_errors(tr::now));
 	addGroup(
-		IssueSeverity::Error,
-		tr::lng_oblivion_lottie_editor_validate_errors(tr::now));
+		warning(IssueCategory::Forbidden),
+		IssueCategoryText(IssueCategory::Forbidden),
+		tr::lng_oblivion_lottie_mask_note_rendered(tr::now));
 	addGroup(
-		IssueSeverity::Warning,
-		tr::lng_oblivion_lottie_editor_validate_warnings(tr::now));
+		warning(IssueCategory::NotRendered),
+		IssueCategoryText(IssueCategory::NotRendered));
+	// Warnings about the file and plain advice go under one title: as two
+	// groups they were "Recommendations" and then "Advice", the same word
+	// twice for the reader.
+	addGroup([](const Issue &issue) {
+		return (issue.severity == IssueSeverity::Warning)
+			&& (issue.category == IssueCategory::File
+				|| issue.category == IssueCategory::Advice);
+	}, tr::lng_oblivion_lottie_editor_validate_warnings(tr::now));
 	if (result.packedSize >= 0) {
 		// After an issue the gap is already there (under its links).
 		if (result.issues.empty()) {
@@ -2584,35 +2923,132 @@ void FillValidationBox(
 				lt_limit,
 				rpl::single(FormatKilobytes(kTgsMaxPackedSize))));
 	}
+	if (!result.issues.empty()) {
+		// Only .tgs stickers are concerned, the other exports keep all.
+		Ui::AddSkip(content);
+		content->add(
+			object_ptr<Ui::FlatLabel>(
+				content,
+				tr::lng_oblivion_lottie_mask_check_scope(),
+				IssueNoteStyle()),
+			st::boxRowPadding);
+	}
 	Ui::AddSkip(content);
 
-	if (result.hasFixable()) {
-		box->addButton(
-			tr::lng_oblivion_lottie_editor_validate_fix_all(),
-			defer([=] { fix({}); }));
+	const auto fixAll = result.hasFixable();
+	if (purpose == ValidationPurpose::Check) {
+		if (fixAll) {
+			box->addButton(
+				tr::lng_oblivion_lottie_editor_validate_fix_all(),
+				defer([=] { fix({}); }));
+		}
+		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+		return;
 	}
-	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+	// A sticker pack refuses a sticker with errors, a file can be written
+	// anyway (the user may want to finish it elsewhere).
+	const auto canProceed = result.ok()
+		|| (purpose != ValidationPurpose::StickerPack);
+	if (!canProceed) {
+		// Nothing to continue with: the box only informs, so the fix
+		// takes the place of the main button and "Cancel" (of what?)
+		// becomes "Close", as in the plain check.
+		if (fixAll) {
+			box->addButton(
+				tr::lng_oblivion_lottie_editor_validate_fix_all(),
+				defer([=] { fix({}); }));
+		}
+		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+		return;
+	}
+	auto text = (purpose == ValidationPurpose::StickerPack)
+		? (warns
+			? tr::lng_oblivion_lottie_mask_check_add_anyway()
+			: tr::lng_oblivion_lottie_mask_check_add())
+		: (purpose == ValidationPurpose::ExportTgs)
+		? (warns
+			? tr::lng_oblivion_lottie_mask_check_save_anyway()
+			: tr::lng_oblivion_lottie_editor_save())
+		: (warns
+			? tr::lng_oblivion_lottie_mask_check_continue_anyway()
+			: tr::lng_oblivion_lottie_mask_check_continue());
+	box->addButton(std::move(text), [=] {
+		const auto proceed = args->proceed;
+		box->closeBox();
+		if (proceed) {
+			proceed();
+		}
+	});
+	box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 }
 
 } // namespace
 
+bool NeedsStickerWarning(const ValidationResult &result) {
+	return ranges::any_of(result.issues, [](const Issue &issue) {
+		return (issue.severity == IssueSeverity::Error)
+			|| (issue.category == IssueCategory::Forbidden)
+			|| (issue.category == IssueCategory::NotRendered);
+	});
+}
+
+void ValidationBoxFor(
+		not_null<Ui::GenericBox*> box,
+		not_null<EditorController*> controller,
+		ValidationArgs &&args) {
+	const auto shared = std::make_shared<ValidationArgs>(std::move(args));
+	box->setTitle((shared->purpose == ValidationPurpose::Check)
+		? tr::lng_oblivion_lottie_editor_validate_title()
+		: tr::lng_oblivion_lottie_mask_check_title());
+	box->setWidth(st::boxWideWidth);
+	box->setMaxHeight(Scaled(560));
+	FillValidationBox(box, controller, shared);
+	controller->documentChanged(
+	) | rpl::on_next([=] {
+		FillValidationBox(box, controller, shared);
+	}, box->lifetime());
+}
+
 void ValidationBox(
 		not_null<Ui::GenericBox*> box,
 		not_null<EditorController*> controller) {
-	box->setTitle(tr::lng_oblivion_lottie_editor_validate_title());
-	box->setWidth(st::boxWideWidth);
-	box->setMaxHeight(Scaled(560));
-	FillValidationBox(box, controller);
-	controller->documentChanged(
-	) | rpl::on_next([=] {
-		FillValidationBox(box, controller);
-	}, box->lifetime());
+	ValidationBoxFor(box, controller, ValidationArgs());
 }
 
 void ShowValidationBox(not_null<EditorController*> controller) {
 	if (const auto show = controller->uiShow()) {
 		show->show(Box(ValidationBox, controller));
 	}
+}
+
+void CheckBeforeSticker(
+		not_null<EditorController*> controller,
+		ValidationPurpose purpose,
+		Fn<void()> proceed) {
+	if (!controller->uiShow()) {
+		if (proceed) {
+			proceed();
+		}
+		return;
+	}
+	const auto document = controller->document();
+	const auto weak = base::make_weak(controller.get());
+	crl::async([=] {
+		auto result = Validate(document);
+		crl::on_main(weak, [=, result = std::move(result)] {
+			const auto show = weak->uiShow();
+			if (!show || !NeedsStickerWarning(result)) {
+				if (proceed) {
+					proceed();
+				}
+				return;
+			}
+			show->show(Box(ValidationBoxFor, weak.get(), ValidationArgs{
+				.purpose = purpose,
+				.proceed = proceed,
+			}));
+		});
+	});
 }
 
 // EditorWindow.
@@ -2657,20 +3093,26 @@ EditorWindow::EditorWindow(EditorArgs &&args)
 		if (!_done) {
 			return;
 		}
-		const auto document = _controller->document();
-		const auto name = _controller->name();
-		const auto done = _done;
-		crl::async([=] {
-			auto tgs = document.toTgs();
-			crl::on_main([=, tgs = std::move(tgs)] {
-				if (tgs.isEmpty()) {
-					ShowAppToast(
-						tr::lng_oblivion_lottie_editor_save_failed(tr::now));
-				} else {
-					done(tgs, name);
-				}
-			});
-		});
+		CheckBeforeSticker(
+			_controller.get(),
+			ValidationPurpose::Done,
+			crl::guard(this, [=] {
+				const auto document = _controller->document();
+				const auto name = _controller->name();
+				const auto done = _done;
+				crl::async([=] {
+					auto tgs = document.toTgs();
+					crl::on_main([=, tgs = std::move(tgs)] {
+						if (tgs.isEmpty()) {
+							ShowAppToast(
+								tr::lng_oblivion_lottie_editor_save_failed(
+									tr::now));
+						} else {
+							done(tgs, name);
+						}
+					});
+				});
+			}));
 	}, lifetime());
 
 	setupShortcuts();
@@ -2886,7 +3328,14 @@ void EditorWindow::handleAction(EditorAction action) {
 	case EditorAction::Open: open(); break;
 	case EditorAction::Save: save(); break;
 	case EditorAction::SaveAs: saveAs(); break;
-	case EditorAction::ExportTgs: exportAs(true); break;
+	case EditorAction::ExportTgs:
+		// A .tgs is a Telegram sticker: the check comes first when there
+		// is something to warn about. JSON keeps everything, no questions.
+		CheckBeforeSticker(
+			_controller.get(),
+			ValidationPurpose::ExportTgs,
+			crl::guard(this, [=] { exportAs(true); }));
+		break;
 	case EditorAction::ExportJson: exportAs(false); break;
 	case EditorAction::Close: requestClose(); break;
 	}
@@ -3511,8 +3960,9 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		.ready = EditorReady,
 	});
 
-	// A new empty animation: empty states of every panel, the name in the
-	// toolbar at a narrow width (the info is dropped, the name stays).
+	// A new empty animation: empty states of every panel, the toolbar at a
+	// narrow width (the info and the zoom percent are dropped, the name is
+	// elided when the tool buttons leave it less room than it needs).
 	RegisterScene(SceneDescriptor{
 		.name = u"lottie_editor_blank"_q,
 		.size = QSize(1000, 640),
@@ -3587,6 +4037,130 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			box->lifetime().add([state] {});
 			ValidationBox(box, state->controller.get());
 		});
+	});
+
+	// Before "Add to sticker pack": a sticker-sized animation with the
+	// After Effects features Telegram does not accept or does not draw
+	// (a mask with an inverted flag and an opacity, a track matte, a
+	// repeater, a star, a gradient stroke), the "add anyway" button.
+	RegisterBoxScene(u"lottie_validation_telegram"_q, QSize(480, 0), [](
+			std::shared_ptr<Ui::Show> show) {
+		struct State {
+			std::unique_ptr<EditorController> controller;
+		};
+		auto document = Document::Blank();
+		const auto apply = [&](Edit &&edit) {
+			auto created = edit.created;
+			if (edit.ok()) {
+				document = std::move(edit.document);
+			} else {
+				created.clear();
+			}
+			return created;
+		};
+		apply(AddLayer(
+			document,
+			LayerTemplate::Shape,
+			u"Круг"_q,
+			0,
+			0,
+			ShapeTemplate::Ellipse));
+		apply(AddLayer(
+			document,
+			LayerTemplate::Shape,
+			u"Звезда"_q,
+			0,
+			1,
+			ShapeTemplate::Star));
+		const auto layers = document.layers();
+		if (layers.size() >= 2) {
+			const auto matte = layers[0];
+			const auto star = layers[1];
+			apply(SetTrackMatte(document, star, MatteMode::Alpha, matte));
+			const auto masks = apply(AddMask(
+				document,
+				star,
+				DefaultMaskPath(document, star, 0.)));
+			if (!masks.empty()) {
+				apply(SetMaskInverted(document, masks.front(), true));
+				apply(SetValueAt(
+					document,
+					PropertyRef{ masks.front(), QByteArray("o") },
+					PropValue::Scalar(60.),
+					0.));
+			}
+			const auto node = document.node(star);
+			if (node && !node->children.empty()) {
+				const auto group = node->children.front();
+				apply(AddShape(
+					document,
+					group,
+					ShapeTemplate::Repeater,
+					ShapeTypeText(ShapeType::Repeater)));
+				apply(AddShape(
+					document,
+					group,
+					ShapeTemplate::GradientStroke,
+					ShapeTypeText(ShapeType::GradientStroke)));
+			}
+		}
+		const auto state = std::make_shared<State>(State{
+			.controller = std::make_unique<EditorController>(
+				std::move(document),
+				u"sample"_q),
+		});
+		state->controller->setShow(show);
+		return Box([=](not_null<Ui::GenericBox*> box) {
+			box->lifetime().add([state] {});
+			ValidationBoxFor(box, state->controller.get(), ValidationArgs{
+				.purpose = ValidationPurpose::StickerPack,
+				.proceed = [] {},
+			});
+		});
+	});
+
+	// The same check with errors (a wrong canvas, frame rate and duration,
+	// a mask with a mode Telegram skips).
+	const auto withErrors = [](
+			std::shared_ptr<Ui::Show> show,
+			ValidationPurpose purpose) {
+		struct State {
+			std::unique_ptr<EditorController> controller;
+		};
+		auto document = Document::FromJson(
+			R"({"v":"5.5.2","fr":25,"ip":0,"op":100,"w":400,"h":300,)"
+			R"("layers":[{"ty":4,"ind":1,"ddd":0,"ip":0,"op":100,"st":0,)"
+			R"("sr":1,"hasMask":true,"masksProperties":[{"mode":"l",)"
+			R"("inv":false,"pt":{"a":0,"k":{"c":true,"v":[[0,0],[100,0],)"
+			R"([100,100]],"i":[[0,0],[0,0],[0,0]],"o":[[0,0],[0,0],)"
+			R"([0,0]]}},"o":{"a":0,"k":100}}],"ks":{},"shapes":[]}]})");
+		const auto state = std::make_shared<State>(State{
+			.controller = std::make_unique<EditorController>(
+				std::move(document),
+				u"sample"_q),
+		});
+		state->controller->setShow(show);
+		return Box([=](not_null<Ui::GenericBox*> box) {
+			box->lifetime().add([state] {});
+			ValidationBoxFor(box, state->controller.get(), ValidationArgs{
+				.purpose = purpose,
+				.proceed = [] {},
+			});
+		});
+	};
+
+	// A sticker pack can't take it, there is nothing to continue with:
+	// "Fix automatically" and "Close".
+	RegisterBoxScene(u"lottie_validation_blocked"_q, QSize(480, 0), [=](
+			std::shared_ptr<Ui::Show> show) {
+		return withErrors(show, ValidationPurpose::StickerPack);
+	});
+
+	// "Export .tgs" of the same animation: the file can be written anyway,
+	// the fix is a link under the notice.
+	RegisterBoxScene(u"lottie_validation_tgs"_q, QSize(480, 0), [=](
+			std::shared_ptr<Ui::Show> show) {
+		return withErrors(show, ValidationPurpose::ExportTgs);
 	});
 });
 

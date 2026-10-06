@@ -92,6 +92,8 @@ private:
 	struct EmojiStatus;
 	struct BotVerifiedData;
 
+	// Oblivion: drawGetWidth() adds the mark of an Oblivion user to this.
+	int drawGetWidthUpstream(Painter &p, Descriptor &&descriptor);
 	int drawTextBadge(Painter &p, const Descriptor &descriptor);
 	int drawVerifyCheck(Painter &p, const Descriptor &descriptor);
 	int drawPremiumEmojiStatus(Painter &p, const Descriptor &descriptor);

@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_inner_widget.h"
 
 #include "oblivion/oblivion_deleted_store.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_media_save.h"
 #include "oblivion/oblivion_message_tools.h"
 #include "oblivion/oblivion_music_editor.h"
@@ -3070,6 +3071,10 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 		}
 		Oblivion::AddSelfDestructingActions(_menu.get(), _controller, item);
 		Oblivion::AddToPlaylistMenu(
+			_menu.get(),
+			_controller,
+			albumPartItem ? albumPartItem : item);
+		Oblivion::Listen::AddStartAction( // Oblivion: listen together.
 			_menu.get(),
 			_controller,
 			albumPartItem ? albumPartItem : item);

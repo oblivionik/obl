@@ -11,6 +11,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_sending.h"
 #include "api/api_stickers_creator.h"
 #include "apiwrap.h"
+#include "base/event_filter.h"
 #include "base/random.h"
 #include "base/timer.h"
 #include "base/unixtime.h"
@@ -43,6 +44,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_lottie_editor.h"
 #include "oblivion/oblivion_photo_core.h"
 #include "oblivion/oblivion_photo_integration.h"
+#include "oblivion/oblivion_sticker_batch.h"
+#include "oblivion/oblivion_sticker_export.h"
 #include "oblivion/oblivion_sticker_packs_core.h"
 #include "oblivion/oblivion_sticker_trim.h"
 #include "oblivion/oblivion_ui_snapshots.h"
@@ -93,6 +96,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtCore/QFileInfo>
 #include <QtCore/QSaveFile>
 #include <QtGui/QClipboard>
+#include <QtGui/QDragEnterEvent>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QLinearGradient>
 #include <QtGui/QPainterPath>
@@ -134,41 +138,14 @@ auto LastPackId = uint64(0);
 // answer would reload this one again, in a loop. Main thread only.
 auto FeedingOwnSets = 0;
 
-struct PackInfo {
-	uint64 id = 0;
-	uint64 accessHash = 0;
-	QString title;
-	QString shortName;
-	int count = 0;
-	bool emoji = false;
-	bool masks = false;
-	std::shared_ptr<Ui::DynamicImage> thumbnail;
-
-	// Stickers can be added only to the usual sticker sets here.
-	[[nodiscard]] bool regular() const {
-		return !emoji && !masks;
-	}
-};
-
-struct PacksState {
-	std::vector<PackInfo> list;
-	bool loaded = false;
-	bool failed = false;
-};
-
-struct NewPack {
-	QString title;
-	QString shortName;
-};
-
-struct Target {
-	std::optional<PackInfo> pack;
-	std::optional<NewPack> create;
-
-	explicit operator bool() const {
-		return pack.has_value() || create.has_value();
-	}
-};
+// The data of the own sets is shared with the batch box, it lives in
+// oblivion_sticker_packs_core.h. The "add a sticker" box here works only
+// with the usual sticker sets (PackInfo::regular()), custom emoji sets
+// are filled by the batch box.
+using PackInfo = StickerPacks::OwnPack;
+using PacksState = StickerPacks::OwnPacks;
+using StickerPacks::NewPack;
+using Target = StickerPacks::PackTarget;
 
 enum class NameStatus : uchar {
 	Unknown,
@@ -183,6 +160,14 @@ struct UploadRequest {
 	Prepared sticker;
 	QString emoji;
 	Target target;
+
+	// Not zero: one of many stickers of the batch box. The lists of the
+	// own sets are not reloaded after it (PacksApi::batchFinished() does
+	// that once), a new set is installed before done is called, so that
+	// the next sticker never has a request of the previous one in flight,
+	// and a file that got to the server is not uploaded again when the
+	// same item is retried after a FLOOD_WAIT.
+	uint64 batchId = 0;
 };
 
 struct UploadHandlers {
@@ -191,6 +176,10 @@ struct UploadHandlers {
 	Fn<void(PackInfo pack, bool created)> done;
 	Fn<void(QString error)> fail; // The error type, empty for the upload.
 };
+
+[[nodiscard]] bool IsFloodError(const QString &type) {
+	return type.startsWith(u"FLOOD"_q);
+}
 
 using MaskDone = Fn<void(Vision::MaskResult)>;
 
@@ -304,6 +293,19 @@ using MaskDone = Fn<void(Vision::MaskResult)>;
 	return light ? active : normal;
 }
 
+// "Add several files" of the list of the sets: its icon is wider than the
+// round one of "create" above it, so it starts earlier to stay centered on
+// the same vertical as that one and as the covers of the sets below.
+[[nodiscard]] const style::SettingsButton &BatchButtonStyle() {
+	static const auto result = [] {
+		auto copy = st::settingsButtonActive;
+		copy.iconLeft -= (st::menuBlueIconPhotoSet.width()
+			- st::settingsIconAdd.width()) / 2;
+		return copy;
+	}();
+	return result;
+}
+
 void CloseLater(not_null<Ui::GenericBox*> box) {
 	crl::on_main(box, [=] {
 		box->closeBox();
@@ -354,6 +356,14 @@ public:
 		UploadRequest request,
 		UploadHandlers handlers);
 
+	// The batch box: what was put off while its stickers were uploaded
+	// (see UploadRequest::batchId) is done now, once for all of them.
+	void batchFinished();
+
+	// A set that was made, but the box that made it was closed before it
+	// could be installed (BatchBackend::install).
+	void install(const PackInfo &pack);
+
 	// done gets the error type, empty on success.
 	void rename(
 		const PackInfo &pack,
@@ -375,6 +385,21 @@ private:
 		rpl::lifetime lifetime;
 	};
 
+	// The file of a batch item that is on the server, but not in the set.
+	// The item keeps its id when it is trimmed or converted for another
+	// kind of a set, so the file itself is remembered as well.
+	struct Uploaded {
+		uint64 batchId = 0;
+		QByteArray bytes;
+		MTPInputDocument document;
+
+		[[nodiscard]] bool matches(const UploadRequest &request) const {
+			return request.batchId
+				&& (request.batchId == batchId)
+				&& (request.sticker.bytes == bytes);
+		}
+	};
+
 	[[nodiscard]] PackInfo infoFromSet(not_null<Data::StickersSet*> set);
 	void requestPage(uint64 offsetId);
 	void publish();
@@ -382,8 +407,12 @@ private:
 	void fileUploaded(const MTPInputFile &file);
 	void addToSet(const MTPInputDocument &document);
 	void setReceived(const MTPmessages_StickerSet &result, bool created);
+	void uploadDone(const PackInfo &pack, bool created);
 	void uploadFailed(const QString &error);
-	void installCreated(const PackInfo &pack);
+
+	// installed (the batch box) is called when the request has ended, the
+	// sticker panel is refreshed later then, by batchFinished().
+	void installCreated(const PackInfo &pack, Fn<void()> installed = nullptr);
 
 	const not_null<Main::Session*> _session;
 	MTP::Sender _api;
@@ -398,10 +427,26 @@ private:
 	mtpRequestId _botRequest = 0;
 	std::unique_ptr<Upload> _upload;
 	int _uploadGeneration = 0;
+	std::optional<Uploaded> _uploaded;
+	bool _batchChanged = false;
+	bool _batchCreatedStickers = false;
+	bool _batchCreatedEmoji = false;
 	base::Timer _reloadTimer;
 	rpl::lifetime _lifetime;
 
 };
+
+// A new set is installed for its creator, the sticker panel (the emoji
+// panel for a custom emoji set) shows it after this.
+void RefreshInstalledSets(not_null<Main::Session*> session, bool emoji) {
+	if (emoji) {
+		session->data().stickers().setLastEmojiUpdate(0);
+		session->api().updateCustomEmoji();
+	} else {
+		session->data().stickers().setLastUpdate(0);
+		session->api().updateStickers();
+	}
+}
 
 PacksApi::PacksApi(not_null<Main::Session*> session)
 : _session(session)
@@ -601,6 +646,31 @@ Fn<void()> PacksApi::upload(UploadRequest request, UploadHandlers handlers) {
 	const auto upload = _upload.get();
 	upload->request = std::move(request);
 	upload->handlers = std::move(handlers);
+
+	if (_uploaded && _uploaded->matches(upload->request)) {
+		// The file of this item is on the server since the last try, only
+		// the set is left. Not right from here: a handler must never be
+		// called before the caller has the way to cancel the upload.
+		const auto document = _uploaded->document;
+		crl::on_main(this, [=] {
+			if (!_upload || _uploadGeneration != generation) {
+				return;
+			} else if (const auto onstack = _upload->handlers.finishing) {
+				onstack();
+				if (!_upload || _uploadGeneration != generation) {
+					return;
+				}
+			}
+			addToSet(document);
+		});
+		return crl::guard(this, [=] {
+			if (_uploadGeneration == generation) {
+				cancelUpload();
+			}
+		});
+	}
+	_uploaded = std::nullopt;
+
 	upload->documentId = base::RandomValue<DocumentId>();
 	upload->fullId = FullMsgId(
 		_session->userPeerId(),
@@ -735,10 +805,18 @@ void PacksApi::fileUploaded(const MTPInputFile &file) {
 			}
 			document->match([&](const MTPDdocument &fields) {
 				found = true;
-				addToSet(MTP_inputDocument(
+				const auto input = MTP_inputDocument(
 					fields.vid(),
 					fields.vaccess_hash(),
-					fields.vfile_reference()));
+					fields.vfile_reference());
+				if (const auto batchId = _upload->request.batchId) {
+					_uploaded = Uploaded{
+						batchId,
+						_upload->request.sticker.bytes,
+						input,
+					};
+				}
+				addToSet(input);
 			}, [](const auto &) {
 			});
 		}, [](const auto &) {
@@ -773,6 +851,12 @@ void PacksApi::addToSet(const MTPInputDocument &document) {
 	const auto fail = [=](const MTP::Error &error) {
 		if (_upload) {
 			_upload->requestId = 0;
+
+			// After a FLOOD_WAIT the same file is added again, anything
+			// else may be about the file itself: it is uploaded anew.
+			if (!IsFloodError(error.type())) {
+				_uploaded = std::nullopt;
+			}
 			uploadFailed(error.type());
 		}
 	};
@@ -785,8 +869,11 @@ void PacksApi::addToSet(const MTPInputDocument &document) {
 			item
 		)).done(done(false)).fail(fail).handleFloodErrors().send();
 	} else if (const auto &create = request.target.create) {
+		// A custom emoji set differs only by the flag: the files are
+		// uploaded the same way (api/api_stickers_creator.cpp does it so).
+		using Flag = MTPstickers_CreateStickerSet::Flag;
 		_upload->requestId = _api.request(MTPstickers_CreateStickerSet(
-			MTP_flags(0),
+			MTP_flags(create->emoji ? Flag::f_emojis : Flag(0)),
 			MTP_inputUserSelf(),
 			MTP_string(create->title),
 			MTP_string(create->shortName),
@@ -803,36 +890,87 @@ void PacksApi::addToSet(const MTPInputDocument &document) {
 void PacksApi::setReceived(
 		const MTPmessages_StickerSet &result,
 		bool created) {
+	const auto batch = (_upload->request.batchId != 0);
 	auto info = std::optional<PackInfo>();
 	result.match([&](const MTPDmessages_stickerSet &data) {
 		auto &stickers = _session->data().stickers();
+
+		// In a batch the lists of the own sets are reloaded once, by
+		// batchFinished(), not after every sticker: the notifications
+		// are hidden from them the way requestPage() hides its own.
+		if (batch) {
+			++FeedingOwnSets;
+		}
 		const auto set = stickers.feedSetFull(data);
 		stickers.notifyUpdated(Data::StickersType::Stickers);
+		if (batch) {
+			--FeedingOwnSets;
+		}
 		info = infoFromSet(set);
 	}, [](const auto &) {
 	});
+	_uploaded = std::nullopt;
 	if (!info) {
 		uploadFailed(u"STICKERSET_INVALID"_q);
 		return;
+	} else if (!batch) {
+		if (created) {
+			installCreated(*info);
+		}
+		reload();
+		uploadDone(*info, created);
+		return;
 	}
-	if (created) {
-		installCreated(*info);
+	_batchChanged = true;
+	if (!created) {
+		uploadDone(*info, false);
+		return;
 	}
-	reload();
+	(info->emoji ? _batchCreatedEmoji : _batchCreatedStickers) = true;
 
+	// The next sticker of the batch starts only when this request has
+	// ended, the upload stays the current one (and can be cancelled).
+	const auto generation = _uploadGeneration;
+	const auto pack = *info;
+	const auto session = _session;
+	const auto weak = base::make_weak(this);
+	installCreated(pack, [=] {
+		const auto strong = weak.get();
+		if (!strong) {
+			// The box is closed, nobody calls batchFinished() anymore:
+			// the panel and the lists of the own sets get the new set now.
+			RefreshInstalledSets(session, pack.emoji);
+			session->data().stickers().notifyUpdated(
+				Data::StickersType::Stickers);
+		} else if (strong->_upload
+			&& strong->_uploadGeneration == generation) {
+			strong->uploadDone(pack, true);
+		}
+	});
+}
+
+void PacksApi::uploadDone(const PackInfo &pack, bool created) {
 	// The handler may destroy everything, nothing is used after it.
 	const auto upload = base::take(_upload);
 	if (const auto onstack = upload->handlers.done) {
-		onstack(*info, created);
+		onstack(pack, created);
 	}
 }
 
-// A new set gets into the sticker panel of its creator right away.
-void PacksApi::installCreated(const PackInfo &pack) {
+// A new set gets into the sticker panel of its creator right away. The
+// request belongs to the session: the set is installed even if the box
+// that made it is closed before the answer comes.
+void PacksApi::installCreated(
+		const PackInfo &pack,
+		Fn<void()> installed) {
 	const auto session = _session;
-	const auto refresh = crl::guard(session, [=] {
-		session->data().stickers().setLastUpdate(0);
-		session->api().updateStickers();
+	const auto emoji = pack.emoji;
+	const auto finish = crl::guard(session, [=] {
+		if (installed) {
+			installed();
+		} else {
+			RefreshInstalledSets(session, emoji);
+		}
 	});
 	session->api().request(MTPmessages_InstallStickerSet(
 		Data::InputStickerSet(StickerSetIdentifier{
@@ -840,7 +978,26 @@ void PacksApi::installCreated(const PackInfo &pack) {
 			.accessHash = pack.accessHash,
 		}),
 		MTP_bool(false)
-	)).done(refresh).fail(refresh).send();
+	)).done(finish).fail(finish).send();
+}
+
+void PacksApi::install(const PackInfo &pack) {
+	installCreated(pack);
+}
+
+void PacksApi::batchFinished() {
+	if (base::take(_batchCreatedStickers)) {
+		RefreshInstalledSets(_session, false);
+	}
+	if (base::take(_batchCreatedEmoji)) {
+		RefreshInstalledSets(_session, true);
+	}
+	if (base::take(_batchChanged)) {
+		// Every list of the own sets reloads itself after this, the one
+		// of this object too (it is not feeding anything now).
+		_session->data().stickers().notifyUpdated(
+			Data::StickersType::Stickers);
+	}
 }
 
 void PacksApi::rename(
@@ -2025,6 +2182,9 @@ struct CreateArgs {
 	QString title;
 	QString shortName;
 
+	// A custom emoji set: the title of the box and the link differ.
+	bool emoji = false;
+
 	// The status of the given short name (the UI snapshots).
 	NameStatus status = NameStatus::Unknown;
 
@@ -2052,14 +2212,19 @@ void CreatePackBox(not_null<Ui::GenericBox*> box, CreateArgs &&args) {
 	state->status = args.status;
 	state->checked = args.shortName;
 	state->nameEdited = !args.shortName.isEmpty();
+	const auto emoji = args.emoji;
 
-	box->setTitle(tr::lng_oblivion_packs_create_title());
+	box->setTitle(emoji
+		? tr::lng_oblivion_sbatch_new_emoji_title()
+		: tr::lng_oblivion_packs_create_title());
 
 	// The typed title and link are not lost by a click past the box.
 	box->setCloseByOutsideClick(false);
 	box->addRow(object_ptr<Ui::FlatLabel>(
 		box,
-		tr::lng_oblivion_packs_create_about(),
+		(emoji
+			? tr::lng_oblivion_sbatch_new_emoji_about()
+			: tr::lng_oblivion_packs_create_about()),
 		st::boxLabel));
 	const auto title = box->addRow(
 		object_ptr<Ui::InputField>(
@@ -2085,14 +2250,16 @@ void CreatePackBox(not_null<Ui::GenericBox*> box, CreateArgs &&args) {
 		using Problem = StickerPacks::NameProblem;
 		const auto text = name->getLastText().trimmed();
 		const auto problem = StickerPacks::CheckShortName(text);
-		const auto link = ShortLink(text, false);
+		const auto link = ShortLink(text, emoji);
 		const auto status = (state->checked == text)
 			? state->status
 			: NameStatus::Checking;
 		auto color = std::optional<QColor>();
 		auto message = QString();
 		if (problem == Problem::Empty) {
-			message = tr::lng_oblivion_packs_name_hint(tr::now);
+			message = emoji
+				? tr::lng_oblivion_sbatch_new_emoji_hint(tr::now)
+				: tr::lng_oblivion_packs_name_hint(tr::now);
 		} else if (problem != Problem::None) {
 			message = NameProblemText(problem);
 			color = st::boxTextFgError->c;
@@ -2208,7 +2375,11 @@ void CreatePackBox(not_null<Ui::GenericBox*> box, CreateArgs &&args) {
 		}
 		CloseLater(box);
 		if (done) {
-			done(NewPack{ .title = titleText, .shortName = nameText });
+			done(NewPack{
+				.title = titleText,
+				.shortName = nameText,
+				.emoji = emoji,
+			});
 		}
 	};
 	title->submits() | rpl::on_next([=] {
@@ -2312,8 +2483,11 @@ private:
 	const style::PeerListItem &_st;
 	const not_null<Ui::IconButton*> _more;
 	const std::shared_ptr<Ui::DynamicImage> _thumbnail;
-	const QString _title;
 	const QString _status;
+
+	// The titles of the sets have emoji: as a text of the app they look
+	// the same on every system, the way they do in the sticker panel.
+	const Ui::Text::String _title;
 	rpl::event_stream<> _menuRequests;
 
 };
@@ -2323,17 +2497,17 @@ PackRow::PackRow(QWidget *parent, const PackInfo &pack)
 , _st(st::defaultPeerListItem)
 , _more(Ui::CreateChild<Ui::IconButton>(this, st::themesMenuToggle))
 , _thumbnail(pack.thumbnail ? pack.thumbnail->clone() : nullptr)
-, _title(pack.title)
 , _status(CountText(pack)
 	+ QString::fromUtf8(" \xC2\xB7 ")
-	+ ShortLink(pack.shortName, pack.emoji)) {
+	+ ShortLink(pack.shortName, pack.emoji))
+, _title(st::semiboldTextStyle, pack.title, kPlainTextOptions) {
 	_more->setClickedCallback([=] {
 		_menuRequests.fire({});
 	});
 	if (_thumbnail) {
 		_thumbnail->subscribeToUpdates([=] { update(); });
 	}
-	setAccessibleName(_title);
+	setAccessibleName(pack.title);
 	resize(width(), _st.height);
 }
 
@@ -2396,13 +2570,13 @@ void PackRow::paintEvent(QPaintEvent *e) {
 	if (textWidth <= 0) {
 		return;
 	}
-	p.setFont(st::semiboldFont);
 	p.setPen(st::contactsNameFg);
-	p.drawTextLeft(
+	_title.drawLeftElided(
+		p,
 		left,
 		_st.namePosition.y(),
-		width(),
-		st::semiboldFont->elided(_title, textWidth));
+		textWidth,
+		width());
 	p.setFont(st::normalFont);
 	p.setPen(over ? st::windowSubTextFgOver : st::windowSubTextFg);
 	p.drawTextLeft(
@@ -2430,12 +2604,27 @@ struct ListArgs {
 	Fn<void(PackInfo)> addSticker;
 	Fn<void(PackInfo)> rename;
 	Fn<void(PackInfo)> remove;
+
+	// The batch box (oblivion_sticker_batch.h): many files at once, into
+	// the set with this id or into the one chosen there (0). The paths
+	// are the files dropped onto the list, empty if it is opened by the
+	// button or from the menu of a set.
+	Fn<void(uint64 packId, QStringList paths)> batch;
+
+	// "Save the set (.zip)" of oblivion_sticker_export.h.
+	Fn<void(not_null<Ui::PopupMenu*>, PackInfo)> addExport;
 };
 
 void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
+	struct Row {
+		QPointer<Ui::RippleButton> widget;
+		uint64 packId = 0;
+	};
 	struct State {
 		base::unique_qptr<Ui::PopupMenu> menu;
 		rpl::variable<QString> message;
+		std::vector<Row> rows; // The sets that take files of the batch box.
+		QPointer<Ui::RippleButton> dropTarget;
 	};
 	const auto show = args.show;
 	const auto reload = std::move(args.reload);
@@ -2444,6 +2633,8 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 	const auto addSticker = std::move(args.addSticker);
 	const auto rename = std::move(args.rename);
 	const auto remove = std::move(args.remove);
+	const auto batch = std::move(args.batch);
+	const auto addExport = std::move(args.addExport);
 	const auto state = box->lifetime().make_state<State>();
 
 	box->setWidth(st::boxWideWidth);
@@ -2465,6 +2656,18 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 			create();
 		}
 	});
+	const auto batchButton = batch
+		? ::Settings::AddButtonWithIcon(
+			content,
+			tr::lng_oblivion_sbatch_add_several(),
+			BatchButtonStyle(),
+			{ &st::menuBlueIconPhotoSet }).get()
+		: nullptr;
+	if (batchButton) {
+		batchButton->setClickedCallback([=] {
+			batch(0, QStringList());
+		});
+	}
 
 	const auto list = content->add(
 		object_ptr<Ui::VerticalLayout>(content),
@@ -2526,6 +2729,12 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 				[=] { addSticker(pack); },
 				&st::menuIconStickerAdd);
 		}
+		if (batch && !pack.masks) {
+			addAction(
+				tr::lng_oblivion_sbatch_add_several(tr::now),
+				[=] { batch(pack.id, QStringList()); },
+				&st::menuIconPhotoSet);
+		}
 		addAction(
 			tr::lng_oblivion_packs_copy_link(tr::now),
 			[=] {
@@ -2534,6 +2743,9 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 				show->showToast(tr::lng_oblivion_packs_link_copied(tr::now));
 			},
 			&st::menuIconLink);
+		if (addExport) {
+			addExport(menu, pack);
+		}
 		if (rename) {
 			addAction(
 				tr::lng_oblivion_packs_rename(tr::now),
@@ -2554,9 +2766,14 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 	std::move(
 		args.packs
 	) | rpl::on_next([=](const PacksState &packs) {
+		state->dropTarget = nullptr;
+		state->rows.clear();
 		list->clear();
 		for (const auto &pack : packs.list) {
 			const auto row = list->add(object_ptr<PackRow>(list, pack));
+			if (!pack.masks) {
+				state->rows.push_back({ row, pack.id });
+			}
 			row->setClickedCallback([=] {
 				if (open) {
 					open(pack);
@@ -2582,6 +2799,71 @@ void PacksListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 	}, box->lifetime());
 
 	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+
+	if (!batch) {
+		return;
+	}
+
+	// Files dragged onto a set go into that set, files dragged anywhere
+	// else in the box go to the batch box with the set chosen there.
+	const auto targetAt = [=](QPoint position) {
+		const auto local = list->mapFrom(box, position);
+		for (const auto &row : state->rows) {
+			if (row.widget && row.widget->geometry().contains(local)) {
+				return row;
+			}
+		}
+		return Row{ .widget = batchButton };
+	};
+	const auto setTarget = [=](Ui::RippleButton *target) {
+		if (state->dropTarget.data() == target) {
+			return;
+		} else if (const auto old = state->dropTarget.data()) {
+			old->setForceRippled(false);
+		}
+		state->dropTarget = target;
+		if (target) {
+			target->setForceRippled(true);
+		}
+	};
+	box->setAcceptDrops(true);
+	base::install_event_filter(box, [=](not_null<QEvent*> e) {
+		using Result = base::EventFilterResult;
+		const auto type = e->type();
+		if (type == QEvent::DragEnter || type == QEvent::DragMove) {
+			const auto drag = static_cast<QDragMoveEvent*>(e.get());
+			if (!StickerBatch::MimeHasFiles(drag->mimeData())) {
+				setTarget(nullptr);
+				drag->ignore();
+			} else {
+				setTarget(targetAt(drag->position().toPoint()).widget.data());
+				drag->setDropAction(Qt::CopyAction);
+				drag->accept();
+			}
+			return Result::Cancel;
+		} else if (type == QEvent::DragLeave) {
+			setTarget(nullptr);
+			return Result::Cancel;
+		} else if (type == QEvent::Drop) {
+			const auto drop = static_cast<QDropEvent*>(e.get());
+			const auto packId = targetAt(drop->position().toPoint()).packId;
+			setTarget(nullptr);
+			const auto paths = StickerBatch::PathsFromMime(drop->mimeData());
+			if (paths.isEmpty()) {
+				drop->ignore();
+			} else {
+				drop->setDropAction(Qt::CopyAction);
+				drop->accept();
+
+				// Not right from the drop: a box is shown above this one.
+				crl::on_main(box, [=] {
+					batch(packId, paths);
+				});
+			}
+			return Result::Cancel;
+		}
+		return Result::Continue;
+	});
 }
 
 void OpenPack(
@@ -2601,11 +2883,13 @@ void ShowCreateBox(
 		std::shared_ptr<Ui::Show> show,
 		std::shared_ptr<PacksApi> api,
 		QString title,
-		Fn<void(NewPack)> done) {
+		Fn<void(NewPack)> done,
+		bool emoji = false) {
 	const auto copy = show;
 	copy->showBox(Box(CreatePackBox, CreateArgs{
 		.show = std::move(show),
 		.title = std::move(title),
+		.emoji = emoji,
 		.suggest = [=](QString title, Fn<void(QString)> done) {
 			api->suggestName(title, std::move(done));
 		},
@@ -3134,6 +3418,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 				.addSticker = [](PackInfo) {},
 				.rename = [](PackInfo) {},
 				.remove = [](PackInfo) {},
+				.batch = [](uint64, QStringList) {},
 			});
 		};
 	};
@@ -3164,6 +3449,18 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.title = u"Коты"_q,
 			.shortName = u"cats"_q,
 			.status = NameStatus::Occupied,
+		});
+	});
+	// A custom emoji set (the batch box creates them): its own title
+	// and the t.me/addemoji link.
+	RegisterBoxScene(u"pack_create_emoji"_q, size, [](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(CreatePackBox, CreateArgs{
+			.show = show,
+			.title = u"Мои эмодзи"_q,
+			.shortName = u"my_tiny_emoji"_q,
+			.emoji = true,
+			.status = NameStatus::Available,
 		});
 	});
 	RegisterBoxScene(u"pack_rename"_q, size, [](
@@ -3449,8 +3746,81 @@ void ShowStickerPacks(not_null<Window::SessionController*> controller) {
 				.confirmStyle = &st::attentionBoxButton,
 			}));
 		},
+		.batch = [=](uint64 packId, QStringList paths) {
+			if (const auto strong = weak.get()) {
+				ShowStickerBatch(strong, std::move(paths), packId);
+			}
+		},
+		.addExport = [=](not_null<Ui::PopupMenu*> menu, PackInfo pack) {
+			AddStickerSetExportAction(
+				menu,
+				show,
+				StickerSetIdentifier{
+					.id = pack.id,
+					.accessHash = pack.accessHash,
+				});
+		},
 	}));
 	api->reload();
+}
+
+StickerPacks::BatchBackend MakeStickerBatchBackend(
+		not_null<Window::SessionController*> controller) {
+	const auto show = controller->uiShow();
+	const auto weak = base::make_weak(controller);
+
+	// Kept alive by the box that holds the backend, it never outlives
+	// the session (the same as the list of the sets above).
+	const auto api = std::make_shared<PacksApi>(&controller->session());
+	return {
+		.packs = [=] {
+			return api->state();
+		},
+		.reload = [=] {
+			api->reload();
+		},
+		.createPack = [=](
+				StickerPacks::PackKind kind,
+				QString title,
+				Fn<void(NewPack)> done) {
+			ShowCreateBox(
+				show,
+				api,
+				std::move(title),
+				std::move(done),
+				(kind == StickerPacks::PackKind::Emoji));
+		},
+		.upload = [=](
+				StickerPacks::BatchUpload upload,
+				StickerPacks::BatchHandlers handlers) {
+			Expects(upload.id != 0);
+
+			return api->upload(
+				UploadRequest{
+					.sticker = std::move(upload.sticker),
+					.emoji = std::move(upload.emoji),
+					.target = std::move(upload.target),
+					.batchId = upload.id,
+				},
+				UploadHandlers{
+					.progress = std::move(handlers.progress),
+					.finishing = std::move(handlers.finishing),
+					.done = std::move(handlers.done),
+					.fail = std::move(handlers.fail),
+				});
+		},
+		.finished = [=] {
+			api->batchFinished();
+		},
+		.openPack = [=](PackInfo pack) {
+			if (const auto strong = weak.get()) {
+				OpenPack(strong, pack);
+			}
+		},
+		.install = [=](PackInfo pack) {
+			api->install(pack);
+		},
+	};
 }
 
 void AddToStickerPack(

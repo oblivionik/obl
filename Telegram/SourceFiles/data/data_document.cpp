@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_document.h"
 
+#include "oblivion/oblivion_sticker_export.h" // Oblivion
+
 #include "data/data_document_resolver.h"
 #include "data/data_session.h"
 #include "data/data_streaming.h"
@@ -1308,7 +1310,13 @@ void DocumentData::handleLoaderUpdates() {
 		_owner->documentLoadProgress(this);
 	}, [=](FileLoader::Error error) {
 		using FailureReason = FileLoader::FailureReason;
-		if (error.started && _loader) {
+		if (error.started
+			&& _loader
+			&& _loader->fileName().isEmpty()
+			&& Oblivion::StickerExport::QuietLoad(this)) {
+			// Oblivion: a load into memory that the sticker export waits
+			// for is reported by the export itself, without the retry box.
+		} else if (error.started && _loader) {
 			const auto origin = _loader->fileOrigin();
 			const auto failedFileName = _loader->fileName();
 			const auto retry = [=] {

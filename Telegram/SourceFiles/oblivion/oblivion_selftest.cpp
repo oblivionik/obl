@@ -8,19 +8,29 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_selftest.h"
 
 #include "core/launcher.h"
+#include "oblivion/oblivion_attach_tools.h"
 #include "oblivion/oblivion_audio.h"
+#include "oblivion/oblivion_badge.h"
+#include "oblivion/oblivion_chat_stats.h"
 #include "oblivion/oblivion_ghost_button.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_lottie.h"
 #include "oblivion/oblivion_lottie_doc.h"
+#include "oblivion/oblivion_lottie_editor_masks.h"
 #include "oblivion/oblivion_noise.h"
 #include "oblivion/oblivion_online.h"
 #include "oblivion/oblivion_photo_core.h"
+#include "oblivion/oblivion_photo_doc.h"
+#include "oblivion/oblivion_photo_fx.h"
 #include "oblivion/oblivion_profile_history.h"
 #include "oblivion/oblivion_round_video_convert.h"
+#include "oblivion/oblivion_sticker_batch.h"
+#include "oblivion/oblivion_sticker_export.h"
 #include "oblivion/oblivion_sticker_packs_core.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "oblivion/oblivion_unified_chats.h"
 #include "oblivion/oblivion_video_core.h"
+#include "oblivion/oblivion_video_fx.h"
 #include "oblivion/oblivion_video_project.h"
 #include "oblivion/oblivion_vision.h"
 #include "oblivion/oblivion_voice_changer.h"
@@ -63,6 +73,17 @@ struct Test {
 		{ u"profile_history"_q, &ProfileHistory::RunSelfTest },
 		{ u"ghost_button"_q, &GhostMode::RunSelfTest },
 		{ u"unified_chats"_q, &UnifiedChats::RunSelfTest },
+		// Round 4.
+		{ u"photo_doc"_q, &Photo::RunDocSelfTest },
+		{ u"photo_fx"_q, &Photo::RunFxSelfTest },
+		{ u"video_fx"_q, &VideoFx::RunSelfTest },
+		{ u"sticker_export"_q, &StickerExport::RunSelfTest },
+		{ u"sticker_batch"_q, &StickerBatch::RunSelfTest },
+		{ u"attach_tools"_q, &AttachTools::RunSelfTest },
+		{ u"chat_stats"_q, &ChatStats::RunSelfTest },
+		{ u"badge"_q, &Badge::RunSelfTest },
+		{ u"listen"_q, &Listen::RunSelfTest },
+		{ u"lottie_editor"_q, &LottieEdit::RunEditorSelfTest },
 		{ u"ui"_q, &SelfTest::RunUiSnapshots, true },
 	};
 }

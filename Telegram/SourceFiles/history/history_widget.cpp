@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_interface.h"
+#include "oblivion/oblivion_listen_ui.h"
 #include "oblivion/oblivion_settings.h"
 #include "api/api_compose_with_ai.h"
 #include "api/api_editing.h"
@@ -3086,6 +3087,7 @@ void HistoryWidget::showHistory(
 	_paysStatus = nullptr;
 	_contactStatus = nullptr;
 	_businessBotStatus = nullptr;
+	_oblivionListenBar.destroy(); // Oblivion.
 
 	Core::App().mediaDevices().refreshRecordAvailability();
 
@@ -3101,6 +3103,18 @@ void HistoryWidget::showHistory(
 		) | rpl::on_next([=] {
 			updateControlsGeometry();
 		}, _contactStatus->bar().lifetime());
+
+		// Oblivion: listening to music together, see oblivion_listen.h.
+		_oblivionListenBar = Oblivion::Listen::CreateBar(
+			_topBars.get(),
+			controller(),
+			_peer);
+		if (const auto raw = _oblivionListenBar.data()) {
+			raw->heightValue(
+			) | rpl::on_next([=] {
+				updateControlsGeometry();
+			}, raw->lifetime());
+		}
 
 		refreshGiftToChannelShown();
 		refreshDirectMessageShown();
@@ -7921,9 +7935,16 @@ void HistoryWidget::updateControlsGeometry() {
 	if (_businessBotStatus) {
 		_businessBotStatus->bar().move(tabsLeftSkip, businessBotTop);
 	}
-	const auto scrollAreaTop = _topBars->y()
-		+ businessBotTop
+	// Oblivion: the listening together bar goes below all the others.
+	const auto oblivionListenTop = businessBotTop
 		+ (_businessBotStatus ? _businessBotStatus->bar().height() : 0);
+	if (_oblivionListenBar) {
+		_oblivionListenBar->move(0, oblivionListenTop);
+		_oblivionListenBar->resizeToWidth(innerWidth);
+	}
+	const auto scrollAreaTop = _topBars->y()
+		+ oblivionListenTop
+		+ (_oblivionListenBar ? _oblivionListenBar->height() : 0);
 	_topBars->resize(
 		innerWidth,
 		scrollAreaTop - _topBars->y() + st::lineWidth);
@@ -8209,6 +8230,9 @@ void HistoryWidget::updateHistoryGeometry(
 	}
 	if (_businessBotStatus) {
 		newScrollHeight -= _businessBotStatus->bar().height();
+	}
+	if (_oblivionListenBar) { // Oblivion.
+		newScrollHeight -= _oblivionListenBar->height();
 	}
 	if (isChoosingTheme()) {
 		newScrollHeight -= _chooseTheme->height();

@@ -36,6 +36,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_account.h" // session->account().sessionChanges().
 #include "main/main_session_settings.h"
 #include "storage/storage_account.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_playlists.h"
 
 namespace Media {
@@ -556,6 +557,11 @@ bool Instance::moveInPlaylist(
 		not_null<Data*> data,
 		int delta,
 		bool autonext) {
+	// Oblivion: listening together, only the host switches the tracks.
+	if (data->type == AudioMsgId::Type::Song
+		&& Oblivion::Listen::Follows(data->current)) {
+		return Oblivion::Listen::FollowerMove(delta, autonext);
+	}
 	if (data->type == AudioMsgId::Type::Song
 		&& Oblivion::PlaylistDrivesPlayer(data->current)) {
 		return Oblivion::PlaylistPlayerMove(delta, autonext);
@@ -753,6 +759,10 @@ bool Instance::previousAvailable(AudioMsgId::Type type) const {
 	Assert(data != nullptr);
 
 	if (type == AudioMsgId::Type::Song
+		&& Oblivion::Listen::Follows(data->current)) { // Oblivion
+		return false;
+	}
+	if (type == AudioMsgId::Type::Song
 		&& Oblivion::PlaylistDrivesPlayer(data->current)) {
 		return Oblivion::PlaylistPlayerCanMove(-1);
 	}
@@ -773,6 +783,10 @@ bool Instance::nextAvailable(AudioMsgId::Type type) const {
 	const auto data = getData(type);
 	Assert(data != nullptr);
 
+	if (type == AudioMsgId::Type::Song
+		&& Oblivion::Listen::Follows(data->current)) { // Oblivion
+		return false;
+	}
 	if (type == AudioMsgId::Type::Song
 		&& Oblivion::PlaylistDrivesPlayer(data->current)) {
 		return Oblivion::PlaylistPlayerCanMove(1);
@@ -806,6 +820,9 @@ rpl::producer<> Media::Player::Instance::playlistChanges(
 		repeatChanges(data) | rpl::to_empty,
 		((type == AudioMsgId::Type::Song)
 			? Oblivion::PlaylistPlayerChanges()
+			: rpl::never<>()),
+		((type == AudioMsgId::Type::Song)
+			? Oblivion::Listen::FollowChanges() // Oblivion
 			: rpl::never<>()));
 }
 
@@ -928,8 +945,15 @@ Streaming::PlaybackOptions Instance::streamingOptions(
 		: Streaming::Mode::Audio;
 	result.speed = LookupPlaybackSpeed(audioId);
 	result.audioId = audioId;
+
+	// Oblivion: a listener starts the track where the host is now.
+	const auto oblivionFrom = (position < 0)
+		? Oblivion::Listen::TakeStartPosition(audioId)
+		: crl::time(-1);
 	if (position >= 0) {
 		result.position = position;
+	} else if (oblivionFrom >= 0) {
+		result.position = oblivionFrom;
 	} else if (document) {
 		auto &local = document->session().local();
 		result.position = local.mediaLastPlaybackPosition(document->id);

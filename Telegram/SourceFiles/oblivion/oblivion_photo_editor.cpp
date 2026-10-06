@@ -7,14 +7,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_photo_editor.h"
 
-#include "base/timer.h"
 #include "base/unique_qptr.h"
-#include "base/weak_ptr.h"
+#include "core/application.h"
 #include "core/file_utilities.h"
 #include "core/shortcuts.h"
 #include "lang/lang_keys.h"
 #include "oblivion/oblivion_photo_editor_canvas.h"
 #include "oblivion/oblivion_photo_editor_controls.h"
+#include "oblivion/oblivion_photo_panels.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "oblivion/oblivion_vision.h"
 #include "ui/boxes/confirm_box.h"
@@ -48,10 +48,19 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <crl/crl_async.h>
 
+#include <QtCore/QCoreApplication>
 #include <QtCore/QFileInfo>
+#include <QtCore/QMimeData>
+#include <QtCore/QPointer>
 #include <QtGui/QClipboard>
+#include <QtGui/QDragEnterEvent>
+#include <QtGui/QDropEvent>
 #include <QtGui/QGuiApplication>
+#include <QtGui/QPainterPath>
 #include <QtGui/QScreen>
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QTextEdit>
 
 #include <array>
 
@@ -101,6 +110,7 @@ constexpr auto kBusyPlateSkip = 20;
 
 constexpr auto kBusySlowHintDelay = crl::time(4000);
 constexpr auto kCommitDelay = crl::time(600);
+constexpr auto kCommitDelayMax = crl::time(2000);
 constexpr auto kDetailDelay = crl::time(150);
 constexpr auto kThumbsDelay = crl::time(250);
 constexpr auto kHistoryLimit = 200;
@@ -135,6 +145,40 @@ constexpr auto kRatioPresets = std::array<RatioPreset, 9>{ {
 	{ 16, 9 },
 	{ 9, 16 },
 } };
+
+constexpr auto kTabCount = 8;
+constexpr auto kToolStripButton = 40;
+constexpr auto kToolStripSkip = 2;
+constexpr auto kToolStripPadding = 6;
+constexpr auto kToolStripGap = 8;
+constexpr auto kToolStripGroupGap = 9;
+constexpr auto kToolStripSeparatorInset = 8;
+constexpr auto kLayersPercent = 36;
+constexpr auto kLayersMin = 150;
+constexpr auto kLayersMax = 320;
+constexpr auto kLayersCompactMin = 84; // A header and one row.
+constexpr auto kLayersSkip = 8;
+constexpr auto kPagesMin = 170;
+constexpr auto kPagesFade = 28;
+constexpr auto kSceneSettle = crl::time(700);
+constexpr auto kImportLimit = 12;
+constexpr auto kThumbnailRound = 8;
+constexpr auto kThumbnailOversample = 8;
+constexpr auto kHeldKeyFirstWait = crl::time(2000);
+constexpr auto kHeldKeyRepeatWait = crl::time(600);
+constexpr auto kBackgroundLostAfter = crl::time(180) * 1000;
+
+// The pause before a change becomes an undo step is longer than a double
+// click of this system takes: the editors that reset a value by a double
+// click (the tone curve, the color wheels) change it with the first click
+// already, and that must not be a step of its own. Not longer than
+// kCommitDelayMax for the systems where a double click may take seconds.
+[[nodiscard]] crl::time CommitDelay() {
+	return std::clamp(
+		crl::time(QApplication::doubleClickInterval()) + 50,
+		kCommitDelay,
+		kCommitDelayMax);
+}
 
 [[nodiscard]] EditState GeometryOnly(const EditState &state) {
 	auto result = EditState();
@@ -265,13 +309,40 @@ constexpr auto kRatioPresets = std::array<RatioPreset, 9>{ {
 	}
 #ifdef Q_OS_MAC
 	switch (e->nativeVirtualKey()) {
-	case 0x06: return Qt::Key_Z;
-	case 0x10: return Qt::Key_Y;
+	case 0x00: return Qt::Key_A;
 	case 0x01: return Qt::Key_S;
+	case 0x02: return Qt::Key_D;
+	case 0x03: return Qt::Key_F;
+	case 0x04: return Qt::Key_H;
+	case 0x05: return Qt::Key_G;
+	case 0x06: return Qt::Key_Z;
+	case 0x07: return Qt::Key_X;
 	case 0x08: return Qt::Key_C;
+	case 0x09: return Qt::Key_V;
+	case 0x0B: return Qt::Key_B;
+	case 0x0C: return Qt::Key_Q;
+	case 0x0D: return Qt::Key_W;
+	case 0x0E: return Qt::Key_E;
+	case 0x0F: return Qt::Key_R;
+	case 0x10: return Qt::Key_Y;
+	case 0x11: return Qt::Key_T;
+	case 0x1F: return Qt::Key_O;
+	case 0x20: return Qt::Key_U;
+	case 0x22: return Qt::Key_I;
+	case 0x23: return Qt::Key_P;
+	case 0x25: return Qt::Key_L;
+	case 0x26: return Qt::Key_J;
+	case 0x28: return Qt::Key_K;
+	case 0x2D: return Qt::Key_N;
+	case 0x2E: return Qt::Key_M;
 	case 0x2A: return Qt::Key_Backslash;
 	}
-#endif // Q_OS_MAC
+#elif defined Q_OS_WIN // Q_OS_MAC
+	const auto native = int(e->nativeVirtualKey());
+	if (native >= 'A' && native <= 'Z') {
+		return Qt::Key_A + (native - 'A');
+	}
+#endif // Q_OS_MAC || Q_OS_WIN
 	return key;
 }
 
@@ -289,6 +360,569 @@ template <typename Compute>
 	return style::margins(padding, top, padding, 0);
 }
 
+// The best scale of the layers for a render that must give this many
+// pixels of an output that is fullOutput at the scale 1: rounded up to
+// a step of sqrt(2), so slight zoom changes reuse the compositor caches.
+[[nodiscard]] double ScaleForOutput(QSize needed, QSize fullOutput) {
+	if (fullOutput.isEmpty() || needed.isEmpty()) {
+		return 1.;
+	}
+	const auto raw = std::max(
+		needed.width() / double(fullOutput.width()),
+		needed.height() / double(fullOutput.height()));
+	if (raw >= 1.) {
+		return 1.;
+	}
+	return std::min(
+		std::pow(2., std::ceil(std::log2(std::max(raw, 1e-4)) * 2.) / 2.),
+		1.);
+}
+
+[[nodiscard]] QStringList ImagePaths(not_null<const QMimeData*> data) {
+	auto result = QStringList();
+	if (!data->hasUrls()) {
+		return result;
+	}
+	for (const auto &url : data->urls()) {
+		if (!url.isLocalFile()) {
+			continue;
+		}
+		const auto path = url.toLocalFile();
+		const auto suffix = QFileInfo(path).suffix().toLower();
+		static const auto kSuffixes = QStringList{
+			u"png"_q,
+			u"jpg"_q,
+			u"jpeg"_q,
+			u"webp"_q,
+			u"bmp"_q,
+			u"gif"_q,
+			u"tif"_q,
+			u"tiff"_q,
+			u"heic"_q,
+			u"heif"_q,
+			u"avif"_q,
+		};
+		if (kSuffixes.contains(suffix)) {
+			result.push_back(path);
+		}
+	}
+	return result;
+}
+
+// The document on a canvas of another size, the old canvas in the middle
+// of the new one, shifted by whole pixels: what CanvasResized() does, but
+// for any size (a canvas made by another tool may be out of its limits)
+// and without touching Document::global.
+[[nodiscard]] Document OnCanvas(Document document, QSize size) {
+	if (document.empty() || size.isEmpty() || document.size == size) {
+		return document;
+	}
+	const auto shift = QPointF(
+		std::round((size.width() - document.size.width()) * 0.5),
+		std::round((size.height() - document.size.height()) * 0.5));
+	document.size = size;
+	if (!shift.isNull()) {
+		const auto move = QTransform::fromTranslate(shift.x(), shift.y());
+		for (auto &layer : document.layers) {
+			layer.transform = layer.transform * move;
+		}
+	}
+	return document;
+}
+
+// The pixels of a layer scaled down to a thumbnail so that thin things
+// stay visible: a pixel of the result has the average color of its block
+// and the largest opacity found there. A few strokes on a large drawing
+// layer are still lines then (a smooth scale fades them to nothing), an
+// opaque photo comes out as the plain average.
+[[nodiscard]] QImage LayerThumbnail(const QImage &pixels, QSize size) {
+	const auto source = (pixels.isNull()
+		|| pixels.format() == QImage::Format_ARGB32_Premultiplied)
+		? pixels
+		: pixels.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+	const auto target = (source.isNull() || size.isEmpty())
+		? QSize()
+		: FitSize(source.size(), size);
+	if (target.isEmpty()) {
+		return QImage();
+	} else if (target == source.size()) {
+		return source;
+	}
+	auto result = QImage(target, QImage::Format_ARGB32_Premultiplied);
+	if (result.isNull()) {
+		return QImage();
+	}
+	const auto fromWidth = qint64(source.width());
+	const auto fromHeight = qint64(source.height());
+	for (auto y = 0; y != target.height(); ++y) {
+		const auto top = int(y * fromHeight / target.height());
+		const auto bottom = std::max(
+			int((y + 1) * fromHeight / target.height()),
+			top + 1);
+		const auto to = reinterpret_cast<uint32*>(result.scanLine(y));
+		for (auto x = 0; x != target.width(); ++x) {
+			const auto left = int(x * fromWidth / target.width());
+			const auto right = std::max(
+				int((x + 1) * fromWidth / target.width()),
+				left + 1);
+			auto alpha = uint64(0);
+			auto red = uint64(0);
+			auto green = uint64(0);
+			auto blue = uint64(0);
+			auto strongest = uint64(0);
+			for (auto line = top; line != bottom; ++line) {
+				const auto from = reinterpret_cast<const uint32*>(
+					source.constScanLine(line));
+				for (auto column = left; column != right; ++column) {
+					const auto pixel = from[column];
+					const auto opacity = uint64(pixel >> 24);
+					alpha += opacity;
+					red += (pixel >> 16) & 0xFFU;
+					green += (pixel >> 8) & 0xFFU;
+					blue += pixel & 0xFFU;
+					strongest = std::max(strongest, opacity);
+				}
+			}
+			to[x] = !alpha
+				? uint32(0)
+				: ((uint32(strongest) << 24)
+					| (uint32(red * strongest / alpha) << 16)
+					| (uint32(green * strongest / alpha) << 8)
+					| uint32(blue * strongest / alpha));
+		}
+	}
+	result.setDevicePixelRatio(1.);
+	return result;
+}
+
+// A key that is held when the editor closes (Cmd+Enter of "Done", Enter
+// in the question about closing, Escape) goes on repeating into whatever
+// gets the focus next. Under the editor that may be the send files box:
+// the repeats would send its files, or close it and drop them. So the
+// repeats of Enter and Escape are swallowed until the key is released or
+// something is pressed anew. There is no release event for a key pressed
+// together with Cmd on macOS, so a pause in the repeats ends it as well.
+// The guard lives on its own: the editor is destroyed long before.
+class HeldKeyGuard final : public QObject {
+public:
+	explicit HeldKeyGuard(not_null<QObject*> application);
+
+	void arm();
+	[[nodiscard]] bool finished() const;
+
+protected:
+	bool eventFilter(QObject *watched, QEvent *e) override;
+
+private:
+	void finish();
+
+	base::Timer _timer;
+	crl::time _lastRepeat = 0;
+	bool _finished = false;
+
+};
+
+HeldKeyGuard::HeldKeyGuard(not_null<QObject*> application)
+: QObject(application)
+, _timer([=] { finish(); }) {
+	application->installEventFilter(this);
+}
+
+void HeldKeyGuard::arm() {
+	_lastRepeat = 0;
+	_timer.callOnce(kHeldKeyFirstWait);
+}
+
+bool HeldKeyGuard::finished() const {
+	return _finished;
+}
+
+void HeldKeyGuard::finish() {
+	if (std::exchange(_finished, true)) {
+		return;
+	}
+	_timer.cancel();
+	if (const auto application = parent()) {
+		application->removeEventFilter(this);
+	}
+	deleteLater();
+}
+
+bool HeldKeyGuard::eventFilter(QObject *watched, QEvent *e) {
+	const auto type = e->type();
+	if (_finished
+		|| (type != QEvent::KeyPress && type != QEvent::KeyRelease)) {
+		return false;
+	}
+	const auto event = static_cast<QKeyEvent*>(e);
+	const auto key = event->key();
+	const auto guarded = (key == Qt::Key_Return)
+		|| (key == Qt::Key_Enter)
+		|| (key == Qt::Key_Escape);
+	const auto modifier = (key == Qt::Key_Shift)
+		|| (key == Qt::Key_Control)
+		|| (key == Qt::Key_Meta)
+		|| (key == Qt::Key_Alt)
+		|| (key == Qt::Key_AltGr)
+		|| (key == Qt::Key_CapsLock);
+	if (type == QEvent::KeyRelease) {
+		// Windows and X11 send a release with every repeat.
+		if (guarded && !event->isAutoRepeat()) {
+			finish();
+		}
+		return false;
+	} else if (!event->isAutoRepeat()) {
+		// A modifier pressed or released doesn't stop the repeats.
+		if (!modifier) {
+			finish();
+		}
+		return false;
+	} else if (!guarded) {
+		return false;
+	}
+	// The first repeat comes after the system delay, the next ones at
+	// the system rate, both may be set slow.
+	const auto now = crl::now();
+	const auto wait = _lastRepeat
+		? std::clamp(
+			(now - _lastRepeat) * 3,
+			kHeldKeyRepeatWait,
+			2 * kHeldKeyFirstWait)
+		: kHeldKeyFirstWait;
+	_lastRepeat = now;
+	_timer.callOnce(wait);
+	return true;
+}
+
+void GuardHeldKeys() {
+	static auto Guard = QPointer<HeldKeyGuard>();
+	const auto application = QCoreApplication::instance();
+	if (!application) {
+		return;
+	} else if (!Guard || Guard->finished()) {
+		Guard = new HeldKeyGuard(application);
+	}
+	Guard->arm();
+}
+
+// See InterruptedPhotoEdit. It is never destroyed: the document may hold
+// contents of other modules to the very end, when what they rely on may
+// be gone already.
+struct InterruptedSlot {
+	InterruptedPhotoEdit edit;
+	int id = 0;
+	int lastId = 0;
+};
+
+[[nodiscard]] InterruptedSlot &Interrupted() {
+	static const auto result = new InterruptedSlot();
+	return *result;
+}
+
+// The pure parts of the shell, a sub-test of OBLIVION_SELFTEST=photo_doc.
+bool RunShellSelfTest(QStringList &log) {
+	auto ok = true;
+	const auto check = [&](bool condition, const QString &what) {
+		log.push_back((condition ? u"OK: "_q : u"FAIL: "_q) + what);
+		ok = ok && condition;
+	};
+	const auto alphaRange = [](const QImage &image) {
+		auto low = 255;
+		auto high = 0;
+		for (auto y = 0; y != image.height(); ++y) {
+			const auto line = reinterpret_cast<const uint32*>(
+				image.constScanLine(y));
+			for (auto x = 0; x != image.width(); ++x) {
+				low = std::min(low, int(line[x] >> 24));
+				high = std::max(high, int(line[x] >> 24));
+			}
+		}
+		return std::pair(low, high);
+	};
+
+	// Layer thumbnails.
+	{
+		auto drawing = QImage(1200, 900, QImage::Format_ARGB32_Premultiplied);
+		drawing.fill(Qt::transparent);
+		for (auto y = 300; y != 303; ++y) {
+			const auto line = reinterpret_cast<uint32*>(drawing.scanLine(y));
+			for (auto x = 100; x != 1100; ++x) {
+				line[x] = 0xFFE53935U;
+			}
+		}
+		const auto thumbnail = LayerThumbnail(drawing, QSize(60, 60));
+		const auto stroke = thumbnail.isNull()
+			? QRgb(0)
+			: thumbnail.pixel(30, 15);
+		check(
+			(thumbnail.size() == QSize(60, 45))
+				&& (thumbnail.format() == QImage::Format_ARGB32_Premultiplied)
+				&& (stroke == qRgba(0xE5, 0x39, 0x35, 0xFF))
+				&& (qAlpha(thumbnail.pixel(30, 5)) == 0)
+				&& (qAlpha(thumbnail.pixel(2, 15)) == 0),
+			u"shell: a 3 px stroke on a large layer stays in its thumbnail"_q);
+
+		const auto photo = FxTestImage(640, 480);
+		const auto small = LayerThumbnail(photo, QSize(60, 60));
+		const auto difference = small.isNull()
+			? 255.
+			: FxImageDifference(small, FxResized(photo, small.size()));
+		check(
+			(small.size() == QSize(60, 45))
+				&& (alphaRange(small) == std::pair(255, 255))
+				&& (difference < 16.),
+			u"shell: the thumbnail of a photo is the photo (differs by %1)"_q.arg(
+				QString::number(difference, 'f', 2)));
+		check(
+			LayerThumbnail(QImage(), QSize(60, 60)).isNull()
+				&& LayerThumbnail(photo, QSize()).isNull()
+				&& (LayerThumbnail(small, QSize(60, 60)).size()
+					== small.size()),
+			u"shell: thumbnails of nothing and of a small picture"_q);
+	}
+
+	// The original on the canvas of the result, for the comparison.
+	{
+		auto document = DocumentFromImage(FxTestImage(64, 48), EditState());
+		auto layer = MakeImageLayer(FxTestImage(20, 10), u"over"_q);
+		layer.transform = QTransform::fromTranslate(7., 9.);
+		AddLayer(document, std::move(layer));
+		document.global.contrast = 15;
+		const auto size = QSize(101, 77);
+		const auto expected = CanvasResized(document, size);
+		const auto moved = OnCanvas(document, size);
+		check(
+			(moved.size == size)
+				&& (moved.size == expected.size)
+				&& (moved.layers == expected.layers)
+				&& (moved.global == document.global),
+			u"shell: the original is put on a resized canvas like the edit"_q);
+		const auto beyond = QSize(20000, 9);
+		check(
+			(OnCanvas(document, beyond).size == beyond)
+				&& (OnCanvas(document, document.size) == document)
+				&& OnCanvas(Document(), size).empty(),
+			u"shell: any canvas size is taken as it is"_q);
+	}
+
+	// The edit kept from an interrupted editor.
+	if (!InterruptedPhotoEditId()) {
+		const auto document = std::make_shared<const Document>(
+			DocumentFromImage(FxTestImage(32, 24), EditState()));
+		const auto first = KeepInterruptedPhotoEdit({
+			.document = document,
+			.fileName = u"first"_q,
+		});
+		const auto second = KeepInterruptedPhotoEdit({
+			.document = document,
+			.fileName = u"second"_q,
+		});
+		DropInterruptedPhotoEdit(first);
+		const auto stays = (InterruptedPhotoEditId() == second);
+		const auto taken = TakeInterruptedPhotoEdit();
+		check(
+			first
+				&& second
+				&& (first != second)
+				&& stays
+				&& (taken.document == document)
+				&& (taken.fileName == u"second"_q)
+				&& !InterruptedPhotoEditId()
+				&& !TakeInterruptedPhotoEdit().document,
+			u"shell: the latest interrupted edit is kept till it is taken"_q);
+		const auto empty = KeepInterruptedPhotoEdit({});
+		const auto third = KeepInterruptedPhotoEdit({ .document = document });
+		const auto kept = (InterruptedPhotoEditId() == third);
+		DropInterruptedPhotoEdit();
+		check(
+			!empty && third && kept && !InterruptedPhotoEditId(),
+			u"shell: an interrupted edit is dropped, an empty one is not kept"_q);
+	}
+	return ok;
+}
+
+const auto ShellSelfTest = SelfTestRegistrar(
+	SelfTestSuite::Doc,
+	"shell",
+	&RunShellSelfTest);
+
+void PaintViewToolIcon(QPainter &p, QRectF rect, QColor color) {
+	auto path = QPainterPath();
+	path.moveTo(6.5, 3.5);
+	path.lineTo(6.5, 19.);
+	path.lineTo(10.4, 15.4);
+	path.lineTo(13.1, 21.);
+	path.lineTo(15.5, 19.9);
+	path.lineTo(12.9, 14.4);
+	path.lineTo(18., 14.4);
+	path.closeSubpath();
+	p.translate(rect.topLeft());
+	p.scale(rect.width() / 24., rect.height() / 24.);
+	p.setPen(Qt::NoPen);
+	p.setBrush(color);
+	p.drawPath(path);
+}
+
+// The usual sign of cropping, two corners that cross each other: the
+// style icon used before (a sheet with a mark for "aspect ratio") said
+// nothing while the tab shows no label.
+void PaintCropIcon(QPainter &p, QRectF rect, QColor color) {
+	p.translate(rect.topLeft());
+	p.scale(rect.width() / 24., rect.height() / 24.);
+	auto pen = QPen(color, 1.6);
+	pen.setJoinStyle(Qt::RoundJoin);
+	pen.setCapStyle(Qt::RoundCap);
+	p.setPen(pen);
+	p.setBrush(Qt::NoBrush);
+	auto first = QPainterPath();
+	first.moveTo(7.5, 3.5);
+	first.lineTo(7.5, 16.5);
+	first.lineTo(20.5, 16.5);
+	p.drawPath(first);
+	auto second = QPainterPath();
+	second.moveTo(3.5, 7.5);
+	second.lineTo(16.5, 7.5);
+	second.lineTo(16.5, 20.5);
+	p.drawPath(second);
+}
+
+void PaintSheetsIcon(QPainter &p, QRectF rect, QColor color, int sheets) {
+	p.translate(rect.topLeft());
+	p.scale(rect.width() / 24., rect.height() / 24.);
+	auto pen = QPen(color, 1.6);
+	pen.setJoinStyle(Qt::RoundJoin);
+	pen.setCapStyle(Qt::RoundCap);
+	p.setPen(pen);
+	const auto step = (sheets > 2) ? 4. : 5.;
+	const auto top = (sheets > 2) ? 3.5 : 5.;
+	for (auto i = sheets; i != 0;) {
+		--i;
+		const auto y = top + i * step;
+		auto sheet = QPainterPath();
+		sheet.moveTo(12., y);
+		sheet.lineTo(20., y + 4.5);
+		sheet.lineTo(12., y + 9.);
+		sheet.lineTo(4., y + 4.5);
+		sheet.closeSubpath();
+		p.setBrush((i == 0)
+			? QBrush(anim::with_alpha(color, 0.28))
+			: QBrush(Qt::NoBrush));
+		if (i == 0) {
+			p.drawPath(sheet);
+		} else {
+			auto edge = QPainterPath();
+			edge.moveTo(20., y + 4.5);
+			edge.lineTo(12., y + 9.);
+			edge.lineTo(4., y + 4.5);
+			p.setBrush(Qt::NoBrush);
+			p.drawPath(edge);
+		}
+	}
+}
+
+void PaintImageKindIcon(QPainter &p, QRectF rect, QColor color) {
+	p.translate(rect.topLeft());
+	p.scale(rect.width() / 24., rect.height() / 24.);
+	auto pen = QPen(color, 1.6);
+	pen.setJoinStyle(Qt::RoundJoin);
+	pen.setCapStyle(Qt::RoundCap);
+	p.setPen(pen);
+	p.setBrush(Qt::NoBrush);
+	p.drawRoundedRect(QRectF(4., 5., 16., 14.), 2.5, 2.5);
+	auto hills = QPainterPath();
+	hills.moveTo(5.5, 16.5);
+	hills.lineTo(10., 11.5);
+	hills.lineTo(13., 14.5);
+	hills.lineTo(15.5, 12.5);
+	hills.lineTo(18.5, 16.);
+	p.drawPath(hills);
+	p.setPen(Qt::NoPen);
+	p.setBrush(color);
+	p.drawEllipse(QPointF(15.5, 9.), 1.4, 1.4);
+}
+
+struct EditorRegistry {
+	std::vector<std::unique_ptr<ToolDescriptor>> tools;
+	std::vector<const ToolDescriptor*> sortedTools;
+	std::vector<std::unique_ptr<PanelDescriptor>> panels;
+	std::vector<const PanelDescriptor*> sortedPanels;
+	std::vector<std::unique_ptr<LayerKindDescriptor>> kinds;
+	std::vector<const LayerKindDescriptor*> sortedKinds;
+	bool built = false;
+	bool building = false;
+};
+
+[[nodiscard]] std::vector<Fn<void()>> &EditorRegistrars() {
+	static auto result = std::vector<Fn<void()>>();
+	return result;
+}
+
+[[nodiscard]] EditorRegistry &EditorRegistryData() {
+	static auto result = EditorRegistry();
+	return result;
+}
+
+[[nodiscard]] const EditorRegistry &BuiltEditorRegistry() {
+	auto &result = EditorRegistryData();
+	if (result.built) {
+		return result;
+	}
+	result.built = true;
+	result.building = true;
+	RegisterLayerKind({
+		.type = "image",
+		.name = tr::lng_oblivion_photo_panel_layer_photo,
+		.order = -100,
+		.paintIcon = PaintImageKindIcon,
+		.create = [](not_null<Controller*> controller) {
+			controller->chooseAndImport();
+		},
+	});
+	for (const auto &callback : EditorRegistrars()) {
+		if (callback) {
+			callback();
+		}
+	}
+	result.building = false;
+	for (const auto &tool : result.tools) {
+		result.sortedTools.push_back(tool.get());
+	}
+	std::stable_sort(
+		begin(result.sortedTools),
+		end(result.sortedTools),
+		[](const ToolDescriptor *a, const ToolDescriptor *b) {
+			return a->order < b->order;
+		});
+	for (const auto &panel : result.panels) {
+		result.sortedPanels.push_back(panel.get());
+	}
+	std::stable_sort(
+		begin(result.sortedPanels),
+		end(result.sortedPanels),
+		[](const PanelDescriptor *a, const PanelDescriptor *b) {
+			return a->order < b->order;
+		});
+	for (const auto &kind : result.kinds) {
+		result.sortedKinds.push_back(kind.get());
+	}
+	std::stable_sort(
+		begin(result.sortedKinds),
+		end(result.sortedKinds),
+		[](const LayerKindDescriptor *a, const LayerKindDescriptor *b) {
+			return a->order < b->order;
+		});
+	return result;
+}
+
+struct RenderKey {
+	uint64 revision = 0;
+	bool uncropped = false;
+
+	friend bool operator==(
+		const RenderKey &a,
+		const RenderKey &b) = default;
+};
+
 // Renders previews off the main thread, one at a time. A request made
 // while a render is running replaces the pending one (the latest wins),
 // the running render is not cancelled, so a continuous stream of
@@ -300,35 +934,40 @@ template <typename Compute>
 // order, cancelled renders don't come back at all.
 class PreviewRenderer final : public base::has_weak_ptr {
 public:
+	struct Request {
+		Document document;
+		double scale = 1.;
+		QSize size;
+		LayerId active = 0;
+		RenderKey key;
+		bool cancellable = false;
+	};
 	struct Result {
 		QImage image;
-		EditState state;
+		RenderKey key;
 		QSize size;
+		QSize frame;
 		uint64 id = 0;
 	};
 
-	explicit PreviewRenderer(Fn<void(Result)> done);
+	PreviewRenderer(
+		std::shared_ptr<Compositor> compositor,
+		Fn<void(Result)> done);
 	~PreviewRenderer();
 
-	uint64 request(
-		QImage source,
-		EditState state,
-		QSize size,
-		bool cancellable = false);
+	uint64 request(Request request);
 	[[nodiscard]] uint64 lastId() const;
 
 private:
 	struct Job {
-		QImage source;
-		EditState state;
-		QSize size;
+		Request request;
 		uint64 id = 0;
-		bool cancellable = false;
 	};
 
 	void start(Job job);
 	void finished(Result result);
 
+	const std::shared_ptr<Compositor> _compositor;
 	const Fn<void(Result)> _done;
 	std::optional<Job> _pending;
 	std::optional<Job> _pendingAfter; // Cancellable, after _pending.
@@ -339,8 +978,11 @@ private:
 
 };
 
-PreviewRenderer::PreviewRenderer(Fn<void(Result)> done)
-: _done(std::move(done)) {
+PreviewRenderer::PreviewRenderer(
+	std::shared_ptr<Compositor> compositor,
+	Fn<void(Result)> done)
+: _compositor(std::move(compositor))
+, _done(std::move(done)) {
 }
 
 PreviewRenderer::~PreviewRenderer() {
@@ -349,17 +991,11 @@ PreviewRenderer::~PreviewRenderer() {
 	}
 }
 
-uint64 PreviewRenderer::request(
-		QImage source,
-		EditState state,
-		QSize size,
-		bool cancellable) {
+uint64 PreviewRenderer::request(Request request) {
+	const auto cancellable = request.cancellable;
 	auto job = Job{
-		.source = std::move(source),
-		.state = std::move(state),
-		.size = size,
+		.request = std::move(request),
 		.id = ++_counter,
-		.cancellable = cancellable,
 	};
 	const auto id = job.id;
 	if (_running) {
@@ -367,7 +1003,7 @@ uint64 PreviewRenderer::request(
 			// finished() gets a null image soon and starts the pending job.
 			_cancel->store(true);
 		}
-		if (cancellable && _pending && !_pending->cancellable) {
+		if (cancellable && _pending && !_pending->request.cancellable) {
 			// The latest regular preview is shown before the slow one.
 			_pendingAfter = std::move(job);
 		} else {
@@ -386,21 +1022,34 @@ uint64 PreviewRenderer::lastId() const {
 
 void PreviewRenderer::start(Job job) {
 	_running = true;
-	_runningCancellable = job.cancellable;
+	_runningCancellable = job.request.cancellable;
 	_cancel = std::make_shared<std::atomic<bool>>(false);
 	crl::async([
 			weak = base::make_weak(this),
 			cancel = _cancel,
+			compositor = _compositor,
 			job = std::move(job)]() mutable {
-		auto image = Render(job.source, job.state, job.size, cancel.get());
-		crl::on_main(weak, [=, image = std::move(image)]() mutable {
+		const auto &request = job.request;
+		auto image = compositor->render(request.document, {
+			.scale = request.scale,
+			.maxSize = request.size,
+			.preview = (request.scale < 1.),
+			.active = request.active,
+			.cancel = cancel.get(),
+		});
+		auto result = Result{
+			.image = std::move(image),
+			.key = request.key,
+			.size = request.size,
+			.frame = OutputSize(request.document),
+			.id = job.id,
+		};
+		crl::on_main(weak, [=, result = std::move(result)]() mutable {
 			// The render could pass its last check before it was cancelled.
-			weak->finished({
-				.image = cancel->load() ? QImage() : std::move(image),
-				.state = job.state,
-				.size = job.size,
-				.id = job.id,
-			});
+			if (cancel->load()) {
+				result.image = QImage();
+			}
+			weak->finished(std::move(result));
 		});
 	});
 }
@@ -607,6 +1256,219 @@ void BusyOverlay::paintEvent(QPaintEvent *e) {
 	}
 }
 
+// The column of the canvas tools at the left of the canvas: the built-in
+// view tool, then the registered ones. More tools than fit in one column
+// continue in the next one.
+class ToolStrip final : public Ui::RpWidget {
+public:
+	ToolStrip(QWidget *parent, not_null<Controller*> controller);
+
+	[[nodiscard]] int widthForHeight(int height) const;
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+	void resizeEvent(QResizeEvent *e) override;
+
+private:
+	struct Entry {
+		QByteArray id;
+		const ToolDescriptor *descriptor = nullptr;
+		not_null<ToolButton*> button;
+		// Tools of one kind stand together: the view and the layer tools,
+		// the drawing ones, the collage. A thin line parts the groups.
+		int group = 0;
+	};
+	struct Place {
+		int column = 0;
+		int top = 0;
+		bool separated = false; // A line of another group is above.
+	};
+	struct Arrangement {
+		std::vector<Place> places;
+		int columns = 1;
+		int bottom = 0; // Of the lowest button.
+	};
+
+	[[nodiscard]] Arrangement placementFor(int height) const;
+	void refresh();
+
+	const not_null<Controller*> _controller;
+	std::vector<Entry> _entries;
+
+};
+
+ToolStrip::ToolStrip(QWidget *parent, not_null<Controller*> controller)
+: RpWidget(parent)
+, _controller(controller) {
+	const auto size = Px(kToolStripButton);
+	const auto add = [&](
+			QByteArray id,
+			const ToolDescriptor *descriptor,
+			IconRef icon,
+			QString tooltip) {
+		const auto button = Ui::CreateChild<ToolButton>(
+			this,
+			std::move(icon),
+			size);
+		button->setTooltip(std::move(tooltip));
+		button->setClickedCallback([=] {
+			_controller->setTool(id);
+		});
+		button->show();
+		// Orders: under 20 the layer tools, 20.. drawing, 60.. collage.
+		const auto order = descriptor ? descriptor->order : 0;
+		_entries.push_back({
+			.id = id,
+			.descriptor = descriptor,
+			.button = button,
+			.group = (order < 20) ? 0 : (order / 10),
+		});
+	};
+	add(
+		kViewTool,
+		nullptr,
+		IconRef{ .paint = PaintViewToolIcon },
+		tr::lng_oblivion_photo_panel_tool_view(tr::now));
+	for (const auto descriptor : AllTools()) {
+		auto tooltip = descriptor->name.now();
+		if (descriptor->key) {
+			tooltip = WithShortcut(tooltip, QKeySequence(descriptor->key));
+		}
+		add(
+			descriptor->id,
+			descriptor,
+			IconRef{ .paint = descriptor->paintIcon },
+			std::move(tooltip));
+	}
+	rpl::merge(
+		_controller->documentChanges(),
+		_controller->activeLayerValue() | rpl::to_empty,
+		_controller->toolValue() | rpl::to_empty
+	) | rpl::on_next([=] {
+		refresh();
+	}, lifetime());
+	refresh();
+}
+
+void ToolStrip::refresh() {
+	const auto current = _controller->toolId();
+	for (const auto &entry : _entries) {
+		entry.button->setActive(entry.id == current);
+		entry.button->setAvailable(!entry.descriptor
+			|| !entry.descriptor->available
+			|| entry.descriptor->available(_controller.get()));
+	}
+}
+
+// Buttons go down the column, a group that starts in the middle of
+// a column gets a gap (with a line) above it, what doesn't fit continues
+// at the top of the next column.
+ToolStrip::Arrangement ToolStrip::placementFor(int height) const {
+	const auto size = Px(kToolStripButton);
+	const auto skip = Px(kToolStripSkip);
+	const auto padding = Px(kToolStripPadding);
+	const auto gap = Px(kToolStripGroupGap);
+	const auto limit = std::max(height - padding, padding + size);
+	const auto total = int(_entries.size());
+	const auto place = [&](int perColumn) {
+		auto result = Arrangement();
+		result.places.reserve(total);
+		auto column = 0;
+		auto inColumn = 0;
+		auto top = padding;
+		for (auto i = 0; i != total; ++i) {
+			auto separated = (i > 0)
+				&& (inColumn > 0)
+				&& (_entries[i].group != _entries[i - 1].group);
+			if (inColumn > 0
+				&& ((inColumn >= perColumn)
+					|| (top + (separated ? gap : 0) + size > limit))) {
+				++column;
+				inColumn = 0;
+				top = padding;
+				separated = false;
+			}
+			if (separated) {
+				top += gap;
+			}
+			result.places.push_back({
+				.column = column,
+				.top = top,
+				.separated = separated,
+			});
+			result.bottom = std::max(result.bottom, top + size);
+			top += size + skip;
+			++inColumn;
+		}
+		result.columns = column + 1;
+		return result;
+	};
+	auto result = place(std::max(total, 1));
+	if (result.columns > 1) {
+		// The same number of columns, but of an even height: a full column
+		// next to a short tail of the last tools looked accidental.
+		const auto columns = result.columns;
+		auto even = place((total + columns - 1) / columns);
+		if (even.columns == columns) {
+			result = std::move(even);
+		}
+	}
+	return result;
+}
+
+int ToolStrip::widthForHeight(int height) const {
+	const auto columns = placementFor(height).columns;
+	return 2 * Px(kToolStripPadding)
+		+ columns * Px(kToolStripButton)
+		+ (columns - 1) * Px(kToolStripSkip);
+}
+
+void ToolStrip::resizeEvent(QResizeEvent *e) {
+	const auto placement = placementFor(height());
+	const auto padding = Px(kToolStripPadding);
+	const auto step = Px(kToolStripButton) + Px(kToolStripSkip);
+	for (auto i = 0; i != int(_entries.size()); ++i) {
+		const auto &place = placement.places[i];
+		_entries[i].button->move(padding + place.column * step, place.top);
+	}
+}
+
+void ToolStrip::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	const auto placement = placementFor(height());
+	const auto padding = Px(kToolStripPadding);
+	const auto size = Px(kToolStripButton);
+	const auto step = size + Px(kToolStripSkip);
+	const auto plate = QRect(
+		0,
+		0,
+		width(),
+		std::min(placement.bottom + padding, height()));
+	{
+		auto hq = PainterHighQualityEnabler(p);
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::groupCallMembersBg);
+		p.drawRoundedRect(plate, Px(kPanelRadius), Px(kPanelRadius));
+	}
+	const auto line = std::max(Px(1), 1);
+	const auto gap = Px(kToolStripGroupGap);
+	const auto inset = Px(kToolStripSeparatorInset);
+	for (const auto &place : placement.places) {
+		if (!place.separated) {
+			continue;
+		}
+		// In the middle between the two buttons.
+		const auto middle = place.top - (gap + Px(kToolStripSkip)) / 2;
+		p.fillRect(
+			QRect(
+				padding + place.column * step + inset,
+				middle - line / 2,
+				size - 2 * inset,
+				line),
+			st::groupCallMembersBgOver);
+	}
+}
+
 class Editor final : public Ui::RpWidget {
 public:
 	Editor(
@@ -617,10 +1479,14 @@ public:
 	~Editor();
 
 	[[nodiscard]] rpl::producer<> closeRequests() const;
+	[[nodiscard]] not_null<Controller*> controller() const;
 	void requestClose();
 	void selectTab(Tab tab);
 	void setComparing(bool comparing);
 	void showBackgroundProgress();
+	// For the snapshot scenes.
+	void scrollTabToEnd();
+	void finishAnimations();
 	[[nodiscard]] bool snapshotReady() const;
 
 protected:
@@ -629,17 +1495,13 @@ protected:
 	void keyPressEvent(QKeyEvent *e) override;
 	void keyReleaseEvent(QKeyEvent *e) override;
 	void focusOutEvent(QFocusEvent *e) override;
+	void dragEnterEvent(QDragEnterEvent *e) override;
+	void dropEvent(QDropEvent *e) override;
 
 private:
 	struct Page {
 		not_null<Ui::ScrollArea*> scroll;
 		not_null<Ui::VerticalLayout*> content;
-	};
-	struct Sources {
-		QImage source;
-		QImage preview;
-		QImage thumbs;
-		bool alpha = false;
 	};
 	struct AutoState {
 		EditState base;
@@ -653,6 +1515,7 @@ private:
 	void setupCanvas();
 	void setupStrip();
 	void setupShortcuts();
+	void setupController();
 	[[nodiscard]] Page createPage();
 	not_null<SectionTitle*> addTitle(
 		not_null<Ui::VerticalLayout*> page,
@@ -662,6 +1525,8 @@ private:
 		not_null<Ui::VerticalLayout*> page,
 		rpl::producer<QString> text);
 	void setupCropPage(not_null<Ui::VerticalLayout*> page);
+	void setupCanvasSection(not_null<Ui::VerticalLayout*> page);
+	void resizeCanvas(QSize size);
 	void setupAdjustPage(not_null<Ui::VerticalLayout*> page);
 	void setupFiltersPage(not_null<Ui::VerticalLayout*> page);
 	void setupEffectsPage(not_null<Ui::VerticalLayout*> page);
@@ -671,30 +1536,56 @@ private:
 	void showEffectMenu(int index, QPoint globalPosition);
 	void chooseCustomColor(int index, EffectParam param);
 	void addEffect(EffectType type);
+	void rebuildToolPage();
+	void addLayerFxSection(
+		not_null<Ui::VerticalLayout*> page,
+		rpl::producer<QString> title,
+		rpl::producer<QString> about,
+		rpl::producer<QString> button,
+		std::vector<FxGroup> groups,
+		bool flat);
+	void showLayerEffects();
+	void revealInPanel(QWidget *widget);
 
 	void startLoading(QImage image);
-	void sourcesReady(Sources &&sources);
-	void preparePreview(int side);
+	void sourceReady(QImage source);
+	void documentReady(Document document);
+	[[nodiscard]] const Layer *backgroundLayer() const;
+	void refreshBackgroundState();
 	void toggleBackground();
+	void startBackgroundRequest(
+		LayerId id,
+		std::shared_ptr<const ImageContent> content);
 	void cancelBackground();
-	void backgroundReady(Sources &&cutout);
-	void replaceSources(Sources &&sources);
+	void finishBackground();
+	void backgroundReady(
+		int token,
+		LayerId id,
+		std::shared_ptr<const ImageContent> from,
+		std::shared_ptr<const ImageContent> cutout);
+	void keepInterrupted();
 
 	void apply(EditState state, bool commitNow);
 	void commit();
 	void undo();
 	void redo();
-	void applyHistory();
+	void documentChanged();
 	void stateChanged();
 	void refreshHistoryButtons();
 	[[nodiscard]] EditState displayState() const;
+	[[nodiscard]] Document displayDocument() const;
+	[[nodiscard]] RenderKey displayKey() const;
+	[[nodiscard]] double proxyScale() const;
 	[[nodiscard]] bool dirty() const;
+	[[nodiscard]] bool resetAvailable() const;
 
 	void refreshPreview(bool force);
 	void requestDetail();
 	void previewReady(PreviewRenderer::Result &&result);
 	void refreshBefore();
 	void beforeReady(PreviewRenderer::Result &&result);
+	void refreshAnalysis();
+	void analysisReady(QImage reduced, bool alpha, uint64 revision);
 	void scheduleThumbnails();
 	void refreshThumbnails();
 
@@ -714,8 +1605,12 @@ private:
 
 	void updateLayout();
 	void updateTopBar();
+	[[nodiscard]] int layersNaturalHeight() const;
+	void refreshPagesFade();
 	[[nodiscard]] bool narrow() const;
 	[[nodiscard]] QRect topBarRect() const;
+	[[nodiscard]] bool handleToolKey(not_null<QKeyEvent*> e);
+	[[nodiscard]] bool importFrom(not_null<const QMimeData*> data);
 
 	void setExporting(bool exporting, QString text = QString());
 	void exportResult(Fn<void(PhotoEditorResult)> callback);
@@ -729,44 +1624,48 @@ private:
 
 	const std::shared_ptr<Ui::Show> _outerShow;
 	PhotoEditorOptions _options;
-	const QSize _sourceSize;
+	QSize _sourceSize;
 	std::unique_ptr<Ui::LayerManager> _layers;
+	std::unique_ptr<Controller> _controller;
 
-	QImage _source;
-	QImage _preview;
 	QImage _thumbSource;
 	bool _hasAlpha = false;
 	bool _sourceReady = false;
 	int _previewSide = 0;
-	bool _preparingPreview = false;
+	uint64 _analysisRevision = 0;
+	bool _analysisRunning = false;
 
-	// "Remove background": the cutout replaces the sources above, the
-	// untouched ones wait here to bring the background back and to show
-	// the original in the comparison. The generation drops the previews
-	// that were being prepared from the replaced source.
-	std::optional<Sources> _withBackground;
+	// "Remove background" replaces the pixels of an image layer with the
+	// cutout that remembers what it was made from, so the button (and
+	// undo) brings the background back.
 	rpl::variable<bool> _backgroundRemoved = false;
-	int _sourceGeneration = 0;
 
 	// The system can't be stopped once it was asked for a cutout. A
 	// cancelled request works on and its result is dropped, unless the
 	// button was pressed again meanwhile: then that result is awaited
-	// instead of asking twice (the source can't change in between).
+	// instead of asking twice, if it is of the same layer. If the button
+	// was pressed for another layer, the request for that one starts when
+	// the running one is over: one request at a time. The result is
+	// applied only to the layer and the pixels it is wanted for.
 	bool _removingBackground = false;
 	bool _backgroundRequested = false;
+	int _backgroundToken = 0;
+	crl::time _backgroundStarted = 0;
+	LayerId _backgroundWantedId = 0;
+	std::shared_ptr<const ImageContent> _backgroundWanted;
 
+	// Document::global of the working document (the state itself while
+	// the picture is still being loaded).
 	EditState _state;
-	EditState _initial;
-	std::vector<EditState> _history;
-	int _historyIndex = 0;
-	base::Timer _commitTimer;
 	rpl::event_stream<> _refreshControls;
+	rpl::event_stream<> _refreshCanvasSize;
 
 	Tab _tab = Tab::Adjust;
 	int _ratioIndex = kRatioFree;
 	bool _layingOut = false;
 	bool _comparing = false;
 	bool _exporting = false;
+	bool _controllerBusy = false;
 	bool _finished = false;
 	std::optional<AutoState> _auto;
 	bool _autoApplying = false;
@@ -782,9 +1681,21 @@ private:
 	Ui::RoundButton *_done = nullptr;
 	int _titleRight = 0;
 
+	ToolStrip *_toolStrip = nullptr;
 	Ui::RpWidget *_panel = nullptr;
 	TabBar *_tabs = nullptr;
 	std::vector<Page> _pages;
+	// A fade over the bottom edge of the page while it continues below:
+	// the scroll bar shows up only under the mouse, and a page cut in the
+	// middle of a control gave no hint that there is more. A smaller one
+	// over the top edge of a page that was scrolled.
+	Ui::RpWidget *_pagesFade = nullptr;
+	Ui::RpWidget *_pagesFadeAbove = nullptr;
+	Ui::RpWidget *_layerPanel = nullptr;
+	Ui::RpWidget *_layersPanel = nullptr;
+	int _layersTop = 0;
+	int _layersNatural = 0;
+	bool _toolHasOptions = false;
 	ChipsFlow *_ratios = nullptr;
 	ValueSlider *_straighten = nullptr;
 	Ui::VerticalLayout *_effectsList = nullptr;
@@ -803,10 +1714,10 @@ private:
 	std::unique_ptr<PreviewRenderer> _beforeRenderer;
 	base::Timer _detailTimer;
 	base::Timer _thumbsTimer;
-	EditState _fastState;
+	RenderKey _fastKey;
 	QSize _fastSize;
 	uint64 _fastId = 0;
-	EditState _detailState;
+	RenderKey _detailKey;
 	QSize _detailSize;
 	uint64 _detailId = 0;
 	// The last detail render is still in progress or is on the screen and
@@ -814,13 +1725,20 @@ private:
 	bool _detailValid = false;
 	EditState _beforeState;
 	QSize _beforeSize;
+	QSize _beforeCanvas;
+	uint64 _beforeId = 0;
 	bool _beforeValid = false;
 	uint64 _shownId = 0;
-	EditState _shownState;
+	RenderKey _shownKey;
 	QSize _shownSize;
+	bool _shownAny = false;
 	std::optional<EditState> _thumbsState;
 	bool _thumbsDirty = true;
 	uint64 _thumbsGeneration = 0;
+
+	// Snapshot scenes: when everything was first seen ready, the picture
+	// is taken a little later (see snapshotReady()).
+	mutable crl::time _snapshotSettledFrom = 0;
 
 	rpl::event_stream<> _closeRequests;
 
@@ -834,33 +1752,44 @@ Editor::Editor(
 : RpWidget(parent)
 , _outerShow(std::move(show))
 , _options(std::move(options))
-, _sourceSize(image.size())
+, _sourceSize((_options.document && !_options.document->empty())
+	? _options.document->size
+	: image.size())
 , _layers(std::make_unique<Ui::LayerManager>(this))
-, _state(Normalized(_options.state))
-, _initial(_state)
-, _history({ _state })
-, _commitTimer([=] { commit(); })
+, _controller(std::make_unique<Controller>(_layers->uiShow()))
+, _state((_options.document && !_options.document->empty())
+	? Normalized(_options.document->global)
+	: Normalized(_options.state))
 , _tab(_options.tab)
-, _renderer(std::make_unique<PreviewRenderer>([=](
-		PreviewRenderer::Result result) {
-	previewReady(std::move(result));
-}))
-, _beforeRenderer(std::make_unique<PreviewRenderer>([=](
-		PreviewRenderer::Result result) {
-	beforeReady(std::move(result));
-}))
+, _renderer(std::make_unique<PreviewRenderer>(
+	_controller->compositor(),
+	[=](PreviewRenderer::Result result) {
+		previewReady(std::move(result));
+	}))
+, _beforeRenderer(std::make_unique<PreviewRenderer>(
+	_controller->compositor(),
+	[=](PreviewRenderer::Result result) {
+		beforeReady(std::move(result));
+	}))
 , _detailTimer([=] { requestDetail(); })
 , _thumbsTimer([=] { refreshThumbnails(); }) {
 	setFocusPolicy(Qt::StrongFocus);
+	setAcceptDrops(true);
 	_autoButtonText = tr::lng_oblivion_photo_ui_auto_button(tr::now);
+	if (_tab == Tab::Tool || _tab == Tab::Layers) {
+		_tab = Tab::Layer;
+	}
 	inferRatio();
 
 	setupCanvas();
 	setupStrip();
+	_toolStrip = Ui::CreateChild<ToolStrip>(this, _controller.get());
+	_toolStrip->show();
 	setupPanel();
 	setupTopBar();
 	setupShortcuts();
 	_busy = Ui::CreateChild<BusyOverlay>(this);
+	setupController();
 
 	_layers->layerShownValue() | rpl::filter(
 		!rpl::mappers::_1
@@ -886,15 +1815,112 @@ Editor::Editor(
 	startLoading(std::move(image));
 }
 
-Editor::~Editor() = default;
+Editor::~Editor() {
+	keepInterrupted();
+
+	// The tools and the panels work with the controller, some of them
+	// in their destructors: they go first, while everything is alive.
+	_controller->shutdown();
+	_menu = nullptr;
+	delete base::take(_toolStrip);
+	delete base::take(_panel);
+}
+
+// The editor is destroyed without finish(): not by the user, with the
+// layers of its window (see PhotoEditorOptions::interrupted). Only the
+// document is copied here, its heavy data is shared. Nothing of the
+// window or the session may be touched, they may be half destroyed.
+void Editor::keepInterrupted() {
+	if (_finished
+		|| !_options.interrupted
+		|| !_sourceReady
+		|| !_controller->hasDocument()
+		|| !dirty()
+		|| Core::Quitting()) {
+		return;
+	}
+	const auto id = KeepInterruptedPhotoEdit({
+		.document = std::make_shared<const Document>(
+			_controller->document()),
+		.fileName = _options.fileName,
+	});
+	if (id) {
+		crl::on_main([id, callback = _options.interrupted] {
+			callback(id);
+		});
+	}
+}
 
 rpl::producer<> Editor::closeRequests() const {
 	return _closeRequests.events();
 }
 
+not_null<Controller*> Editor::controller() const {
+	return _controller.get();
+}
+
+void Editor::setupController() {
+	_controller->setView({
+		.documentToWidget = [=] { return _canvas->documentToWidget(); },
+		.update = [=] { _canvas->update(); },
+	});
+	_canvas->setToolProvider([=] { return _controller->tool(); });
+	_canvas->viewChanges() | rpl::on_next([=] {
+		_controller->notifyViewChanged();
+	}, _canvas->lifetime());
+
+	_controller->documentChanges() | rpl::on_next([=] {
+		documentChanged();
+	}, lifetime());
+	_controller->historyChanges() | rpl::on_next([=] {
+		refreshHistoryButtons();
+	}, lifetime());
+	_controller->toolChanges() | rpl::on_next([=] {
+		_canvas->toolChanged();
+	}, lifetime());
+	_controller->toolValue() | rpl::on_next([=] {
+		rebuildToolPage();
+	}, lifetime());
+	_controller->toolOptionsRequests() | rpl::on_next([=] {
+		if (_toolHasOptions && !_exporting) {
+			selectTab(Tab::Tool);
+		}
+	}, lifetime());
+	_controller->layerEffectsRequests() | rpl::on_next([=] {
+		showLayerEffects();
+	}, lifetime());
+	_controller->revealRequests(
+	) | rpl::on_next([=](QPointer<QWidget> widget) {
+		// The section may be just appearing: after the page is laid out.
+		crl::on_main(this, [=] {
+			revealInPanel(widget.data());
+		});
+	}, lifetime());
+	_canvas->toolDragValue() | rpl::on_next([=](bool dragging) {
+		_controller->setInteracting(dragging);
+	}, _canvas->lifetime());
+	_controller->activeLayerValue() | rpl::skip(1) | rpl::on_next([=] {
+		refreshBackgroundState();
+		// The picture under another layer is worth keeping now.
+		refreshPreview(false);
+	}, lifetime());
+	_controller->busyValue() | rpl::on_next([=](const QString &text) {
+		if (!text.isEmpty()) {
+			if (!_exporting) {
+				_controllerBusy = true;
+				setExporting(true, text);
+			}
+		} else if (_controllerBusy) {
+			_controllerBusy = false;
+			setExporting(false);
+		}
+	}, lifetime());
+}
+
 void Editor::setupCanvas() {
 	_canvas = Ui::CreateChild<Canvas>(this);
 	_canvas->setLoading(true);
+	_canvas->setCheckerboard(true);
 	_canvas->setCrop(_state.crop);
 	_canvas->setCropRatio(cropRatio());
 	_canvas->show();
@@ -1000,17 +2026,20 @@ void Editor::setupTopBar() {
 			_ratios->setSelected(_ratioIndex);
 		}
 		_canvas->setCropRatio(cropRatio());
-		apply(EditState(), true);
+		if (!_controller->hasDocument()) {
+			apply(EditState(), true);
+			return;
+		}
+		// Back to what was opened, without the whole-image edits.
+		auto document = _controller->initialDocument();
+		document.global = EditState();
+		_controller->apply(std::move(document), true);
 	});
 
 	_more = button(
 		{ &st::infoTopBarMenuActive },
 		tr::lng_oblivion_photo_ui_more(tr::now));
 	_more->setClickedCallback([=] { showMoreMenu(); });
-	const auto hasMenu = _options.allowSaveToFile
-		|| _options.allowCopy
-		|| !_options.actions.empty();
-	_more->setVisible(hasMenu);
 
 	auto doneText = !_options.done
 		? tr::lng_oblivion_photo_ui_save()
@@ -1068,12 +2097,23 @@ void Editor::setupPanel() {
 		p.setBrush(st::groupCallMembersBg);
 		const auto radius = Px(kPanelRadius);
 		p.drawRoundedRect(_panel->rect(), radius, radius);
+		if (_layersTop > 0) {
+			// The layers list is a part of the same plate, under a line.
+			const auto line = std::max(Px(1), 1);
+			p.fillRect(
+				QRect(
+					Px(kPanelPadding),
+					_layersTop - Px(kLayersSkip) / 2,
+					_panel->width() - 2 * Px(kPanelPadding),
+					line),
+				st::groupCallMembersBgOver);
+		}
 	}, _panel->lifetime());
 
 	auto tabs = std::vector<TabInfo>();
 	tabs.push_back({
 		tr::lng_oblivion_photo_ui_tab_crop(),
-		{ &st::photoEditorCropRatioButton.icon },
+		IconRef{ .paint = PaintCropIcon },
 	});
 	tabs.push_back({
 		tr::lng_oblivion_photo_ui_tab_adjust(),
@@ -1091,7 +2131,25 @@ void Editor::setupPanel() {
 		tr::lng_oblivion_photo_ui_tab_auto(),
 		{ &st::aiComposeTabStyleIcon },
 	});
+	tabs.push_back({
+		tr::lng_oblivion_photo_panel_tab_layer(),
+		IconRef{ .paint = [](QPainter &p, QRectF rect, QColor color) {
+			PaintSheetsIcon(p, rect, color, 2);
+		} },
+	});
+	tabs.push_back({
+		tr::lng_oblivion_photo_panel_tab_tool(),
+		{ &st::menuIconEdit },
+	});
+	tabs.push_back({
+		tr::lng_oblivion_photo_panel_tab_layers(),
+		IconRef{ .paint = [](QPainter &p, QRectF rect, QColor color) {
+			PaintSheetsIcon(p, rect, color, 3);
+		} },
+	});
 	_tabs = Ui::CreateChild<TabBar>(_panel, std::move(tabs));
+	_tabs->setTabVisible(int(Tab::Tool), false);
+	_tabs->setTabVisible(int(Tab::Layers), false);
 	_tabs->setActive(int(_tab), anim::type::instant);
 	_tabs->show();
 	_tabs->activeChanges() | rpl::on_next([=](int index) {
@@ -1100,7 +2158,7 @@ void Editor::setupPanel() {
 		}
 	}, _tabs->lifetime());
 
-	for (auto i = 0; i != 5; ++i) {
+	for (auto i = 0; i != kTabCount; ++i) {
 		_pages.push_back(createPage());
 	}
 	setupCropPage(_pages[int(Tab::Crop)].content);
@@ -1108,11 +2166,199 @@ void Editor::setupPanel() {
 	setupFiltersPage(_pages[int(Tab::Filters)].content);
 	setupEffectsPage(_pages[int(Tab::Effects)].content);
 	setupAutoPage(_pages[int(Tab::Auto)].content);
-	for (const auto &page : _pages) {
-		page.content->add(object_ptr<Ui::FixedHeightWidget>(
-			page.content,
-			Px(kPageBottom)));
+	const auto layerPage = _pages[int(Tab::Layer)].content;
+	_layerPanel = layerPage->add(
+		CreateLayerPanel(layerPage, _controller.get()));
+	for (auto i = 0; i != kTabCount; ++i) {
+		if (i != int(Tab::Tool) && i != int(Tab::Layers)) {
+			_pages[i].content->add(object_ptr<Ui::FixedHeightWidget>(
+				_pages[i].content,
+				Px(kPageBottom)));
+		}
 	}
+
+	const auto makeFade = [&](bool above) {
+		const auto result = Ui::CreateChild<Ui::RpWidget>(_panel);
+		result->setAttribute(Qt::WA_TransparentForMouseEvents);
+		result->hide();
+		result->paintRequest() | rpl::on_next([=] {
+			auto p = QPainter(result);
+			const auto color = st::groupCallMembersBg->c;
+			auto gradient = QLinearGradient(0, 0, 0, result->height());
+			gradient.setColorAt(above ? 1. : 0., anim::with_alpha(color, 0.));
+			gradient.setColorAt(above ? 0. : 1., color);
+			p.fillRect(result->rect(), gradient);
+		}, result->lifetime());
+		return result;
+	};
+	_pagesFade = makeFade(false);
+	_pagesFadeAbove = makeFade(true);
+	for (const auto &page : _pages) {
+		rpl::merge(
+			page.scroll->scrolls(),
+			page.scroll->innerResizes(),
+			page.scroll->geometryChanged()
+		) | rpl::on_next([=] {
+			refreshPagesFade();
+		}, page.scroll->lifetime());
+	}
+
+	auto layers = CreateLayersPanel(_panel, _controller.get());
+	_layersPanel = layers.release();
+	_layersPanel->show();
+}
+
+// The page of the current tab goes on under its bottom edge (or above
+// the top one, when it was scrolled).
+void Editor::refreshPagesFade() {
+	if (!_pagesFade || !_pagesFadeAbove || _pages.empty()) {
+		return;
+	}
+	const auto scroll = _pages[int(_tab)].scroll;
+	const auto shown = (_tab != Tab::Layers) && !scroll->isHidden();
+	const auto top = scroll->scrollTop();
+	const auto below = shown && (top + Px(2) < scroll->scrollTopMax());
+	const auto above = shown && (top > Px(2));
+	// Not over the round corners of the plate.
+	const auto inset = Px(kPanelRadius) / 2;
+	const auto fadeWidth = std::max(scroll->width() - 2 * inset, 1);
+	if (below) {
+		const auto fade = std::min(Px(kPagesFade), scroll->height() / 2);
+		_pagesFade->setGeometry(
+			scroll->x() + inset,
+			scroll->y() + scroll->height() - fade,
+			fadeWidth,
+			fade);
+	}
+	if (above) {
+		const auto fade = std::min(
+			Px(kPagesFade) / 2,
+			scroll->height() / 4);
+		_pagesFadeAbove->setGeometry(
+			scroll->x() + inset,
+			scroll->y(),
+			fadeWidth,
+			fade);
+	}
+	_pagesFade->setVisible(below);
+	_pagesFadeAbove->setVisible(above);
+}
+
+// What the layers list needs to show all its rows, 0: it didn't say.
+int Editor::layersNaturalHeight() const {
+	auto chosen = (const PanelDescriptor*)(nullptr);
+	for (const auto descriptor : AllPanels()) {
+		if (descriptor->slot == PanelSlot::Layers) {
+			chosen = descriptor;
+		}
+	}
+	return (chosen && chosen->height)
+		? std::max(chosen->height(_controller.get()), 0)
+		: 0;
+}
+
+void Editor::rebuildToolPage() {
+	if (_pages.empty()) {
+		return;
+	}
+	const auto page = _pages[int(Tab::Tool)].content;
+	page->clear();
+	const auto descriptor = FindTool(_controller->toolId());
+	_toolHasOptions = descriptor && descriptor->options;
+	if (_toolHasOptions) {
+		addTitle(page, rpl::single(descriptor->name.now()));
+		page->add(descriptor->options(page, _controller.get()));
+		page->add(object_ptr<Ui::FixedHeightWidget>(page, Px(kPageBottom)));
+		page->resizeToWidth(_panel->width());
+	}
+	_tabs->setTabVisible(int(Tab::Tool), _toolHasOptions);
+	if (_toolHasOptions) {
+		selectTab(Tab::Tool);
+	} else if (_tab == Tab::Tool
+		|| (_tab == Tab::Crop && _controller->toolId() != kViewTool)) {
+		// A tool can't work while the crop frame owns the canvas.
+		selectTab(Tab::Layer);
+	} else {
+		updateLayout();
+	}
+}
+
+// The whole-picture tabs lead to the effects of the active layer: the
+// fine adjustments (curves, color ranges...) from the Adjust tab, the
+// blurs, distortions and the other packs from the Effects tab. The chosen
+// effect is added to the layer and shown on the Layer tab.
+void Editor::addLayerFxSection(
+		not_null<Ui::VerticalLayout*> page,
+		rpl::producer<QString> title,
+		rpl::producer<QString> about,
+		rpl::producer<QString> button,
+		std::vector<FxGroup> groups,
+		bool flat) {
+	addTitle(page, std::move(title), Px(kLargeSkip));
+	page->add(
+		object_ptr<Ui::FlatLabel>(page, std::move(about), HintLabelStyle()),
+		RowMargins());
+	const auto add = page->add(
+		object_ptr<PanelButton>(page, std::move(button), false),
+		RowMargins(Px(kSkip)));
+	add->setClickedCallback([=] {
+		if (_exporting || !_sourceReady) {
+			return;
+		}
+		const auto weak = base::make_weak(this);
+		ShowAddFxMenu(
+			this,
+			add->mapToGlobal(QPoint(0, add->height())),
+			[=](std::vector<FxInstance> stack) {
+				const auto strong = weak.get();
+				if (strong
+					&& !strong->_exporting
+					&& AppendLayerFx(
+						strong->_controller.get(),
+						strong->_controller->activeLayerId(),
+						std::move(stack))) {
+					strong->showLayerEffects();
+				}
+			},
+			groups,
+			flat);
+	});
+}
+
+void Editor::showLayerEffects() {
+	if (_exporting || _pages.empty()) {
+		return;
+	}
+	selectTab(Tab::Layer);
+	// The effects are the last section of the Layer page, the new card is
+	// the last one of them: it is there after the page was laid out. Its
+	// top is shown, a card may be taller than the page and scrolling to
+	// the very end left it without its header.
+	const auto scroll = _pages[int(Tab::Layer)].scroll;
+	crl::on_main(this, [=] {
+		if (_tab != Tab::Layer) {
+			return;
+		}
+		const auto top = _layerPanel
+			? LayerPanelLastFxTop(_layerPanel)
+			: -1;
+		const auto max = scroll->scrollTopMax();
+		scroll->scrollToY((top >= 0)
+			? std::clamp(_layerPanel->y() + top - Px(kSkip), 0, max)
+			: max);
+	});
+}
+
+void Editor::revealInPanel(QWidget *widget) {
+	if (!widget || _exporting || _tab == Tab::Layers) {
+		return;
+	}
+	const auto &page = _pages[int(_tab)];
+	if (!page.content->isAncestorOf(widget)) {
+		return;
+	}
+	const auto top = widget->mapTo(page.content, QPoint()).y();
+	page.scroll->scrollToY(top, top + widget->height());
 }
 
 void Editor::setupCropPage(not_null<Ui::VerticalLayout*> page) {
@@ -1200,6 +2446,128 @@ void Editor::setupCropPage(not_null<Ui::VerticalLayout*> page) {
 	}, reset->lifetime());
 
 	addHint(page, tr::lng_oblivion_photo_ui_crop_hint());
+	setupCanvasSection(page);
+}
+
+// The canvas of the whole document: its size can be typed (or dragged)
+// and extended to an aspect ratio, so there is room around the photo for
+// the other layers. See CanvasResized() in oblivion_photo_doc.h.
+void Editor::setupCanvasSection(not_null<Ui::VerticalLayout*> page) {
+	addTitle(page, tr::lng_oblivion_photo_panel_canvas_title(), Px(kLargeSkip));
+	const auto current = [=] {
+		const auto size = _controller->hasDocument()
+			? _controller->document().size
+			: _sourceSize;
+		auto result = FxParams();
+		result.set("width", FxValue::Integer(size.width()));
+		result.set("height", FxValue::Integer(size.height()));
+		return result;
+	};
+	const auto initial = _sourceSize.isEmpty()
+		? QSize(kCanvasMinSide, kCanvasMinSide)
+		: _sourceSize;
+	// A photo that was opened may be larger than what can be asked for.
+	const auto limit = std::max({
+		kCanvasMaxSide,
+		initial.width(),
+		initial.height(),
+	});
+	page->add(
+		CreateParamsPanel(page, ParamsPanelArgs{
+			.params = {
+				FxInt(
+					"width",
+					tr::lng_oblivion_photo_panel_canvas_width,
+					kCanvasMinSide,
+					limit,
+					initial.width(),
+					u" px"_q),
+				FxInt(
+					"height",
+					tr::lng_oblivion_photo_panel_canvas_height,
+					kCanvasMinSide,
+					limit,
+					initial.height(),
+					u" px"_q),
+			},
+			.values = current(),
+			.updates = rpl::merge(
+				_controller->documentChanges(),
+				_refreshCanvasSize.events()
+			) | rpl::map(current),
+			.changed = [=](
+					const QByteArray &id,
+					FxValue value,
+					bool finished) {
+				if (!finished || !_controller->hasDocument()) {
+					return;
+				}
+				auto size = _controller->document().size;
+				if (id == "width") {
+					size.setWidth(value.integer());
+				} else {
+					size.setHeight(value.integer());
+				}
+				resizeCanvas(size);
+			},
+			.commitOnRelease = true,
+			// 16 .. 16384: on an even scale the knob of any usual photo
+			// stood at the very start of the track.
+			.logarithmic = { QByteArray("width"), QByteArray("height") },
+		}),
+		RowMargins());
+	page->add(
+		object_ptr<Ui::FlatLabel>(
+			page,
+			tr::lng_oblivion_photo_panel_canvas_extend(),
+			HintLabelStyle()),
+		RowMargins(Px(kSkip)));
+	const auto chips = page->add(
+		object_ptr<ChipsFlow>(page),
+		RowMargins(Px(kSkip)));
+	for (const auto &preset : kRatioPresets) {
+		if (preset.width <= 0) {
+			continue;
+		}
+		const auto width = preset.width;
+		const auto height = preset.height;
+		chips->addChip(
+			rpl::single(QString::number(width) + ':' + QString::number(height)),
+			[=] {
+				if (_controller->hasDocument()) {
+					resizeCanvas(CanvasSizeForAspect(
+						_controller->document().size,
+						width,
+						height));
+				}
+			});
+	}
+	addHint(page, tr::lng_oblivion_photo_panel_canvas_about());
+}
+
+void Editor::resizeCanvas(QSize size) {
+	// A value that was not taken as it was (a limit, the editor is busy)
+	// is replaced with the real one. Later: a slider that reports the end
+	// of its drag doesn't take values from outside yet.
+	crl::on_main(this, [=] {
+		_refreshCanvasSize.fire({});
+	});
+	if (_exporting || !_sourceReady || !_controller->hasDocument()) {
+		return;
+	}
+	const auto valid = ValidCanvasSize(size);
+	if (valid == _controller->document().size) {
+		return;
+	}
+	// The crop frame is reset with the canvas, its ratio too.
+	_ratioIndex = kRatioFree;
+	if (_ratios) {
+		_ratios->setSelected(_ratioIndex);
+	}
+	_canvas->setCropRatio(cropRatio());
+	_controller->apply(
+		CanvasResized(_controller->document(), valid),
+		true);
 }
 
 void Editor::setupAdjustPage(not_null<Ui::VerticalLayout*> page) {
@@ -1299,6 +2667,13 @@ void Editor::setupAdjustPage(not_null<Ui::VerticalLayout*> page) {
 		}
 	}
 	addHint(page, tr::lng_oblivion_photo_ui_adjust_hint());
+	addLayerFxSection(
+		page,
+		tr::lng_oblivion_photo_panel_fine_title(),
+		tr::lng_oblivion_photo_panel_fine_about(),
+		tr::lng_oblivion_photo_panel_fine_button(),
+		{ FxGroup::Light, FxGroup::Color, FxGroup::Detail, FxGroup::Finish },
+		true);
 }
 
 void Editor::setupFiltersPage(not_null<Ui::VerticalLayout*> page) {
@@ -1383,6 +2758,20 @@ void Editor::setupEffectsPage(not_null<Ui::VerticalLayout*> page) {
 			[=] { addEffect(type); });
 	}
 	addHint(page, tr::lng_oblivion_photo_ui_effects_hint());
+	addLayerFxSection(
+		page,
+		tr::lng_oblivion_photo_panel_more_title(),
+		tr::lng_oblivion_photo_panel_more_about(),
+		tr::lng_oblivion_photo_panel_more_button(),
+		{
+			FxGroup::Blur,
+			FxGroup::Distort,
+			FxGroup::Lofi,
+			FxGroup::Glitch,
+			FxGroup::Stylize,
+			FxGroup::Classic,
+		},
+		false);
 	rebuildEffects();
 }
 
@@ -1413,6 +2802,7 @@ void Editor::addEffectCard(int index) {
 			index ? Px(kCardSkip) : Px(kSkip),
 			Px(kPanelPadding),
 			0));
+	MarkAsCard(card);
 	card->paintRequest() | rpl::on_next([=] {
 		auto p = QPainter(card);
 		auto hq = PainterHighQualityEnabler(p);
@@ -1492,7 +2882,7 @@ void Editor::addEffectCard(int index) {
 					EffectParamName(param),
 					_state.effects[index].value(param) != 0,
 					false),
-				style::margins(0, 0, padding, 0));
+				paramMargins);
 			toggle->toggles() | rpl::on_next([=](bool enabled) {
 				change([=](Effect &effect) {
 					effect.setValue(param, enabled ? 1 : 0);
@@ -1694,113 +3084,132 @@ void Editor::setupAutoPage(not_null<Ui::VerticalLayout*> page) {
 }
 
 void Editor::startLoading(QImage image) {
-	if (image.isNull()) {
-		_canvas->setLoading(false);
-		return;
-	}
 	const auto screen = QGuiApplication::primaryScreen();
 	const auto screenSide = screen
 		? int(std::max(screen->size().width(), screen->size().height())
 			* screen->devicePixelRatio()
 			* kPreviewScreenPart)
 		: kPreviewMinSide;
-	const auto side = std::clamp(
+	_previewSide = std::clamp(
 		screenSide,
 		kPreviewMinSide,
 		kPreviewMaxInitialSide);
-	crl::async([weak = base::make_weak(this), image = std::move(image), side] {
-		auto sources = Sources();
-		sources.source = PrepareSource(image);
-		sources.preview = PrepareSource(sources.source, QSize(side, side));
-		sources.thumbs = PrepareSource(
-			sources.preview,
-			QSize(kThumbSourceSide, kThumbSourceSide));
-		sources.alpha = HasTransparentPixels(sources.thumbs);
-		crl::on_main(weak, [=, sources = std::move(sources)]() mutable {
-			weak->sourcesReady(std::move(sources));
+	if (_options.document && !_options.document->empty()) {
+		documentReady(*_options.document);
+		return;
+	} else if (image.isNull()) {
+		_canvas->setLoading(false);
+		return;
+	}
+	crl::async([weak = base::make_weak(this), image = std::move(image)] {
+		auto source = PrepareSource(image);
+		crl::on_main(weak, [=, source = std::move(source)]() mutable {
+			weak->sourceReady(std::move(source));
 		});
 	});
 }
 
-void Editor::sourcesReady(Sources &&sources) {
-	_source = std::move(sources.source);
-	_preview = std::move(sources.preview);
-	_previewSide = std::max(_preview.width(), _preview.height());
-	_thumbSource = std::move(sources.thumbs);
-	_hasAlpha = sources.alpha;
-	_sourceReady = !_source.isNull();
-	if (!_sourceReady) {
+void Editor::sourceReady(QImage source) {
+	if (source.isNull()) {
 		_canvas->setLoading(false);
 		toast(tr::lng_oblivion_photo_ui_export_failed(tr::now));
 		return;
 	}
-	_canvas->setCheckerboard(_hasAlpha);
+	documentReady(DocumentFromImage(
+		std::move(source),
+		_state,
+		tr::lng_oblivion_photo_panel_layer_photo(tr::now)));
+}
+
+void Editor::documentReady(Document document) {
+	if (document.empty()) {
+		_canvas->setLoading(false);
+		toast(tr::lng_oblivion_photo_ui_export_failed(tr::now));
+		return;
+	}
+	_sourceReady = true;
 	_done->setDisabled(false);
-	stateChanged();
+	_controller->setDocument(std::move(document));
+	if (!_options.tool.isEmpty()) {
+		_controller->setTool(_options.tool);
+	}
 	update();
 }
 
-void Editor::preparePreview(int side) {
-	if (_preparingPreview || _source.isNull()) {
-		return;
+const Layer *Editor::backgroundLayer() const {
+	if (!_controller->hasDocument()) {
+		return nullptr;
 	}
-	_preparingPreview = true;
-	crl::async([
-			weak = base::make_weak(this),
-			source = _source,
-			generation = _sourceGeneration,
-			side] {
-		auto preview = PrepareSource(source, QSize(side, side));
-		crl::on_main(weak, [=, preview = std::move(preview)]() mutable {
-			weak->_preparingPreview = false;
-			if (weak->_sourceGeneration != generation) {
-				weak->refreshPreview(true);
-			} else if (!preview.isNull()) {
-				weak->_preview = std::move(preview);
-				weak->_previewSide = std::max(
-					weak->_preview.width(),
-					weak->_preview.height());
-				weak->refreshPreview(true);
-			}
-		});
-	});
+	const auto active = _controller->activeLayer();
+	if (active && AsImage(active->content)) {
+		return active;
+	}
+	for (const auto &layer : _controller->document().layers) {
+		if (AsImage(layer.content)) {
+			return &layer;
+		}
+	}
+	return nullptr;
+}
+
+void Editor::refreshBackgroundState() {
+	const auto layer = backgroundLayer();
+	const auto image = layer ? AsImage(layer->content) : nullptr;
+	_backgroundRemoved = image && (image->original() != nullptr);
 }
 
 void Editor::toggleBackground() {
 	if (_exporting || !_sourceReady) {
 		return;
-	} else if (_withBackground) {
-		auto sources = base::take(*_withBackground);
-		_withBackground = std::nullopt;
-		replaceSources(std::move(sources));
+	}
+	const auto layer = backgroundLayer();
+	if (!layer) {
+		toast(tr::lng_oblivion_photo_panel_no_image_layer(tr::now));
+		return;
+	} else if (layer->locked) {
+		toast(tr::lng_oblivion_photo_panel_layer_locked(tr::now));
+		return;
+	}
+	const auto id = layer->id;
+	const auto content = std::static_pointer_cast<const ImageContent>(
+		layer->content);
+	if (const auto original = content->original()) {
+		_controller->changeLayer(id, [=](Layer &layer) {
+			layer.content = original;
+		});
 		return;
 	}
 	showBackgroundProgress();
-	if (_backgroundRequested) {
+	if (!_removingBackground) {
 		return;
 	}
+	_backgroundWantedId = id;
+	_backgroundWanted = content;
+	// A request that runs for minutes will hardly ever answer, its result
+	// is not waited for anymore.
+	if (!_backgroundRequested
+		|| (crl::now() - _backgroundStarted >= kBackgroundLostAfter)) {
+		startBackgroundRequest(id, content);
+	}
+}
+
+void Editor::startBackgroundRequest(
+		LayerId id,
+		std::shared_ptr<const ImageContent> content) {
+	const auto token = ++_backgroundToken;
 	_backgroundRequested = true;
-	crl::async([
-			weak = base::make_weak(this),
-			source = _source,
-			side = std::max(_previewSide, 1)] {
-		auto removed = Vision::RemoveBackground(source);
-		auto sources = Sources();
+	_backgroundStarted = crl::now();
+	crl::async([weak = base::make_weak(this), content, id, token] {
+		auto removed = Vision::RemoveBackground(content->image());
+		auto cutout = std::shared_ptr<const ImageContent>();
 		if (removed.ok) {
-			sources.source = std::move(removed.cutout);
-			sources.preview = PrepareSource(
-				sources.source,
-				QSize(side, side));
-			sources.thumbs = PrepareSource(
-				sources.preview,
-				QSize(kThumbSourceSide, kThumbSourceSide));
-			sources.alpha = true;
+			cutout = MakeImageContent(std::move(removed.cutout), content);
 		} else {
 			LOG(("Oblivion Vision Error: no background removal, %1."
 				).arg(removed.error));
 		}
-		crl::on_main(weak, [=, sources = std::move(sources)]() mutable {
-			weak->backgroundReady(std::move(sources));
+		crl::on_main(weak, [=] {
+			weak->backgroundReady(token, id, content, cutout);
 		});
 	});
 }
@@ -1817,115 +3226,107 @@ void Editor::showBackgroundProgress() {
 }
 
 void Editor::cancelBackground() {
-	if (!_removingBackground) {
-		return;
+	if (_removingBackground) {
+		finishBackground();
 	}
+}
+
+void Editor::finishBackground() {
 	_removingBackground = false;
+	_backgroundWantedId = 0;
+	_backgroundWanted = nullptr;
 	setExporting(false);
 }
 
-void Editor::backgroundReady(Sources &&cutout) {
+void Editor::backgroundReady(
+		int token,
+		LayerId id,
+		std::shared_ptr<const ImageContent> from,
+		std::shared_ptr<const ImageContent> cutout) {
+	if (token != _backgroundToken) {
+		// Of a request that was given up for lost, another one runs.
+		return;
+	}
 	_backgroundRequested = false;
 	if (!_removingBackground || _finished) {
 		return;
 	}
-	_removingBackground = false;
-	setExporting(false);
-	if (cutout.source.isNull() || cutout.preview.isNull()) {
+	const auto wantedId = _backgroundWantedId;
+	const auto wanted = _backgroundWanted;
+	if (id != wantedId || from != wanted) {
+		// The result of a cancelled request, while the button was pressed
+		// for another layer since: that layer has its turn now, the cover
+		// stays.
+		const auto layer = _controller->document().find(wantedId);
+		if (wanted && layer && !layer->locked && layer->content == wanted) {
+			startBackgroundRequest(wantedId, wanted);
+		} else {
+			finishBackground();
+		}
+		return;
+	}
+	finishBackground();
+	const auto layer = _controller->document().find(id);
+	if (!cutout
+		|| cutout->image().isNull()
+		|| !layer
+		|| layer->content != from) {
 		toast(tr::lng_oblivion_vision_cutout_not_found(tr::now));
 		return;
 	}
-	_withBackground = Sources{
-		.source = _source,
-		.preview = _preview,
-		.thumbs = _thumbSource,
-		.alpha = _hasAlpha,
-	};
-	replaceSources(std::move(cutout));
-}
-
-void Editor::replaceSources(Sources &&sources) {
-	++_sourceGeneration;
-	_source = std::move(sources.source);
-	_preview = std::move(sources.preview);
-	_previewSide = std::max(_preview.width(), _preview.height());
-	_thumbSource = std::move(sources.thumbs);
-	_hasAlpha = sources.alpha;
-	_backgroundRemoved = _withBackground.has_value();
-	_canvas->setCheckerboard(_hasAlpha);
-
-	// The state is the same, only the pixels differ: nothing rendered or
-	// requested from the previous source may be kept as "up to date" and
-	// a render of it that is still on its way must not get to the canvas.
-	_shownId = _renderer->lastId() + 1;
-	_shownSize = QSize();
-	_fastSize = QSize();
-	_detailState = EditState();
-	_detailSize = QSize();
-	_detailValid = false;
-	_beforeValid = false;
-	_beforeState = EditState();
-	_beforeSize = QSize();
-	_canvas->setBeforeImage(QImage());
-	_thumbsState = std::nullopt;
-	++_thumbsGeneration;
-	refreshPreview(true);
-	if (_comparing) {
-		refreshBefore();
-	}
-	scheduleThumbnails();
+	_controller->changeLayer(id, [=](Layer &layer) {
+		layer.content = cutout;
+	});
 }
 
 void Editor::apply(EditState state, bool commitNow) {
 	state = Normalized(std::move(state));
-	const auto changed = !(state == _state);
-	if (changed) {
-		_state = std::move(state);
-		stateChanged();
+	if (!_controller->hasDocument()) {
+		// Still loading: the document starts from this state.
+		if (!(state == _state)) {
+			_state = std::move(state);
+			stateChanged();
+		}
+		return;
 	}
-	if (commitNow) {
-		commit();
-	} else if (changed) {
-		_commitTimer.callOnce(kCommitDelay);
-	}
+	auto document = _controller->document();
+	document.global = std::move(state);
+	_controller->apply(std::move(document), commitNow);
 }
 
 void Editor::commit() {
-	_commitTimer.cancel();
-	if (_history[_historyIndex] == _state) {
-		return;
-	}
-	_history.resize(_historyIndex + 1);
-	_history.push_back(_state);
-	if (int(_history.size()) > kHistoryLimit) {
-		_history.erase(begin(_history));
-	}
-	_historyIndex = int(_history.size()) - 1;
-	refreshHistoryButtons();
+	_controller->commit();
 }
 
 void Editor::undo() {
-	commit();
-	if (_historyIndex > 0) {
-		--_historyIndex;
-		applyHistory();
+	if (!_controller->canUndo()) {
+		return;
 	}
+	_controller->undo();
+	_canvas->setGridVisible(false);
+	syncRatio();
 }
 
 void Editor::redo() {
-	commit();
-	if (_historyIndex + 1 < int(_history.size())) {
-		++_historyIndex;
-		applyHistory();
+	if (!_controller->canRedo()) {
+		return;
 	}
-}
-
-void Editor::applyHistory() {
-	_state = _history[_historyIndex];
+	_controller->redo();
 	_canvas->setGridVisible(false);
 	syncRatio();
+}
+
+void Editor::documentChanged() {
+	const auto &document = _controller->document();
+	_state = document.global;
+	_sourceSize = document.size;
 	stateChanged();
-	refreshHistoryButtons();
+	// The layers list (under the pages, or the page of its own tab in
+	// a narrow window) is as tall as its rows.
+	if ((!narrow() || _tab == Tab::Layers)
+		&& layersNaturalHeight() != _layersNatural) {
+		updateLayout();
+	}
 }
 
 void Editor::syncRatio() {
@@ -1947,9 +3348,20 @@ void Editor::syncRatio() {
 
 void Editor::refreshHistoryButtons() {
 	if (_undo) {
-		_undo->setAvailable(_historyIndex > 0);
-		_redo->setAvailable(_historyIndex + 1 < int(_history.size()));
+		_undo->setAvailable(_controller->canUndo());
+		_redo->setAvailable(_controller->canRedo());
 	}
+}
+
+bool Editor::resetAvailable() const {
+	if (!IsIdentity(_state)) {
+		return true;
+	} else if (!_controller->hasDocument()) {
+		return false;
+	}
+	const auto &now = _controller->document();
+	const auto &initial = _controller->initialDocument();
+	return (now.size != initial.size) || !(now.layers == initial.layers);
 }
 
 void Editor::stateChanged() {
@@ -1963,8 +3375,9 @@ void Editor::stateChanged() {
 	_canvas->setCrop(_state.crop);
 	_canvas->setCropRatio(cropRatio());
 	_refreshControls.fire({});
+	refreshBackgroundState();
 	if (_reset) {
-		_reset->setAvailable(!IsIdentity(_state));
+		_reset->setAvailable(resetAvailable());
 	}
 	if (_undo) {
 		refreshHistoryButtons();
@@ -1973,6 +3386,7 @@ void Editor::stateChanged() {
 	if (_comparing) {
 		refreshBefore();
 	}
+	refreshAnalysis();
 	scheduleThumbnails();
 	update(topBarRect());
 }
@@ -1985,38 +3399,67 @@ EditState Editor::displayState() const {
 	return result;
 }
 
+Document Editor::displayDocument() const {
+	auto result = _controller->document();
+	result.global = displayState();
+	return result;
+}
+
+RenderKey Editor::displayKey() const {
+	return {
+		.revision = _controller->revision(),
+		.uncropped = (_tab == Tab::Crop),
+	};
+}
+
+double Editor::proxyScale() const {
+	return ScaleForSide(_controller->document().size, _previewSide);
+}
+
 bool Editor::dirty() const {
-	return _withBackground.has_value()
-		|| !(Normalized(_state) == _initial);
+	return _controller->modified()
+		|| (_options.unsaved && _controller->hasDocument());
 }
 
 void Editor::refreshPreview(bool force) {
 	if (!_sourceReady) {
 		return;
 	}
-	const auto display = displayState();
-	const auto frame = OutputSize(_source.size(), display);
+	const auto key = displayKey();
+	const auto display = displayDocument();
+	const auto frame = OutputSize(display);
 	if (frame != _canvas->frameSize()) {
 		_beforeValid = false;
 	}
 	_canvas->setFrameSize(frame);
+	_canvas->setFrameTransform(OutputTransform(display, frame));
 	const auto fit = _canvas->fitPixels();
 	if (fit.isEmpty()) {
 		return;
 	}
 	const auto fitSide = std::max(fit.width(), fit.height());
-	const auto sourceSide = std::max(_source.width(), _source.height());
+	const auto sourceSide = std::max(
+		display.size.width(),
+		display.size.height());
 	const auto target = std::min(
 		std::max(kPreviewMinSide, int(fitSide * kPreviewGrow)),
 		sourceSide);
 	if (_previewSide * kDetailThreshold < target
 		|| _previewSide > target * kPreviewShrink) {
-		preparePreview(target);
+		_previewSide = target;
+		force = true;
 	}
-	if (force || !(display == _fastState) || fit != _fastSize) {
-		_fastState = display;
+	const auto active = _controller->activeLayerId();
+	if (force || !(key == _fastKey) || fit != _fastSize) {
+		_fastKey = key;
 		_fastSize = fit;
-		_fastId = _renderer->request(_preview, display, fit);
+		_fastId = _renderer->request({
+			.document = display,
+			.scale = proxyScale(),
+			.size = fit,
+			.active = active,
+			.key = key,
+		});
 
 		// It drops a detail render still in progress and its result may
 		// replace the detail one on the screen (an undo and a redo in a
@@ -2024,7 +3467,10 @@ void Editor::refreshPreview(bool force) {
 		_detailValid = false;
 	}
 	const auto needed = _canvas->renderPixels();
-	const auto fast = OutputSize(_preview.size(), display, fit);
+	const auto fast = OutputSize(
+		ScaledSize(display.size, proxyScale()),
+		display.global,
+		fit);
 	if (needed.width() > fast.width() * kDetailThreshold
 		|| needed.height() > fast.height() * kDetailThreshold) {
 		_detailTimer.callOnce(kDetailDelay);
@@ -2037,39 +3483,48 @@ void Editor::requestDetail() {
 	if (!_sourceReady) {
 		return;
 	}
-	const auto display = displayState();
+	const auto key = displayKey();
 	const auto needed = _canvas->renderPixels();
-	if (_detailValid && display == _detailState && needed == _detailSize) {
+	if (_detailValid && key == _detailKey && needed == _detailSize) {
 		return;
 	}
-	_detailState = display;
+	_detailKey = key;
 	_detailSize = needed;
-	_detailId = _renderer->request(_source, display, needed, true);
+	const auto display = displayDocument();
+	_detailId = _renderer->request({
+		.document = display,
+		.scale = ScaleForOutput(needed, OutputSize(display)),
+		.size = needed,
+		.active = _controller->activeLayerId(),
+		.key = key,
+		.cancellable = true,
+	});
 	_detailValid = true;
 }
 
 void Editor::previewReady(PreviewRenderer::Result &&result) {
-	if (result.id < _shownId
-		|| OutputSize(_source.size(), result.state)
-			!= _canvas->frameSize()) {
+	if (result.id < _shownId || result.frame != _canvas->frameSize()) {
 		return;
 	}
-	if (result.state == _shownState
+	if (_shownAny
+		&& result.key == _shownKey
 		&& _canvas->hasImage()
 		&& result.image.width() < _shownSize.width()
 		&& result.size == _fastSize
-		&& _detailState == _shownState) {
+		&& _detailKey == _shownKey) {
 		if (result.id == _fastId && _shownId == _detailId) {
 			// Everything requested is done and the detail render stays.
 			_detailValid = true;
 		}
 		return;
 	}
+	_shownAny = true;
 	_shownId = result.id;
-	_shownState = result.state;
+	_shownKey = result.key;
 	_shownSize = result.image.size();
 	_canvas->setImage(std::move(result.image));
 	_canvas->setLoading(false);
+	_controller->setShownRevision(_shownKey.revision);
 }
 
 void Editor::refreshBefore() {
@@ -2078,9 +3533,13 @@ void Editor::refreshBefore() {
 	}
 	const auto display = GeometryOnly(displayState());
 	const auto needed = _canvas->renderPixels();
-	if (_beforeValid && display == _beforeState && needed == _beforeSize) {
+	const auto canvas = _controller->document().size;
+	if (_beforeValid
+		&& display == _beforeState
+		&& needed == _beforeSize
+		&& canvas == _beforeCanvas) {
 		return;
-	} else if (!(display == _beforeState)) {
+	} else if (!(display == _beforeState) || canvas != _beforeCanvas) {
 		// Another geometry: the old original would be shown turned or
 		// flipped the wrong way until the new one is ready.
 		_beforeValid = false;
@@ -2088,23 +3547,70 @@ void Editor::refreshBefore() {
 	}
 	_beforeState = display;
 	_beforeSize = needed;
-	const auto &full = _withBackground ? _withBackground->source : _source;
-	const auto &small = _withBackground
-		? _withBackground->preview
-		: _preview;
-	const auto fast = OutputSize(small.size(), display, needed);
-	const auto &source = (needed.width() > fast.width() * kDetailThreshold)
-		? full
-		: small;
-	_beforeRenderer->request(source, display, needed);
+	_beforeCanvas = canvas;
+	// The canvas may have got another size since the picture was opened
+	// (the Crop tab, the proportions of a collage). The original is shown
+	// on the canvas of the result, where it was put when the canvas was
+	// resized: in the same frame, not stretched over it.
+	auto document = OnCanvas(_controller->initialDocument(), canvas);
+	document.global = display;
+	const auto scale = std::max(
+		ScaleForSide(document.size, _previewSide),
+		ScaleForOutput(needed, OutputSize(document)));
+	_beforeId = _beforeRenderer->request({
+		.document = std::move(document),
+		.scale = scale,
+		.size = needed,
+	});
 }
 
 void Editor::beforeReady(PreviewRenderer::Result &&result) {
-	if (!(result.state == _beforeState) || result.size != _beforeSize) {
+	if (result.id != _beforeId
+		|| result.size != _beforeSize
+		|| result.frame != _canvas->frameSize()) {
 		return;
 	}
 	_beforeValid = true;
 	_canvas->setBeforeImage(std::move(result.image));
+}
+
+// A little picture of the flattened layers: the source of the filter
+// thumbnails and the answer to "does the result have transparency".
+void Editor::refreshAnalysis() {
+	if (!_sourceReady || _analysisRunning) {
+		return;
+	}
+	const auto revision = _controller->layersRevision();
+	if (_analysisRevision == revision) {
+		return;
+	}
+	_analysisRunning = true;
+	crl::async([
+			weak = base::make_weak(this),
+			compositor = _controller->compositor(),
+			document = _controller->document(),
+			revision] {
+		auto reduced = compositor->render(document, {
+			.scale = ScaleForSide(document.size, kThumbSourceSide),
+			.global = false,
+			.preview = true,
+		});
+		const auto alpha = HasTransparentPixels(reduced);
+		crl::on_main(weak, [=, reduced = std::move(reduced)]() mutable {
+			weak->analysisReady(std::move(reduced), alpha, revision);
+		});
+	});
+}
+
+void Editor::analysisReady(QImage reduced, bool alpha, uint64 revision) {
+	_analysisRunning = false;
+	_analysisRevision = revision;
+	_thumbSource = std::move(reduced);
+	_hasAlpha = alpha;
+	_thumbsState = std::nullopt;
+	++_thumbsGeneration;
+	scheduleThumbnails();
+	refreshAnalysis();
 }
 
 void Editor::setComparing(bool comparing) {
@@ -2293,14 +3799,17 @@ void Editor::autoEnhance() {
 	_autoBusy = true;
 	_autoButtonText = tr::lng_oblivion_photo_ui_auto_working(tr::now);
 	_autoButton->setBusy(true);
+	auto document = _controller->document();
+	document.global = GeometryOnly(_state);
 	crl::async([
 			weak = base::make_weak(this),
-			source = _preview,
-			geometry = GeometryOnly(_state)] {
-		const auto framed = Render(
-			source,
-			geometry,
-			QSize(kAutoSide, kAutoSide));
+			compositor = _controller->compositor(),
+			document = std::move(document)] {
+		const auto framed = compositor->render(document, {
+			.scale = ScaleForSide(document.size, 2 * kAutoSide),
+			.maxSize = QSize(kAutoSide, kAutoSide),
+			.preview = true,
+		});
 		auto target = AutoEnhance(framed);
 		crl::on_main(weak, [=, target = std::move(target)]() mutable {
 			weak->autoReady(std::move(target));
@@ -2401,6 +3910,14 @@ void Editor::updateLayout() {
 		? FilterStrip::StripHeight()
 		: 0;
 	const auto isNarrow = narrow();
+	_tabs->setTabVisible(int(Tab::Layers), isNarrow);
+	if (!isNarrow && _tab == Tab::Layers) {
+		_tab = Tab::Layer;
+		_tabs->setActive(int(_tab), anim::type::instant);
+		for (auto i = 0; i != int(_pages.size()); ++i) {
+			_pages[i].scroll->setVisible(i == int(_tab));
+		}
+	}
 	const auto panelWidth = isNarrow
 		? std::max(width() - 2 * margin, 1)
 		: std::min(Px(kPanelWidth), width() / 2);
@@ -2412,7 +3929,8 @@ void Editor::updateLayout() {
 		page.content->resizeToWidth(panelWidth);
 	}
 	auto panel = QRect();
-	auto canvas = QRect();
+	auto canvasBottom = 0;
+	_layersNatural = layersNaturalHeight();
 	if (isNarrow) {
 		// Under the photo the panel takes only what the current page
 		// needs (up to a part of the window), the rest goes to the photo.
@@ -2420,9 +3938,11 @@ void Editor::updateLayout() {
 			height() * kNarrowPanelPercent / 100,
 			1);
 		const auto &page = _pages[int(_tab)];
-		const auto natural = pagesTop
-			+ page.content->height()
-			+ radius / 2;
+		const auto natural = (_tab != Tab::Layers)
+			? (pagesTop + page.content->height() + radius / 2)
+			: (_layersNatural > 0)
+			? (pagesTop + _layersNatural + radius / 2)
+			: maxHeight;
 		const auto panelHeight = std::clamp(
 			natural,
 			std::min(Px(kNarrowPanelMin), maxHeight),
@@ -2432,23 +3952,29 @@ void Editor::updateLayout() {
 			height() - margin - panelHeight,
 			panelWidth,
 			panelHeight);
-		canvas = QRect(
-			0,
-			top,
-			width(),
-			std::max(panel.y() - top - stripHeight - Px(kCanvasPanelGap), 1));
+		canvasBottom = panel.y() - stripHeight - Px(kCanvasPanelGap);
 	} else {
 		panel = QRect(
 			width() - margin - panelWidth,
 			top,
 			panelWidth,
 			height() - top - margin);
-		canvas = QRect(
-			0,
-			top,
-			std::max(panel.x() - Px(kCanvasPanelGap), 1),
-			std::max(height() - top - stripHeight, 1));
+		canvasBottom = height() - stripHeight;
 	}
+	const auto toolsHeight = std::max(
+		(isNarrow ? canvasBottom : (height() - margin)) - top,
+		1);
+	const auto toolsWidth = _toolStrip->widthForHeight(toolsHeight);
+	_toolStrip->setGeometry(margin, top, toolsWidth, toolsHeight);
+	const auto canvasLeft = margin + toolsWidth + Px(kToolStripGap);
+	const auto canvasRight = isNarrow
+		? width()
+		: (panel.x() - Px(kCanvasPanelGap));
+	const auto canvas = QRect(
+		canvasLeft,
+		top,
+		std::max(canvasRight - canvasLeft, 1),
+		std::max(canvasBottom - top, 1));
 	_panel->setGeometry(panel);
 	_canvas->setGeometry(canvas);
 	if (stripHeight) {
@@ -2461,13 +3987,49 @@ void Editor::updateLayout() {
 	_strip->setVisible(stripHeight > 0);
 
 	_tabs->moveToLeft(inset, inset, panel.width());
+	const auto pagesBottom = panel.height() - radius / 2;
+	auto pagesHeight = std::max(pagesBottom - pagesTop, 1);
+	if (isNarrow) {
+		_layersTop = 0;
+		_layersPanel->setGeometry(0, pagesTop, panel.width(), pagesHeight);
+		_layersPanel->setVisible(_tab == Tab::Layers);
+	} else {
+		// The layers list takes the bottom part of the plate: what its
+		// rows need, but not more than a part of the plate (it scrolls
+		// then). The pages never get less than they need to stay usable.
+		const auto limit = std::clamp(
+			panel.height() * kLayersPercent / 100,
+			Px(kLayersMin),
+			Px(kLayersMax));
+		const auto wanted = (_layersNatural > 0)
+			? std::clamp(_layersNatural, Px(kLayersCompactMin), limit)
+			: limit;
+		const auto layersHeight = std::max(
+			std::min(wanted, pagesHeight - Px(kPagesMin) - Px(kLayersSkip)),
+			0);
+		const auto shown = (layersHeight >= Px(kLayersMin) / 2);
+		if (shown) {
+			pagesHeight -= layersHeight + Px(kLayersSkip);
+			_layersTop = pagesTop + pagesHeight + Px(kLayersSkip);
+			_layersPanel->setGeometry(
+				0,
+				_layersTop,
+				panel.width(),
+				std::max(pagesBottom - _layersTop, 1));
+		} else {
+			_layersTop = 0;
+		}
+		_layersPanel->setVisible(shown);
+	}
 	for (const auto &page : _pages) {
 		page.scroll->setGeometry(
 			0,
 			pagesTop,
 			panel.width(),
-			std::max(panel.height() - pagesTop - radius / 2, 1));
+			std::max(pagesHeight, 1));
 	}
+	refreshPagesFade();
+	_panel->update();
 	if (_busy) {
 		_busy->setGeometry(rect());
 	}
@@ -2475,6 +4037,11 @@ void Editor::updateLayout() {
 }
 
 void Editor::selectTab(Tab tab) {
+	if (tab == Tab::Tool && !_toolHasOptions) {
+		tab = Tab::Layer;
+	} else if (tab == Tab::Layers && !narrow()) {
+		tab = Tab::Layer;
+	}
 	const auto wasCrop = (_tab == Tab::Crop);
 	_tab = tab;
 	if (wasCrop && tab != Tab::Crop) {
@@ -2482,7 +4049,8 @@ void Editor::selectTab(Tab tab) {
 	}
 	_tabs->setActive(int(tab));
 	for (auto i = 0; i != int(_pages.size()); ++i) {
-		_pages[i].scroll->setVisible(i == int(tab));
+		_pages[i].scroll->setVisible(
+			(i == int(tab)) && (tab != Tab::Layers));
 	}
 	_canvas->setCropMode(tab == Tab::Crop);
 	updateLayout();
@@ -2508,9 +4076,7 @@ void Editor::paintEvent(QPaintEvent *e) {
 	}
 	const auto &titleFont = TitleFont();
 	const auto &subtitleFont = SmallFont();
-	const auto subtitle = _sourceReady
-		? SizeText(OutputSize(_source.size(), _state))
-		: SizeText(OutputSize(_sourceSize, _state));
+	const auto subtitle = SizeText(OutputSize(_sourceSize, _state));
 	const auto full = titleFont->height
 		+ Px(kSubtitleSkip)
 		+ subtitleFont->height;
@@ -2540,6 +4106,80 @@ void Editor::resizeEvent(QResizeEvent *e) {
 	updateLayout();
 }
 
+// A key that a text field inside of the editor had no use for (Backspace
+// in a field that is empty already, an arrow at the end of the text)
+// comes up here through the parents of the field. It is not a shortcut of
+// the editor or of the tool then: Backspace removes a layer or a photo of
+// a collage there. Only the modifier keys and what is pressed with
+// Ctrl / Cmd (save, zoom, done) go on.
+[[nodiscard]] bool KeyOfTextField(
+		not_null<const QWidget*> editor,
+		not_null<const QKeyEvent*> e) {
+	switch (e->key()) {
+	case Qt::Key_Shift:
+	case Qt::Key_Control:
+	case Qt::Key_Meta:
+	case Qt::Key_Alt:
+	case Qt::Key_AltGr:
+		return false;
+	}
+	if (e->modifiers() & Qt::ControlModifier) {
+		return false;
+	}
+	const auto focused = QApplication::focusWidget();
+	return focused
+		&& editor->isAncestorOf(focused)
+		&& (qobject_cast<QTextEdit*>(focused)
+			|| qobject_cast<QLineEdit*>(focused));
+}
+
+bool Editor::handleToolKey(not_null<QKeyEvent*> e) {
+	const auto tool = _canvas->cropMode() ? nullptr : _controller->tool();
+	return tool && tool->keyPress(e);
+}
+
+bool Editor::importFrom(not_null<const QMimeData*> data) {
+	if (!_sourceReady || _exporting) {
+		return false;
+	}
+	const auto paths = ImagePaths(data);
+	if (!paths.isEmpty()) {
+		_controller->importFiles(paths);
+		return true;
+	} else if (data->hasImage()) {
+		auto image = qvariant_cast<QImage>(data->imageData());
+		if (!image.isNull()) {
+			_controller->addImageLayer(std::move(image), QString());
+			return true;
+		}
+	}
+	return false;
+}
+
+void Editor::dragEnterEvent(QDragEnterEvent *e) {
+	const auto data = e->mimeData();
+	if (_sourceReady
+		&& !_exporting
+		&& data
+		&& (!ImagePaths(data).isEmpty() || data->hasImage())) {
+		e->setDropAction(Qt::CopyAction);
+		e->accept();
+	} else {
+		e->ignore();
+	}
+}
+
+void Editor::dropEvent(QDropEvent *e) {
+	const auto data = e->mimeData();
+	if (data && importFrom(data)) {
+		e->setDropAction(Qt::CopyAction);
+		e->accept();
+		setFocus();
+	} else {
+		e->ignore();
+	}
+}
+
 void Editor::keyPressEvent(QKeyEvent *e) {
 	if (_exporting) {
 		if (_removingBackground
@@ -2555,6 +4195,32 @@ void Editor::keyPressEvent(QKeyEvent *e) {
 		& ~(Qt::KeypadModifier | Qt::GroupSwitchModifier);
 	const auto command = (modifiers & Qt::ControlModifier) != 0;
 	const auto shift = (modifiers & Qt::ShiftModifier) != 0;
+	if (key == Qt::Key_Escape) {
+		// A held key that has just cancelled something must not go on
+		// and close the editor.
+		if (e->isAutoRepeat()) {
+			e->accept();
+			return;
+		}
+		const auto tool = _canvas->cropMode() ? nullptr : _controller->tool();
+		if (tool && tool->cancel()) {
+			_canvas->update();
+		} else if (_controller->hasTemporaryTool()) {
+			_controller->clearTemporaryTool();
+		} else {
+			requestClose();
+		}
+		e->accept();
+		return;
+	}
+	if (KeyOfTextField(this, e)) {
+		e->accept();
+		return;
+	}
+	if (handleToolKey(e)) {
+		e->accept();
+		return;
+	}
 	if (e->matches(QKeySequence::Undo)
 		|| (command && !shift && key == Qt::Key_Z)) {
 		undo();
@@ -2570,21 +4236,26 @@ void Editor::keyPressEvent(QKeyEvent *e) {
 		if (!e->isAutoRepeat()) {
 			_canvas->setPanMode(true);
 		}
-	} else if (key == Qt::Key_Escape) {
-		// A held key that has just cancelled something must not go on
-		// and close the editor.
-		if (!e->isAutoRepeat()) {
-			requestClose();
-		}
 	} else if (command && (key == Qt::Key_Return || key == Qt::Key_Enter)) {
-		done();
+		if (!e->isAutoRepeat()) {
+			done();
+		}
 	} else if (command && !shift && key == Qt::Key_S) {
-		if (_options.allowSaveToFile || !_options.done) {
+		if (!e->isAutoRepeat()
+			&& (_options.allowSaveToFile || !_options.done)) {
 			saveToFile(false);
 		}
 	} else if (command && shift && key == Qt::Key_C) {
-		if (_options.allowCopy) {
+		if (!e->isAutoRepeat() && _options.allowCopy) {
 			copyToClipboard();
+		}
+	} else if (command && !shift && key == Qt::Key_V) {
+		// A held key would add a layer with every repeat.
+		if (!e->isAutoRepeat()) {
+			const auto data = QGuiApplication::clipboard()->mimeData();
+			if (!data || !importFrom(data)) {
+				toast(tr::lng_oblivion_photo_io_paste_empty(tr::now));
+			}
 		}
 	} else if (e->matches(QKeySequence::ZoomIn)
 		|| (command && (key == Qt::Key_Equal || key == Qt::Key_Plus))) {
@@ -2594,13 +4265,26 @@ void Editor::keyPressEvent(QKeyEvent *e) {
 		_canvas->zoomOut();
 	} else if (command && key == Qt::Key_0) {
 		_canvas->zoomFit();
-	} else if (!modifiers && key >= Qt::Key_1 && key <= Qt::Key_5) {
+	} else if (!modifiers && key >= Qt::Key_1 && key <= Qt::Key_7) {
+		// 7 is the Tool tab, the Layer tab while the tool has no options.
 		selectTab(Tab(key - Qt::Key_1));
 	} else if (!modifiers
 		&& _tab == Tab::Filters
 		&& (key == Qt::Key_Left || key == Qt::Key_Right)) {
 		stepFilter((key == Qt::Key_Left) ? -1 : 1);
 	} else {
+		if (!modifiers && !e->isAutoRepeat() && _tab != Tab::Crop) {
+			for (const auto descriptor : AllTools()) {
+				if (descriptor->key
+					&& descriptor->key == key
+					&& (!descriptor->available
+						|| descriptor->available(_controller.get()))) {
+					_controller->setTool(descriptor->id);
+					e->accept();
+					return;
+				}
+			}
+		}
 		e->ignore();
 		return;
 	}
@@ -2616,6 +4300,12 @@ void Editor::keyReleaseEvent(QKeyEvent *e) {
 		setComparing(false);
 	} else if (key == Qt::Key_Space) {
 		_canvas->setPanMode(false);
+	} else if (!_exporting && !_canvas->cropMode()) {
+		if (const auto tool = _controller->tool()) {
+			if (tool->keyRelease(e)) {
+				e->accept();
+			}
+		}
 	}
 }
 
@@ -2638,36 +4328,43 @@ void Editor::setExporting(bool exporting, QString text) {
 }
 
 void Editor::exportResult(Fn<void(PhotoEditorResult)> callback) {
-	if (_exporting || !_sourceReady) {
+	if (_exporting || !_sourceReady || _finished) {
 		return;
 	}
 	commit();
 	setExporting(true, tr::lng_oblivion_photo_ui_processing(tr::now));
+	const auto document = std::make_shared<const Document>(
+		_controller->document());
 	crl::async([
 			weak = base::make_weak(this),
-			source = _source,
-			replaced = _withBackground.has_value(),
-			state = _state,
+			document,
 			maxSize = _options.maxOutputSize,
 			callback = std::move(callback)]() mutable {
-		auto image = Render(source, state, maxSize);
+		auto image = RenderDocument(*document, maxSize);
 		// The callback is moved to the main thread lambda, so whatever it
 		// holds (shows, windows...) is never released on this worker.
 		crl::on_main(weak, [
 				weak,
-				state,
+				document,
 				image = std::move(image),
-				source = replaced ? source : QImage(),
 				callback = std::move(callback)]() mutable {
 			weak->setExporting(false);
 			if (image.isNull()) {
 				weak->toast(tr::lng_oblivion_photo_ui_export_failed(tr::now));
 				return;
 			}
+			auto source = QImage();
+			if (IsPlainImage(*document)) {
+				const auto content = AsImage(document->layers.front().content);
+				if (content->original()) {
+					source = content->image();
+				}
+			}
 			callback({
 				.image = std::move(image),
-				.state = state,
+				.state = document->global,
 				.source = std::move(source),
+				.document = document,
 			});
 		});
 	});
@@ -2687,7 +4384,7 @@ void Editor::done() {
 }
 
 void Editor::saveToFile(bool closeAfter) {
-	if (_exporting || !_sourceReady) {
+	if (_exporting || !_sourceReady || _finished) {
 		return;
 	}
 	struct Format {
@@ -2759,13 +4456,12 @@ void Editor::saveToFile(bool closeAfter) {
 				tr::lng_oblivion_photo_ui_saving(tr::now));
 			crl::async([
 					weak,
-					source = strong->_source,
-					state = strong->_state,
+					document = strong->_controller->document(),
 					maxSize = strong->_options.maxOutputSize,
 					path,
 					format,
 					closeAfter] {
-				const auto image = Render(source, state, maxSize);
+				const auto image = RenderDocument(document, maxSize);
 				const auto ok = !image.isNull()
 					&& SaveImage(image, path, format, kSaveQuality);
 				crl::on_main(weak, [=] {
@@ -2820,6 +4516,12 @@ void Editor::showMoreMenu() {
 	_menu = base::make_unique_q<Ui::PopupMenu>(
 		this,
 		st::mediaviewPopupMenu);
+	if (_sourceReady) {
+		_menu->addAction(
+			tr::lng_oblivion_photo_panel_import(tr::now),
+			[=] { _controller->chooseAndImport(); },
+			&st::mediaMenuIconShowAll);
+	}
 	if (_options.allowSaveToFile) {
 		_menu->addAction(
 			tr::lng_oblivion_photo_ui_save_file(tr::now),
@@ -2882,6 +4584,8 @@ void Editor::finish(Fn<void()> after) {
 		return;
 	}
 	_finished = true;
+	// What is under the editor gets the focus next.
+	GuardHeldKeys();
 	crl::on_main(this, [=] {
 		_closeRequests.fire({});
 		if (after) {
@@ -2890,12 +4594,43 @@ void Editor::finish(Fn<void()> after) {
 	});
 }
 
+void Editor::scrollTabToEnd() {
+	if (_pages.empty() || _tab == Tab::Layers) {
+		return;
+	}
+	const auto scroll = _pages[int(_tab)].scroll;
+	scroll->scrollToY(scroll->scrollTopMax());
+}
+
+// The highlight of the tab bar slides to the tab a scene has chosen: in
+// a picture it is where it is going.
+void Editor::finishAnimations() {
+	_tabs->finishAnimating();
+}
+
 bool Editor::snapshotReady() const {
-	return _sourceReady
+	const auto ready = _sourceReady
 		&& _canvas->hasImage()
+		&& _shownAny
+		&& (_shownKey == displayKey())
 		&& (_tab != Tab::Filters || _strip->thumbnailsReady())
 		&& (!_comparing || _beforeValid)
+		&& !_controller->busy()
+		&& !_controller->thumbnailsPending()
 		&& _busy->settled();
+	if (!ready) {
+		_snapshotSettledFrom = 0;
+		return false;
+	}
+	// The picture is there, but the highlight of the tab bar and the
+	// switches are still sliding and the thumbnails of the layers list
+	// are asked for with a delay: a scene taken right now showed them
+	// half way. Give them time to finish.
+	const auto now = crl::now();
+	if (!_snapshotSettledFrom) {
+		_snapshotSettledFrom = now;
+	}
+	return (now - _snapshotSettledFrom >= kSceneSettle);
 }
 
 class EditorLayer final : public Ui::LayerWidget {
@@ -3005,7 +4740,7 @@ void EditorLayer::keyPressEvent(QKeyEvent *e) {
 		std::move(options));
 }
 
-void RegisterEditorScene(
+void RegisterOptionsScene(
 		QString name,
 		QSize size,
 		Fn<PhotoEditorOptions()> options,
@@ -3018,9 +4753,11 @@ void RegisterEditorScene(
 			return CreateScene(parent, options());
 		},
 		.prepare = [=](not_null<QWidget*> widget) {
+			const auto editor = static_cast<Editor*>(widget.get());
 			if (prepare) {
-				prepare(static_cast<Editor*>(widget.get()));
+				prepare(editor);
 			}
+			editor->finishAnimations();
 		},
 		.ready = [](not_null<QWidget*> widget) {
 			return static_cast<Editor*>(widget.get())->snapshotReady();
@@ -3029,9 +4766,77 @@ void RegisterEditorScene(
 	});
 }
 
+// A panel of the editor alone, see RegisterPanelScene().
+class PanelSceneHost final : public Ui::RpWidget {
+public:
+	PanelSceneHost(
+		QWidget *parent,
+		std::shared_ptr<Ui::Show> show,
+		const PanelSceneArgs &args);
+	~PanelSceneHost();
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+	int resizeGetHeight(int newWidth) override;
+
+private:
+	const int _fixedHeight = 0;
+	std::unique_ptr<Controller> _controller;
+	Ui::RpWidget *_panel = nullptr;
+
+};
+
+PanelSceneHost::PanelSceneHost(
+	QWidget *parent,
+	std::shared_ptr<Ui::Show> show,
+	const PanelSceneArgs &args)
+: RpWidget(parent)
+, _fixedHeight(args.size.height())
+, _controller(std::make_unique<Controller>(std::move(show))) {
+	_controller->setDocument(args.document
+		? args.document()
+		: SampleSceneDocument());
+	if (args.prepare) {
+		args.prepare(_controller.get());
+	}
+	if (args.create) {
+		auto panel = args.create(this, _controller.get());
+		_panel = panel.release();
+	}
+	if (_panel) {
+		_panel->show();
+		_panel->heightValue() | rpl::skip(1) | rpl::on_next([=] {
+			if (!_fixedHeight) {
+				resizeToWidth(width());
+			}
+		}, _panel->lifetime());
+	}
+}
+
+PanelSceneHost::~PanelSceneHost() {
+	_controller->shutdown();
+	delete base::take(_panel);
+}
+
+void PanelSceneHost::paintEvent(QPaintEvent *e) {
+	QPainter(this).fillRect(e->rect(), st::groupCallMembersBg);
+}
+
+int PanelSceneHost::resizeGetHeight(int newWidth) {
+	if (!_panel) {
+		return _fixedHeight;
+	} else if (_fixedHeight) {
+		_panel->setGeometry(0, 0, newWidth, _fixedHeight);
+		return _fixedHeight;
+	}
+	_panel->resizeToWidth(newWidth);
+	_panel->moveToLeft(0, 0, newWidth);
+	return _panel->height();
+}
+
 const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	const auto wide = QSize(1120, 720);
-	RegisterEditorScene(u"photo_editor_adjust"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_adjust"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Adjust;
 		options.state.exposure = 12;
@@ -3042,21 +4847,21 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		options.state.vignette = 30;
 		return options;
 	});
-	RegisterEditorScene(u"photo_editor_filters"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_filters"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Filters;
 		options.state.filter = u"film"_q;
 		options.state.filterIntensity = 80;
 		return options;
 	});
-	RegisterEditorScene(u"photo_editor_crop"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_crop"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Crop;
 		options.state.crop = QRectF(0.1, 0.05, 0.72, 0.9);
 		options.state.straighten = 2.5;
 		return options;
 	});
-	RegisterEditorScene(u"photo_editor_effects"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_effects"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Effects;
 		auto glitch = DefaultEffect(EffectType::Glitch);
@@ -3067,14 +4872,14 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	});
 	// The overlay of a running background removal, with the hint about
 	// the slow first run that shows up after kBusySlowHintDelay.
-	RegisterEditorScene(u"photo_editor_background_busy"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_background_busy"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Effects;
 		return options;
 	}, [](not_null<Editor*> editor) {
 		editor->showBackgroundProgress();
 	}, kBusySlowHintDelay + kSceneWait);
-	RegisterEditorScene(u"photo_editor_compare"_q, wide, [] {
+	RegisterOptionsScene(u"photo_editor_compare"_q, wide, [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Adjust;
 		options.state.filter = u"noir"_q;
@@ -3082,23 +4887,1171 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	}, [](not_null<Editor*> editor) {
 		editor->setComparing(true);
 	});
-	RegisterEditorScene(u"photo_editor_narrow"_q, QSize(520, 820), [] {
+	RegisterOptionsScene(u"photo_editor_narrow"_q, QSize(520, 820), [] {
 		auto options = PhotoEditorOptions();
 		options.tab = Tab::Filters;
 		options.state.filter = u"vivid"_q;
 		return options;
 	});
+	// The canvas size section at the end of the Crop page.
+	RegisterOptionsScene(u"photo_editor_crop_canvas"_q, wide, [] {
+		auto options = PhotoEditorOptions();
+		options.tab = Tab::Crop;
+		return options;
+	}, [](not_null<Editor*> editor) {
+		editor->scrollTabToEnd();
+	});
+	// The ends of the whole-picture pages: the way from them to the
+	// effects of the active layer.
+	RegisterOptionsScene(u"photo_editor_adjust_fine"_q, wide, [] {
+		auto options = PhotoEditorOptions();
+		options.tab = Tab::Adjust;
+		return options;
+	}, [](not_null<Editor*> editor) {
+		editor->scrollTabToEnd();
+	});
+	RegisterOptionsScene(u"photo_editor_effects_more"_q, wide, [] {
+		auto options = PhotoEditorOptions();
+		options.tab = Tab::Effects;
+		options.state.effects.push_back(DefaultEffect(EffectType::Sepia));
+		return options;
+	}, [](not_null<Editor*> editor) {
+		editor->scrollTabToEnd();
+	});
+
+	// The layered shell: three layers, the Layer tab with the effects of
+	// the active one, the layers list under it.
+	RegisterEditorScene({
+		.name = u"photo_editor_layers"_q,
+		.document = SampleSceneDocument,
+		.tab = Tab::Layer,
+		.prepare = [](not_null<Controller*> controller) {
+			const auto &layers = controller->document().layers;
+			if (layers.size() > 1) {
+				controller->setActiveLayer(layers[1].id);
+			}
+		},
+	});
+	RegisterEditorScene({
+		.name = u"photo_editor_layers_adjust"_q,
+		.document = [] {
+			auto document = SampleSceneDocument();
+			document.global.contrast = 20;
+			document.global.crop = QRectF(0.05, 0.05, 0.9, 0.85);
+			return document;
+		},
+		.tab = Tab::Adjust,
+	});
+	RegisterEditorScene({
+		.name = u"photo_editor_layers_narrow"_q,
+		.size = QSize(520, 820),
+		.document = SampleSceneDocument,
+		.tab = Tab::Layers,
+	});
+	// What a just opened photo looks like on the Layer tab: no effects
+	// yet, one row in the layers list (the list is as tall as that row).
+	RegisterEditorScene({
+		.name = u"photo_editor_layer_plain"_q,
+		.tab = Tab::Layer,
+	});
+	// The Auto tab before the button was pressed.
+	RegisterOptionsScene(u"photo_editor_auto"_q, wide, [] {
+		auto options = PhotoEditorOptions();
+		options.tab = Tab::Auto;
+		return options;
+	});
+	// More layers than the list can show: it stops growing and scrolls,
+	// the page above keeps its place.
+	RegisterEditorScene({
+		.name = u"photo_editor_layers_many"_q,
+		.document = [] {
+			auto document = SampleSceneDocument();
+			if (document.empty()) {
+				return document;
+			}
+			const auto canvas = document.size;
+			for (auto i = 0; i != 6; ++i) {
+				auto layer = MakeImageLayer(
+					FxTestImage(
+						std::max(canvas.width() / 5, 8),
+						std::max(canvas.height() / 5, 8),
+						(i % 2) == 1),
+					NewLayerName(document));
+				layer.transform = QTransform::fromTranslate(
+					canvas.width() * (0.06 + 0.13 * i),
+					canvas.height() * (0.08 + 0.06 * (i % 3)));
+				layer.opacity = 1. - 0.15 * (i % 3);
+				AddLayer(document, std::move(layer));
+			}
+			return document;
+		},
+		.tab = Tab::Adjust,
+	});
+	// A picture of a camera size (about 10 MP): it is scaled down to fit,
+	// while the small sample of the other scenes is enlarged.
+	RegisterEditorScene({
+		.name = u"photo_editor_large"_q,
+		.document = [] {
+			return DocumentFromImage(
+				SampleImage().scaledToWidth(4032, Qt::SmoothTransformation),
+				EditState(),
+				tr::lng_oblivion_photo_panel_layer_photo(tr::now));
+		},
+		.tab = Tab::Layer,
+	});
+	// The question about closing with changes nobody got a result of.
+	RegisterOptionsScene(u"photo_editor_close_confirm"_q, wide, [] {
+		auto options = PhotoEditorOptions();
+		options.tab = Tab::Adjust;
+		options.document = std::make_shared<const Document>(
+			DocumentFromImage(
+				SampleImage(),
+				EditState(),
+				tr::lng_oblivion_photo_panel_layer_photo(tr::now)));
+		options.unsaved = true;
+		return options;
+	}, [](not_null<Editor*> editor) {
+		editor->requestClose();
+	});
 });
 
 } // namespace
+
+int KeepInterruptedPhotoEdit(InterruptedPhotoEdit edit) {
+	auto &slot = Interrupted();
+	if (!edit.document || edit.document->empty()) {
+		return 0;
+	}
+	slot.edit = std::move(edit);
+	slot.id = ++slot.lastId;
+	return slot.id;
+}
+
+int InterruptedPhotoEditId() {
+	return Interrupted().id;
+}
+
+InterruptedPhotoEdit TakeInterruptedPhotoEdit() {
+	auto &slot = Interrupted();
+	slot.id = 0;
+	return base::take(slot.edit);
+}
+
+void DropInterruptedPhotoEdit(int id) {
+	auto &slot = Interrupted();
+	if (!id || slot.id == id) {
+		slot.id = 0;
+		slot.edit = InterruptedPhotoEdit();
+	}
+}
+
+void RegisterTool(ToolDescriptor &&descriptor) {
+	auto &registry = EditorRegistryData();
+	if (!registry.building
+		|| descriptor.id.isEmpty()
+		|| descriptor.id == kViewTool
+		|| !descriptor.create) {
+		return;
+	}
+	for (const auto &existing : registry.tools) {
+		if (existing->id == descriptor.id) {
+			return;
+		}
+	}
+	registry.tools.push_back(
+		std::make_unique<ToolDescriptor>(std::move(descriptor)));
+}
+
+void RegisterPanel(PanelDescriptor &&descriptor) {
+	auto &registry = EditorRegistryData();
+	if (!registry.building || !descriptor.create) {
+		return;
+	}
+	registry.panels.push_back(
+		std::make_unique<PanelDescriptor>(std::move(descriptor)));
+}
+
+void RegisterLayerKind(LayerKindDescriptor &&descriptor) {
+	auto &registry = EditorRegistryData();
+	if (!registry.building || descriptor.type.isEmpty()) {
+		return;
+	}
+	for (const auto &existing : registry.kinds) {
+		if (existing->type == descriptor.type) {
+			return;
+		}
+	}
+	registry.kinds.push_back(
+		std::make_unique<LayerKindDescriptor>(std::move(descriptor)));
+}
+
+EditorRegistrar::EditorRegistrar(Fn<void()> registerAll) {
+	EditorRegistrars().push_back(std::move(registerAll));
+}
+
+const std::vector<const ToolDescriptor*> &AllTools() {
+	return BuiltEditorRegistry().sortedTools;
+}
+
+const ToolDescriptor *FindTool(QByteArrayView id) {
+	for (const auto descriptor : AllTools()) {
+		if (QByteArrayView(descriptor->id) == id) {
+			return descriptor;
+		}
+	}
+	return nullptr;
+}
+
+const std::vector<const PanelDescriptor*> &AllPanels() {
+	return BuiltEditorRegistry().sortedPanels;
+}
+
+const std::vector<const LayerKindDescriptor*> &AllLayerKinds() {
+	return BuiltEditorRegistry().sortedKinds;
+}
+
+const LayerKindDescriptor *FindLayerKind(QByteArrayView type) {
+	for (const auto descriptor : AllLayerKinds()) {
+		if (QByteArrayView(descriptor->type) == type) {
+			return descriptor;
+		}
+	}
+	return nullptr;
+}
+
+Controller::Controller(std::shared_ptr<Ui::Show> show)
+: _show(std::move(show))
+, _compositor(std::make_shared<Compositor>())
+, _commitTimer([=] { commit(); })
+, _toolId(kViewTool) {
+}
+
+Controller::~Controller() {
+	shutdown();
+}
+
+const Document &Controller::document() const {
+	return _document;
+}
+
+bool Controller::hasDocument() const {
+	return _hasDocument;
+}
+
+rpl::producer<> Controller::documentChanges() const {
+	return _documentChanges.events();
+}
+
+uint64 Controller::revision() const {
+	return _revision;
+}
+
+uint64 Controller::layersRevision() const {
+	return _layersRevision;
+}
+
+void Controller::changed(bool layers) {
+	++_revision;
+	if (layers) {
+		++_layersRevision;
+	}
+	validateActiveLayer();
+	_documentChanges.fire({});
+}
+
+void Controller::validateActiveLayer() {
+	if (_document.find(_activeLayer.current())) {
+		return;
+	}
+	const auto top = _document.top();
+	_activeLayer = top ? top->id : LayerId(0);
+}
+
+void Controller::apply(Document document, bool commitNow) {
+	if (_shutdown || !_hasDocument) {
+		return;
+	}
+	const auto different = !(document == _document);
+	if (different) {
+		const auto layers = (document.size != _document.size)
+			|| !(document.layers == _document.layers);
+		// Ids are never reused, whatever copy the change was made from.
+		document.nextId = std::max(document.nextId, _document.nextId);
+		_document = std::move(document);
+		changed(layers);
+	}
+	if (commitNow) {
+		commit();
+	} else if (different && !_interacting) {
+		_commitTimer.callOnce(CommitDelay());
+	}
+}
+
+void Controller::change(Fn<void(Document&)> modify, bool commitNow) {
+	if (!modify || !_hasDocument) {
+		return;
+	}
+	auto document = _document;
+	modify(document);
+	apply(std::move(document), commitNow);
+}
+
+void Controller::changeLayer(
+		LayerId id,
+		Fn<void(Layer&)> modify,
+		bool commitNow) {
+	if (!modify || !_document.find(id)) {
+		return;
+	}
+	auto document = _document;
+	modify(*document.find(id));
+	apply(std::move(document), commitNow);
+}
+
+void Controller::changeFx(
+		LayerId id,
+		uint64 uid,
+		Fn<void(FxInstance&)> modify,
+		bool commitNow) {
+	if (!modify || !LayerFx(_document, id, uid)) {
+		return;
+	}
+	auto document = _document;
+	const auto instance = LayerFx(document, id, uid);
+	const auto keep = instance->uid;
+	modify(*instance);
+	instance->uid = keep;
+	apply(std::move(document), commitNow);
+}
+
+void Controller::commit() {
+	_commitTimer.cancel();
+	if (_shutdown || !_hasDocument) {
+		return;
+	} else if (_history.push(_document)) {
+		_historyChanges.fire({});
+	}
+}
+
+bool Controller::canUndo() const {
+	return _hasDocument
+		&& (_history.canUndo() || !(_history.current() == _document));
+}
+
+bool Controller::canRedo() const {
+	return _hasDocument && _history.canRedo();
+}
+
+void Controller::undo() {
+	if (_shutdown || !_hasDocument) {
+		return;
+	}
+	commit();
+	if (!_history.undo()) {
+		return;
+	}
+	const auto &target = _history.current();
+	const auto layers = (target.size != _document.size)
+		|| !(target.layers == _document.layers);
+	const auto nextId = _document.nextId;
+	_document = target;
+	_document.nextId = std::max(_document.nextId, nextId);
+	changed(layers);
+	_historyChanges.fire({});
+}
+
+void Controller::redo() {
+	if (_shutdown || !_hasDocument) {
+		return;
+	}
+	commit();
+	if (!_history.redo()) {
+		return;
+	}
+	const auto &target = _history.current();
+	const auto layers = (target.size != _document.size)
+		|| !(target.layers == _document.layers);
+	const auto nextId = _document.nextId;
+	_document = target;
+	_document.nextId = std::max(_document.nextId, nextId);
+	changed(layers);
+	_historyChanges.fire({});
+}
+
+rpl::producer<> Controller::historyChanges() const {
+	return _historyChanges.events();
+}
+
+void Controller::setDocument(Document document) {
+	if (_shutdown) {
+		return;
+	}
+	_commitTimer.cancel();
+	document.nextId = std::max(document.nextId, _document.nextId);
+	_document = std::move(document);
+	_initial = _document;
+	_history.reset(_document);
+	_hasDocument = !_document.empty();
+	const auto top = _document.top();
+	_activeLayer = top ? top->id : LayerId(0);
+	changed(true);
+	_historyChanges.fire({});
+}
+
+const Document &Controller::initialDocument() const {
+	return _initial;
+}
+
+bool Controller::modified() const {
+	return _hasDocument && !(_document == _initial);
+}
+
+LayerId Controller::activeLayerId() const {
+	return _activeLayer.current();
+}
+
+const Layer *Controller::activeLayer() const {
+	return _document.find(_activeLayer.current());
+}
+
+void Controller::setActiveLayer(LayerId id) {
+	if (_document.find(id)) {
+		_activeLayer = id;
+	}
+}
+
+rpl::producer<LayerId> Controller::activeLayerValue() const {
+	return _activeLayer.value();
+}
+
+LayerId Controller::addLayer(Layer layer) {
+	if (_shutdown || !_hasDocument || !layer.content) {
+		return 0;
+	}
+	if (layer.name.isEmpty()) {
+		layer.name = NewLayerName(_document);
+	}
+	auto document = _document;
+	const auto index = document.indexOf(_activeLayer.current());
+	const auto id = AddLayer(
+		document,
+		std::move(layer),
+		(index >= 0) ? (index + 1) : -1);
+	_document = std::move(document);
+	_activeLayer = id;
+	changed(true);
+	commit();
+	return id;
+}
+
+LayerId Controller::addImageLayer(QImage image, QString name) {
+	if (image.isNull() || !_hasDocument) {
+		return 0;
+	}
+	auto layer = MakeImageLayer(std::move(image), std::move(name));
+	layer.transform = PlaceTransform(
+		layer.size(),
+		_document.size,
+		Placement::Fit);
+	const auto result = addLayer(std::move(layer));
+	if (result) {
+		placeAdded();
+	}
+	return result;
+}
+
+// A picture that was just added is most likely about to be moved and
+// resized: the plain view tool gives way to the transform tool (a brush or
+// the collage tool stays what it is).
+void Controller::placeAdded() {
+	static const auto kPlaceTool = QByteArray("layer.transform");
+	if (_shutdown || _temporaryTool || _toolId.current() != kViewTool) {
+		return;
+	}
+	const auto descriptor = FindTool(kPlaceTool);
+	if (descriptor
+		&& (!descriptor->available || descriptor->available(this))) {
+		setTool(kPlaceTool);
+	}
+}
+
+void Controller::removeLayer(LayerId id) {
+	change([=](Document &document) {
+		RemoveLayer(document, id);
+	});
+}
+
+LayerId Controller::duplicateLayer(LayerId id) {
+	if (_shutdown || !_hasDocument) {
+		return 0;
+	}
+	auto document = _document;
+	const auto copy = DuplicateLayer(document, id);
+	if (!copy) {
+		return 0;
+	}
+	_document = std::move(document);
+	_activeLayer = copy;
+	changed(true);
+	commit();
+	return copy;
+}
+
+uint64 Controller::addFx(LayerId id, FxInstance instance) {
+	if (_shutdown || !_hasDocument) {
+		return 0;
+	}
+	auto document = _document;
+	const auto uid = AddLayerFx(document, id, std::move(instance));
+	if (uid) {
+		apply(std::move(document), true);
+	}
+	return uid;
+}
+
+FxValue Controller::fxParam(
+		LayerId id,
+		uint64 uid,
+		QByteArrayView param) const {
+	const auto instance = LayerFx(_document, id, uid);
+	if (!instance) {
+		return FxValue();
+	}
+	const auto descriptor = FindFx(instance->id);
+	const auto info = descriptor ? descriptor->param(param) : nullptr;
+	return info
+		? info->normalized(instance->params.value(param))
+		: instance->params.value(param);
+}
+
+void Controller::setFxParam(
+		LayerId id,
+		uint64 uid,
+		const QByteArray &param,
+		FxValue value,
+		bool commitNow) {
+	changeFx(id, uid, [&](FxInstance &instance) {
+		instance.params.set(param, std::move(value));
+	}, commitNow);
+}
+
+void Controller::chooseAndImport() {
+	const auto weak = base::make_weak(this);
+	chooseImages([=](std::vector<ImportedImage> images) {
+		if (const auto strong = weak.get()) {
+			strong->addImported(std::move(images));
+		}
+	});
+}
+
+void Controller::importFiles(const QStringList &paths) {
+	const auto weak = base::make_weak(this);
+	loadImages(paths, [=](std::vector<ImportedImage> images) {
+		if (const auto strong = weak.get()) {
+			strong->addImported(std::move(images));
+		}
+	});
+}
+
+void Controller::addImported(std::vector<ImportedImage> images) {
+	if (_shutdown || !_hasDocument || images.empty()) {
+		return;
+	}
+	auto document = _document;
+	auto index = document.indexOf(_activeLayer.current());
+	auto last = LayerId(0);
+	for (auto &entry : images) {
+		auto layer = MakeImageLayer(
+			std::move(entry.image),
+			entry.name.isEmpty() ? NewLayerName(document) : entry.name);
+		layer.transform = PlaceTransform(
+			layer.size(),
+			document.size,
+			Placement::Fit);
+		last = AddLayer(
+			document,
+			std::move(layer),
+			(index >= 0) ? ++index : -1);
+	}
+	_document = std::move(document);
+	_activeLayer = last;
+	changed(true);
+	commit();
+	placeAdded();
+}
+
+void Controller::chooseImages(
+		Fn<void(std::vector<ImportedImage> images)> done,
+		bool multiple) {
+	if (_shutdown || !_show || !_show->valid() || !done) {
+		return;
+	}
+	const auto weak = base::make_weak(this);
+	const auto callback = [=](FileDialog::OpenResult &&result) {
+		if (const auto strong = weak.get()) {
+			strong->loadImages(result.paths, done);
+		}
+	};
+	if (multiple) {
+		FileDialog::GetOpenPaths(
+			_show->toastParent().get(),
+			tr::lng_oblivion_photo_panel_import_title(tr::now),
+			FileDialog::ImagesFilter(),
+			callback);
+	} else {
+		FileDialog::GetOpenPath(
+			_show->toastParent().get(),
+			tr::lng_oblivion_photo_ui_open_title(tr::now),
+			FileDialog::ImagesFilter(),
+			callback);
+	}
+}
+
+void Controller::loadImages(
+		const QStringList &paths,
+		Fn<void(std::vector<ImportedImage> images)> done) {
+	if (_shutdown || paths.isEmpty() || busy() || !done) {
+		return;
+	}
+	_busy = tr::lng_oblivion_photo_io_loading(tr::now);
+	crl::async([
+			weak = base::make_weak(this),
+			list = paths.mid(0, kImportLimit),
+			requested = int(paths.size()),
+			done = std::move(done)]() mutable {
+		auto loaded = std::vector<ImportedImage>();
+		for (const auto &path : list) {
+			auto image = LoadImage(path);
+			if (!image.isNull()) {
+				loaded.push_back({
+					std::move(image),
+					QFileInfo(path).completeBaseName(),
+				});
+			}
+		}
+		crl::on_main(weak, [
+				weak,
+				requested,
+				loaded = std::move(loaded),
+				done = std::move(done)]() mutable {
+			weak->_busy = QString();
+			if (weak->_shutdown) {
+				return;
+			} else if (loaded.empty()) {
+				weak->showToast(
+					tr::lng_oblivion_photo_ui_open_failed(tr::now));
+				return;
+			} else if (int(loaded.size()) < requested) {
+				// Over the limit of one import or not opened: said, not
+				// left out silently.
+				weak->showToast(tr::lng_oblivion_photo_panel_import_partial(
+					tr::now,
+					lt_added,
+					QString::number(loaded.size()),
+					lt_total,
+					QString::number(requested),
+					lt_limit,
+					QString::number(kImportLimit)));
+			}
+			done(std::move(loaded));
+		});
+	});
+}
+
+void Controller::runBusy(
+		QString text,
+		Fn<std::optional<Document>(const Document &document)> work,
+		Fn<void(bool applied)> done) {
+	if (_shutdown || !_hasDocument || busy() || !work) {
+		if (done) {
+			done(false);
+		}
+		return;
+	}
+	commit();
+	_busy = text.isEmpty()
+		? tr::lng_oblivion_photo_ui_processing(tr::now)
+		: text;
+	crl::async([
+			weak = base::make_weak(this),
+			document = _document,
+			revision = _revision,
+			work = std::move(work),
+			done = std::move(done)]() mutable {
+		auto result = work(document);
+		crl::on_main(weak, [
+				weak,
+				revision,
+				result = std::move(result),
+				done = std::move(done)]() mutable {
+			weak->_busy = QString();
+			const auto fits = result.has_value()
+				&& !weak->_shutdown
+				&& (weak->_revision == revision);
+			if (fits) {
+				weak->apply(std::move(*result), true);
+			}
+			if (done) {
+				done(fits);
+			}
+		});
+	});
+}
+
+rpl::producer<QString> Controller::busyValue() const {
+	return _busy.value();
+}
+
+bool Controller::busy() const {
+	return !_busy.current().isEmpty();
+}
+
+QByteArray Controller::toolId() const {
+	return _toolId.current();
+}
+
+void Controller::setTool(const QByteArray &id) {
+	if (_shutdown) {
+		return;
+	}
+	const auto descriptor = (id == kViewTool) ? nullptr : FindTool(id);
+	const auto real = descriptor ? descriptor->id : kViewTool;
+	clearTemporaryTool();
+	if (_toolId.current() == real) {
+		return;
+	}
+	if (_tool) {
+		_tool->deactivated();
+	}
+	auto old = std::move(_tool);
+	_tool = descriptor ? descriptor->create(this) : nullptr;
+	if (_tool) {
+		_tool->activated();
+	}
+	_toolId = real;
+	_toolChanges.fire({});
+	updateCanvas();
+}
+
+rpl::producer<QByteArray> Controller::toolValue() const {
+	return _toolId.value();
+}
+
+Tool *Controller::tool() const {
+	return _temporaryTool ? _temporaryTool.get() : _tool.get();
+}
+
+void Controller::setTemporaryTool(
+		std::unique_ptr<Tool> tool,
+		Fn<void()> finished) {
+	clearTemporaryTool();
+	if (_shutdown || !tool) {
+		return;
+	}
+	_temporaryTool = std::move(tool);
+	_temporaryFinished = std::move(finished);
+	_temporaryTool->activated();
+	_toolChanges.fire({});
+	updateCanvas();
+}
+
+void Controller::clearTemporaryTool() {
+	if (!_temporaryTool) {
+		return;
+	}
+	_temporaryTool->deactivated();
+	const auto old = std::move(_temporaryTool);
+	const auto finished = base::take(_temporaryFinished);
+	_toolChanges.fire({});
+	updateCanvas();
+	if (finished) {
+		finished();
+	}
+}
+
+bool Controller::hasTemporaryTool() const {
+	return (_temporaryTool != nullptr);
+}
+
+rpl::producer<> Controller::toolChanges() const {
+	return _toolChanges.events();
+}
+
+void Controller::showToolOptions() {
+	if (!_shutdown) {
+		_toolOptionsRequests.fire({});
+	}
+}
+
+rpl::producer<> Controller::toolOptionsRequests() const {
+	return _toolOptionsRequests.events();
+}
+
+void Controller::showLayerEffects() {
+	if (!_shutdown) {
+		_layerEffectsRequests.fire({});
+	}
+}
+
+rpl::producer<> Controller::layerEffectsRequests() const {
+	return _layerEffectsRequests.events();
+}
+
+void Controller::revealInPanel(not_null<QWidget*> widget) {
+	if (!_shutdown) {
+		_revealRequests.fire(QPointer<QWidget>(widget.get()));
+	}
+}
+
+rpl::producer<QPointer<QWidget>> Controller::revealRequests() const {
+	return _revealRequests.events();
+}
+
+QTransform Controller::documentToWidget() const {
+	return _view.documentToWidget ? _view.documentToWidget() : QTransform();
+}
+
+QTransform Controller::widgetToDocument() const {
+	auto invertible = false;
+	const auto result = documentToWidget().inverted(&invertible);
+	return invertible ? result : QTransform();
+}
+
+double Controller::viewScale() const {
+	const auto determinant = std::abs(documentToWidget().determinant());
+	return (determinant > 0.) ? std::sqrt(determinant) : 1.;
+}
+
+rpl::producer<> Controller::viewChanges() const {
+	return _viewChanges.events();
+}
+
+void Controller::updateCanvas() {
+	if (_view.update) {
+		_view.update();
+	}
+}
+
+std::shared_ptr<Compositor> Controller::compositor() const {
+	return _compositor;
+}
+
+void Controller::requestLayerThumbnail(
+		LayerId id,
+		QSize size,
+		Fn<void(QImage image)> done) {
+	const auto layer = _document.find(id);
+	if (!done) {
+		return;
+	} else if (!layer || !layer->content || size.isEmpty()) {
+		done(QImage());
+		return;
+	}
+	const auto full = layer->size();
+	if (full.isEmpty()) {
+		done(QImage());
+		return;
+	}
+	// A few fixed steps of the scale, so thumbnails of slightly different
+	// sizes share the cached pixels. The layer is rendered larger than
+	// the thumbnail, so that thin strokes are still there to be kept by
+	// LayerThumbnail(). Not much larger while it has effects: they are
+	// applied at that size after every change.
+	const auto plain = ranges::all_of(layer->effects, FxIsIdentity);
+	const auto exact = std::min({
+		size.width() / double(full.width()),
+		size.height() / double(full.height()),
+		1.,
+	}) * (plain ? kThumbnailOversample : 2);
+	const auto scale = std::min(
+		std::pow(2., std::ceil(std::log2(std::max(exact, 1e-4)))),
+		1.);
+	++_thumbnailsPending;
+	crl::async([
+			weak = base::make_weak(this),
+			compositor = _compositor,
+			copy = *layer,
+			scale,
+			size,
+			done = std::move(done)]() mutable {
+		auto image = LayerThumbnail(
+			compositor->layerPixels(copy, scale),
+			size);
+		crl::on_main(weak, [
+				weak,
+				image = std::move(image),
+				done = std::move(done)]() mutable {
+			--weak->_thumbnailsPending;
+			done(std::move(image));
+		});
+	});
+}
+
+bool Controller::thumbnailsPending() const {
+	return (_thumbnailsPending > 0);
+}
+
+std::shared_ptr<Ui::Show> Controller::uiShow() const {
+	return _show;
+}
+
+void Controller::showToast(const QString &text) {
+	if (_show && _show->valid()) {
+		_show->showToast(text);
+	}
+}
+
+rpl::lifetime &Controller::lifetime() {
+	return _lifetime;
+}
+
+void Controller::setView(View view) {
+	_view = std::move(view);
+	_viewChanges.fire({});
+}
+
+void Controller::notifyViewChanged() {
+	_viewChanges.fire({});
+}
+
+uint64 Controller::shownRevision() const {
+	return _shownRevision.current();
+}
+
+rpl::producer<uint64> Controller::shownRevisionValue() const {
+	return _shownRevision.value();
+}
+
+void Controller::setShownRevision(uint64 revision) {
+	if (!_shutdown) {
+		_shownRevision = revision;
+	}
+}
+
+bool Controller::interacting() const {
+	return _interacting;
+}
+
+void Controller::setInteracting(bool interacting) {
+	if (_interacting == interacting || _shutdown) {
+		return;
+	}
+	if (interacting) {
+		// What was changed before the press is a step of its own.
+		commit();
+		_interacting = true;
+	} else {
+		_interacting = false;
+		if (_hasDocument && !(_history.current() == _document)) {
+			_commitTimer.callOnce(CommitDelay());
+		}
+	}
+}
+
+void Controller::shutdown() {
+	if (_shutdown) {
+		return;
+	}
+	_shutdown = true;
+	_interacting = false;
+	_commitTimer.cancel();
+	if (_temporaryTool) {
+		_temporaryTool->deactivated();
+	}
+	if (_tool) {
+		_tool->deactivated();
+	}
+	_view = View();
+	_temporaryFinished = nullptr;
+	_temporaryTool = nullptr;
+	_tool = nullptr;
+}
+
+QString BlendModeName(BlendMode mode) {
+	switch (mode) {
+	case BlendMode::Normal:
+		return tr::lng_oblivion_photo_panel_blend_normal(tr::now);
+	case BlendMode::Multiply:
+		return tr::lng_oblivion_photo_panel_blend_multiply(tr::now);
+	case BlendMode::Screen:
+		return tr::lng_oblivion_photo_panel_blend_screen(tr::now);
+	case BlendMode::Overlay:
+		return tr::lng_oblivion_photo_panel_blend_overlay(tr::now);
+	case BlendMode::SoftLight:
+		return tr::lng_oblivion_photo_panel_blend_soft_light(tr::now);
+	case BlendMode::HardLight:
+		return tr::lng_oblivion_photo_panel_blend_hard_light(tr::now);
+	case BlendMode::Darken:
+		return tr::lng_oblivion_photo_panel_blend_darken(tr::now);
+	case BlendMode::Lighten:
+		return tr::lng_oblivion_photo_panel_blend_lighten(tr::now);
+	case BlendMode::ColorDodge:
+		return tr::lng_oblivion_photo_panel_blend_color_dodge(tr::now);
+	case BlendMode::ColorBurn:
+		return tr::lng_oblivion_photo_panel_blend_color_burn(tr::now);
+	case BlendMode::Difference:
+		return tr::lng_oblivion_photo_panel_blend_difference(tr::now);
+	case BlendMode::Exclusion:
+		return tr::lng_oblivion_photo_panel_blend_exclusion(tr::now);
+	case BlendMode::Add:
+		return tr::lng_oblivion_photo_panel_blend_add(tr::now);
+	case BlendMode::Hue:
+		return tr::lng_oblivion_photo_panel_blend_hue(tr::now);
+	case BlendMode::Saturation:
+		return tr::lng_oblivion_photo_panel_blend_saturation(tr::now);
+	case BlendMode::Color:
+		return tr::lng_oblivion_photo_panel_blend_color(tr::now);
+	case BlendMode::Luminosity:
+		return tr::lng_oblivion_photo_panel_blend_luminosity(tr::now);
+	}
+	return QString();
+}
+
+QString FxGroupName(FxGroup group) {
+	switch (group) {
+	case FxGroup::Light:
+		return tr::lng_oblivion_photo_panel_group_light(tr::now);
+	case FxGroup::Color:
+		return tr::lng_oblivion_photo_panel_group_color(tr::now);
+	case FxGroup::Detail:
+		return tr::lng_oblivion_photo_panel_group_detail(tr::now);
+	case FxGroup::Finish:
+		return tr::lng_oblivion_photo_panel_group_finish(tr::now);
+	case FxGroup::Blur:
+		return tr::lng_oblivion_photo_panel_group_blur(tr::now);
+	case FxGroup::Distort:
+		return tr::lng_oblivion_photo_panel_group_distort(tr::now);
+	case FxGroup::Lofi:
+		return tr::lng_oblivion_photo_panel_group_lofi(tr::now);
+	case FxGroup::Glitch:
+		return tr::lng_oblivion_photo_panel_group_glitch(tr::now);
+	case FxGroup::Stylize:
+		return tr::lng_oblivion_photo_panel_group_stylize(tr::now);
+	case FxGroup::Classic:
+		return tr::lng_oblivion_photo_panel_group_classic(tr::now);
+	}
+	return QString();
+}
+
+QString NewLayerName(const Document &document) {
+	for (auto index = int(document.layers.size()) + 1;; ++index) {
+		const auto name = tr::lng_oblivion_photo_panel_layer_name(
+			tr::now,
+			lt_index,
+			QString::number(index));
+		if (!ranges::contains(document.layers, name, &Layer::name)) {
+			return name;
+		}
+	}
+}
+
+QImage SampleSceneImage() {
+	return SampleImage();
+}
+
+Document SampleSceneDocument() {
+	auto document = DocumentFromImage(
+		SampleImage(),
+		EditState(),
+		tr::lng_oblivion_photo_panel_layer_photo(tr::now));
+	if (document.empty()) {
+		return document;
+	}
+	const auto canvas = document.size;
+	const auto side = std::max(std::min(canvas.width(), canvas.height()), 8);
+
+	auto card = FxTestImage(side * 6 / 10, side * 4 / 10);
+	auto second = MakeImageLayer(std::move(card), NewLayerName(document));
+	second.transform = ComposeTransform({
+		.center = QPointF(canvas.width() * 0.66, canvas.height() * 0.38),
+		.scaleX = 1.,
+		.scaleY = 1.,
+		.rotation = -8.,
+	}, QSizeF(second.size()));
+	second.blend = BlendMode::Multiply;
+	second.opacity = 0.85;
+	second.effects.push_back(MakeFx("classic.duotone"));
+	second.effects.push_back(MakeFx("classic.light", {
+		{ "contrast", FxValue::Integer(25) },
+	}));
+	AddLayer(document, std::move(second));
+
+	auto third = MakeImageLayer(
+		FxTestImage(side * 4 / 10, side * 4 / 10, true),
+		NewLayerName(document));
+	third.transform = QTransform::fromTranslate(
+		canvas.width() * 0.12,
+		canvas.height() * 0.5);
+	third.blend = BlendMode::Screen;
+	const auto maskSize = MaskSizeFor(third.size());
+	auto mask = QImage(maskSize, QImage::Format_Grayscale8);
+	if (!mask.isNull()) {
+		for (auto y = 0; y != maskSize.height(); ++y) {
+			const auto line = mask.scanLine(y);
+			for (auto x = 0; x != maskSize.width(); ++x) {
+				line[x] = uchar(255 * (maskSize.height() - y)
+					/ maskSize.height());
+			}
+		}
+		third.mask = MakeMask(std::move(mask));
+	}
+	AddLayer(document, std::move(third));
+	return document;
+}
+
+void RegisterEditorScene(EditorSceneArgs &&args) {
+	const auto shared = std::make_shared<EditorSceneArgs>(std::move(args));
+	RegisterOptionsScene(
+		shared->name,
+		shared->size.isEmpty() ? QSize(1120, 720) : shared->size,
+		[=] {
+			auto options = PhotoEditorOptions();
+			options.tab = shared->tab;
+			options.tool = shared->tool;
+			options.document = std::make_shared<const Document>(
+				shared->document
+					? shared->document()
+					: DocumentFromImage(
+						SampleImage(),
+						EditState(),
+						tr::lng_oblivion_photo_panel_layer_photo(tr::now)));
+			return options;
+		},
+		[=](not_null<Editor*> editor) {
+			if (shared->prepare) {
+				shared->prepare(editor->controller());
+			}
+			// Choosing a tool with options opens its tab.
+			editor->selectTab(shared->tab);
+		},
+		(shared->wait > 0) ? shared->wait : kSceneWait);
+}
+
+void RegisterPanelScene(PanelSceneArgs &&args) {
+	const auto shared = std::make_shared<PanelSceneArgs>(std::move(args));
+	SelfTest::RegisterScene(
+		shared->name,
+		shared->size,
+		[=](not_null<Ui::RpWidget*> parent) {
+			return Ui::CreateChild<PanelSceneHost>(
+				parent.get(),
+				SelfTest::SceneShow(parent),
+				*shared);
+		});
+}
 
 void ShowPhotoEditor(
 		std::shared_ptr<Ui::Show> show,
 		QImage image,
 		PhotoEditorOptions options) {
+	const auto continued = options.document && !options.document->empty();
 	if (!show || !show->valid()) {
 		return;
-	} else if (image.isNull()) {
+	} else if (Core::IsAppLaunched() && Core::App().passcodeLocked()) {
+		// The app has locked itself while the picture was loading:
+		// nothing is shown above the passcode screen.
+		return;
+	} else if (image.isNull() && !continued) {
 		show->showToast(tr::lng_oblivion_photo_ui_open_failed(tr::now));
 		return;
 	}

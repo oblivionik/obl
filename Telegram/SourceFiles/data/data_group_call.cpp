@@ -18,6 +18,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/group/calls_group_call.h"
 #include "calls/group/calls_group_common.h"
 #include "core/application.h"
+#include "oblivion/oblivion_badge.h"
 #include "apiwrap.h"
 
 namespace Data {
@@ -743,7 +744,11 @@ void GroupCall::applyParticipantsSlice(
 				return;
 			}
 			if (const auto about = data.vabout()) {
-				participantPeer->setAbout(qs(*about));
+				// Oblivion: the invisible badge marker is kept out of the
+				// bio of a user here too, see Data::ApplyUserUpdate().
+				participantPeer->setAbout(participantPeer->isUser()
+					? Oblivion::Badge::StripAbout(qs(*about))
+					: qs(*about));
 			}
 			const auto was = (i != end(_participants))
 				? std::make_optional(*i)

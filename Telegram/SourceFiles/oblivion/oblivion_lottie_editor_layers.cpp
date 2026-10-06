@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "oblivion/oblivion_lottie_doc.h"
 #include "oblivion/oblivion_lottie_editor.h"
+#include "oblivion/oblivion_lottie_editor_masks.h"
 #include "oblivion/oblivion_lottie_editor_palette.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/effects/animation_value.h"
@@ -1368,6 +1369,24 @@ void LayersPanel::Tree::showMenu(int index, QPoint globalPosition) {
 			},
 			&st::menuIconSelect);
 	}
+	if (node->kind == NodeKind::Layer) {
+		_menu->addAction(
+			tr::lng_oblivion_lottie_mask_add(tr::now),
+			[=] {
+				const auto &document = _controller->document();
+				if (document.contains(id)) {
+					_controller->addMask(
+						id,
+						DefaultMaskPath(
+							document,
+							id,
+							_controller->currentFrame()),
+						MaskMode::Add,
+						NewMaskName(document, id));
+				}
+			},
+			&st::menuIconAdd);
+	}
 	_menu->addSeparator();
 	_menu->addAction(
 		tr::lng_oblivion_lottie_layers_expand_all(tr::now),
@@ -1975,7 +1994,35 @@ void LayersPanel::showAddMenu() {
 		add(ShapeType::Fill, ShapeTemplate::Fill);
 		add(ShapeType::Stroke, ShapeTemplate::Stroke);
 		add(ShapeType::GradientFill, ShapeTemplate::GradientFill);
+		add(ShapeType::GradientStroke, ShapeTemplate::GradientStroke);
 		add(ShapeType::TrimPaths, ShapeTemplate::TrimPaths);
+		add(ShapeType::Repeater, ShapeTemplate::Repeater);
+		add(ShapeType::RoundCorners, ShapeTemplate::RoundCorners);
+	}
+	// A mask for the layer of the selection: a rectangle around what the
+	// layer shows, its points are then edited with the pen on the canvas.
+	if (const auto layer = document.owningLayer(
+			_controller->primarySelection())) {
+		_menu->addSeparator();
+		_menu->addAction(
+			tr::lng_oblivion_lottie_mask_add_to(
+				tr::now,
+				lt_name,
+				NodeDisplayName(document, layer)),
+			[=] {
+				const auto &document = _controller->document();
+				if (document.contains(layer)) {
+					_controller->addMask(
+						layer,
+						DefaultMaskPath(
+							document,
+							layer,
+							_controller->currentFrame()),
+						MaskMode::Add,
+						NewMaskName(document, layer));
+				}
+			},
+			&st::menuIconAdd);
 	}
 	_menu->popup(_add->mapToGlobal(QPoint(0, _add->height())));
 }

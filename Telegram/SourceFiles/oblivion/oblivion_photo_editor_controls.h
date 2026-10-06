@@ -42,10 +42,22 @@ namespace Oblivion::Photo::EditorUi {
 	const QString &text,
 	const QKeySequence &keys);
 
+// A card is a plate of the darker st::groupCallBg on the panel (an effect
+// with its parameters). The secondary PanelButton and the chips are wells
+// of that same color on the panel, so inside a card they would be bare
+// text: there they paint themselves a step lighter. Whoever paints such
+// a plate marks its widget, the controls find it among their parents.
+void MarkAsCard(not_null<QWidget*> widget);
+[[nodiscard]] bool InsideCard(not_null<const QWidget*> widget);
+
 struct IconRef {
 	const style::icon *icon = nullptr;
 	bool mirrored = false;
 	int rotation = 0;
+	// An icon painted in code instead of a style one: it is asked to draw
+	// itself with the color inside a centered 24 x 24 square (logical
+	// pixels, already scaled with the interface).
+	Fn<void(QPainter &p, QRectF rect, QColor color)> paint;
 };
 void PaintIcon(QPainter &p, const IconRef &icon, QRect rect, QColor color);
 
@@ -167,6 +179,10 @@ struct SliderArgs {
 	int value = 0;
 	Fn<QString(int)> format;
 	SliderTrack track = SliderTrack::Plain;
+	// The knob moves with the logarithm of the value (only for min > 0):
+	// for sizes with a wide range, like 16 .. 16384 pixels, where an even
+	// scale would keep every usual value in the first tenth of the track.
+	bool logarithmic = false;
 };
 
 // A labeled slider: the label and the value on top, the track below.
@@ -182,6 +198,13 @@ public:
 	[[nodiscard]] bool dragging() const;
 
 	[[nodiscard]] rpl::producer<SliderChange> changes() const;
+
+	// With it a click on the shown value doesn't move the slider, it is
+	// reported instead: the owner shows a field to type the value in
+	// over valueRect().
+	void setValueClickable(bool clickable);
+	[[nodiscard]] rpl::producer<> valueClicks() const;
+	[[nodiscard]] QRect valueRect() const;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -207,6 +230,7 @@ private:
 	int _value = 0;
 	const Fn<QString(int)> _format;
 	const SliderTrack _track = SliderTrack::Plain;
+	const bool _logarithmic = false;
 	bool _dimmed = false;
 	bool _over = false;
 	bool _pressed = false;
@@ -215,8 +239,11 @@ private:
 	int _grabOffset = 0;
 	bool _grabbed = false;
 	bool _moved = false;
+	bool _valueClickable = false;
+	bool _valuePressed = false;
 	Ui::Animations::Simple _overAnimation;
 	rpl::event_stream<SliderChange> _changes;
+	rpl::event_stream<> _valueClicks;
 
 };
 
@@ -247,13 +274,26 @@ struct TabInfo {
 
 // Icon + label tabs with a sliding highlight. Each tab gets the width of
 // its label plus an equal share of the rest, so long labels still fit.
-class TabBar final : public Ui::RpWidget {
+// When the labels of all the visible tabs don't fit, only the active tab
+// shows its label, the others become icons with tooltips.
+class TabBar final
+	: public Ui::RpWidget
+	, public Ui::AbstractTooltipShower {
 public:
 	TabBar(QWidget *parent, std::vector<TabInfo> tabs);
 
 	void setActive(int index, anim::type animated = anim::type::normal);
 	[[nodiscard]] int active() const;
 	[[nodiscard]] rpl::producer<int> activeChanges() const;
+	// Puts the highlight where it is going at once.
+	void finishAnimating();
+	// A hidden tab takes no place and can't be clicked.
+	void setTabVisible(int index, bool visible);
+	[[nodiscard]] bool tabVisible(int index) const;
+
+	QString tooltipText() const override;
+	QPoint tooltipPos() const override;
+	bool tooltipWindowActive() const override;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -268,24 +308,34 @@ private:
 	struct Tab {
 		QString text;
 		IconRef icon;
+		bool visible = true;
 	};
 	[[nodiscard]] QRect tabRect(int index) const;
-	[[nodiscard]] QRectF highlightRect(float64 position) const;
+	[[nodiscard]] QRectF highlightRect() const;
 	[[nodiscard]] int tabAt(QPoint point) const;
 	void refreshWidths();
 
 	std::vector<Tab> _tabs;
 	std::vector<int> _lefts; // _tabs.size() + 1 edges.
+	bool _compact = false;
 	int _active = 0;
+	int _previous = -1; // Fades out while the highlight slides.
 	int _over = -1;
 	int _pressed = -1;
+	// The highlight slides from the rectangle it had when another tab was
+	// chosen to the rectangle of that tab: the tabs between them (hidden
+	// ones as well) and their widths don't matter.
+	QRectF _slideFrom;
 	Ui::Animations::Simple _slide;
 	rpl::event_stream<int> _activeChanges;
 
 };
 
 // An on / off switch with a title: a header of an effect card (with the
-// "..." menu button on the right) or a plain toggle row.
+// "..." menu button on the right, it has the side padding of the card in
+// it) or a plain toggle row (withMenu == false: no padding of its own,
+// the switch starts at the left edge like the label of a slider, so give
+// it the same margins as the rows around it).
 class SwitchHeader final : public Ui::RpWidget {
 public:
 	SwitchHeader(

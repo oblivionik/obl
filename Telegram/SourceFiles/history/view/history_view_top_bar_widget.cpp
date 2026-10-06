@@ -20,6 +20,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mainwindow.h"
 #include "main/main_session.h"
 #include "mtproto/mtproto_config.h"
+#include "oblivion/oblivion_badge.h"
 #include "lang/lang_keys.h"
 #include "core/shortcuts.h"
 #include "core/application.h"
@@ -242,6 +243,11 @@ TopBarWidget::TopBarWidget(
 			&& (_activeChat.key.peer() == update.peer)) {
 			this->update();
 		}
+	}, lifetime());
+
+	// Oblivion: the mark of an Oblivion user after the name in the title.
+	Oblivion::Badge::Changes() | rpl::on_next([=] {
+		update();
 	}, lifetime());
 
 	rpl::combine(

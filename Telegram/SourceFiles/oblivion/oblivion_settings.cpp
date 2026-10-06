@@ -63,6 +63,10 @@ constexpr auto kGhostPreset = "ghost_preset";
 constexpr auto kGhostButtonOwned = "ghost_button_owned";
 constexpr auto kUnifiedChats = "unified_chats";
 constexpr auto kVoiceNoiseSuppression = "voice_noise_suppression";
+constexpr auto kAttachTools = "attach_tools";
+constexpr auto kBadgeEnabled = "badge_enabled";
+constexpr auto kBadgeAsked = "badge_asked";
+constexpr auto kListenTogether = "listen_together";
 
 [[nodiscard]] QString FilePath() {
 	return cWorkingDir() + u"tdata/oblivion.json"_q;
@@ -347,6 +351,10 @@ void Settings::load() {
 	_ghostButtonOwned.offlineSend = owned.value(u"offline_send"_q).toBool();
 	read(kUnifiedChats, _unifiedChats);
 	read(kVoiceNoiseSuppression, _voiceNoiseSuppression);
+	read(kAttachTools, _attachTools);
+	read(kBadgeEnabled, _badgeEnabled);
+	read(kBadgeAsked, _badgeAsked);
+	read(kListenTogether, _listenTogether);
 }
 
 void Settings::save() {
@@ -467,6 +475,10 @@ void Settings::save() {
 	object.insert(
 		QString::fromUtf8(kVoiceNoiseSuppression),
 		_voiceNoiseSuppression);
+	object.insert(QString::fromUtf8(kAttachTools), _attachTools);
+	object.insert(QString::fromUtf8(kBadgeEnabled), _badgeEnabled);
+	object.insert(QString::fromUtf8(kBadgeAsked), _badgeAsked);
+	object.insert(QString::fromUtf8(kListenTogether), _listenTogether);
 
 	// QSaveFile replaces the old file only after a complete write
 	// (a failed write() is remembered and makes commit() discard it),

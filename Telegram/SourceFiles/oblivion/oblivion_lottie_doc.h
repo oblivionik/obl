@@ -15,6 +15,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <rpl/variable.h>
 
 #include <QtCore/QPointF>
+#include <QtCore/QRectF>
 #include <QtCore/QSize>
 #include <QtGui/QColor>
 #include <QtGui/QPainterPath>
@@ -81,6 +82,44 @@ class Show;
 // Threads. Json::Value, Document, all free functions (operations,
 // Validate(), AutoFix()) are pure and thread safe. EditorController and the
 // localized helpers in oblivion_lottie_editor.h are main thread only.
+//
+// After Effects features (round 4) and what Telegram's renderer does with
+// them. Checked against the rlottie sources bundled with this app
+// (Telegram/ThirdParty/rlottie/src/lottie: lottieparser.cpp, lottieitem.cpp,
+// lottiemodel.cpp), the model reads, edits and writes all of them:
+//
+// - Masks ("masksProperties"): applied only when the layer has
+//   "hasMask": true (AddMask() writes it). Modes add / subtract / intersect
+//   / difference and the path (static or animated) are rendered, the masks
+//   are combined in their order. Not rendered: the inverted flag ("inv"),
+//   mask opacity ("o", always 100%), feather ("f"), expansion ("x"); masks
+//   with the modes none / lighten / darken are skipped, and a layer with
+//   masks none of which gives a shape is not drawn at all.
+// - Track mattes: a layer with "tt" is cut by the layer right above it in
+//   the layers array, whatever that layer is ("td" and the "tp" link of
+//   newer exports are not read). Alpha, inverted alpha, luma and inverted
+//   luma are rendered. A matted layer that has no layer above, or whose
+//   layer above is matted too, is not drawn at all.
+// - Trim paths ("tm"): start / end / offset, both modes, rendered.
+// - Repeater ("rp"): copies, offset, anchor, position, scale, rotation,
+//   start / end opacity are rendered, it repeats every item above it in
+//   the same list. The composite order ("m") is ignored.
+// - Gradient fill / stroke ("gf" / "gs"): linear and radial, color and
+//   opacity stops, radial highlight length / angle, all rendered.
+// - Stroke dashes ("d"): rendered, the values are read by position (dash,
+//   gap, ..., offset last), the "n" names are ignored.
+// - Rounded corners: the rectangle roundness ("rc"."r") is rendered, the
+//   round corners modifier ("rd") is ignored (BakeRoundCorners() turns it
+//   into real path geometry).
+// - Parenting ("parent" -> "ind" in the same composition): rendered, links
+//   to a missing layer and cycles are ignored.
+// - Easing: one cubic bezier per keyframe segment and hold, rendered.
+//
+// Two parser quirks matter for files written by other tools: a shape item
+// loses every key that stands before its "ty", and a layer without
+// "ddd": 0 before "ks" is read as a 3D layer (its "r" rotation is ignored).
+// Everything created here puts those keys first; Validate() reports such
+// files as IssueType::KeyOrder (auto-fixable).
 namespace Oblivion::LottieEdit {
 
 using NodeId = uint64;
@@ -205,10 +244,22 @@ struct Member {
 	Value value;
 };
 
-// Strict JSON (UTF-8, optional BOM). Empty optional on error.
+// Strict JSON (UTF-8, optional BOM). Empty optional on error. Zero bytes
+// after the root value are allowed (padding). Two things are not kept the
+// way they are written: a key that an object has more than once is kept
+// once, with its last value (that is how get() would read it, while the
+// renderer has no rule for such objects), and "-0" is read as 0 (it is
+// written back as that).
 [[nodiscard]] std::optional<Value> Parse(
 	QByteArrayView json,
 	QString *error = nullptr);
+
+// The root value alone: whatever follows it is not looked at, the way
+// rlottie reads a file. rewritten tells that the result is not what the
+// bytes say (a repeated key or a "-0", see Parse()).
+[[nodiscard]] std::optional<Value> ParseRoot(
+	QByteArrayView json,
+	bool *rewritten = nullptr);
 
 // Compact JSON. Numbers use the shortest round-trip form.
 [[nodiscard]] QByteArray Serialize(const Value &value);
@@ -264,6 +315,45 @@ enum class MatteMode : uchar {
 	LumaInverted, // 4
 };
 
+// rlottie draws Add / Subtract / Intersect / Difference and skips the
+// other modes; a layer whose masks are all skipped is not drawn at all.
+enum class MaskMode : uchar {
+	None, // "n": meant to do nothing.
+	Add, // "a"
+	Subtract, // "s"
+	Intersect, // "i"
+	Lighten, // "l": the same as Add at 100% opacity.
+	Darken, // "d": the same as Intersect at 100% opacity.
+	Difference, // "f"
+};
+
+enum class GradientType : uchar {
+	Linear, // "t": 1
+	Radial, // 2
+};
+
+enum class TrimMode : uchar {
+	Simultaneously, // "m": 1, every path is trimmed on its own.
+	Individually, // 2, the paths are trimmed as one long path.
+};
+
+enum class LineCap : uchar {
+	Butt, // "lc": 1, also when "lc" is missing.
+	Round, // 2
+	Square, // 3
+};
+
+enum class LineJoin : uchar {
+	Miter, // "lj": 1, also when "lj" is missing.
+	Round, // 2
+	Bevel, // 3
+};
+
+enum class FillRule : uchar {
+	NonZero, // "r": 1, also when "r" is missing.
+	EvenOdd, // 2
+};
+
 struct NodeInfo {
 	NodeId id = 0;
 	NodeKind kind = NodeKind::Composition;
@@ -311,6 +401,31 @@ struct NodeInfo {
 
 	// Asset.
 	bool imageAsset = false; // Has "p" (image / external file).
+
+	// Layer, round 4.
+	bool masksEnabled = false; // "hasMask": true, masks are drawn only then.
+
+	// Track matte links as the renderer sees them: a layer with matte !=
+	// None is cut by the layer right above it. matteLayer is that layer (0
+	// if there is none or it is matted itself: then this layer is not drawn
+	// at all), matteTarget is the layer right below that this one cuts.
+	NodeId matteLayer = 0;
+	NodeId matteTarget = 0;
+	std::optional<int> matteParentInd; // "tp" of newer exports, not read.
+
+	// Mask.
+	MaskMode maskMode = MaskMode::Add; // "mode".
+	bool maskInverted = false; // "inv", not rendered by rlottie.
+
+	// Shape items: gradients ("t"), trim paths ("m"), strokes and gradient
+	// strokes ("lc", "lj", "ml", "d"), fills and gradient fills ("r").
+	GradientType gradientType = GradientType::Linear;
+	TrimMode trimMode = TrimMode::Simultaneously;
+	LineCap lineCap = LineCap::Butt;
+	LineJoin lineJoin = LineJoin::Miter;
+	double miterLimit = 0.;
+	FillRule fillRule = FillRule::NonZero;
+	int dashValues = 0; // Items in "d" (dashes, gaps and the offset).
 };
 
 struct PropertyRef {
@@ -396,6 +511,7 @@ enum class PropertyRole : uchar {
 	Radius,
 	Amount,
 	Other,
+	MaskFeather, // Mask "f", { x, y }, ignored by rlottie.
 };
 
 struct PathData {
@@ -433,6 +549,10 @@ struct PropValue {
 struct GradientStop {
 	double offset = 0.; // [0, 1]
 	QColor color; // Opaque color of a color stop, alpha of an opacity stop.
+
+	friend inline bool operator==(
+		const GradientStop &a,
+		const GradientStop &b) = default;
 };
 
 // colorStops is "g"."p". Opacity stops (if any) follow the color stops,
@@ -443,6 +563,88 @@ struct GradientStop {
 [[nodiscard]] std::vector<GradientStop> OpacityStops(
 	const PropValue &gradient,
 	int colorStops);
+
+// A gradient value ("gf" / "gs" property "g.k") split into its stops.
+// colors: offset + opaque color, at least one. alphas: offset + opacity in
+// QColor::alphaF() (black rgb), empty for a fully opaque gradient; rlottie
+// needs at least two of them, so EncodeGradient() doubles a single one.
+struct GradientData {
+	std::vector<GradientStop> colors;
+	std::vector<GradientStop> alphas;
+
+	[[nodiscard]] bool valid() const {
+		return !colors.empty();
+	}
+	friend inline bool operator==(
+		const GradientData &a,
+		const GradientData &b) = default;
+};
+
+[[nodiscard]] GradientData DecodeGradient(
+	const PropValue &gradient,
+	int colorStops);
+
+// Stops are sorted by offset (stable), offsets and channels are clamped to
+// [0, 1]. The color stop count for "g"."p" is data.colors.size().
+[[nodiscard]] PropValue EncodeGradient(const GradientData &data);
+
+// Color with alpha at an offset: linear between the neighbour stops, the
+// first / last stop outside of them.
+[[nodiscard]] QColor GradientColorAt(const GradientData &data, double offset);
+
+// Path helpers for masks, shape paths and the pen tool. Tangents are
+// relative to their vertex. Segment i goes from vertex i to vertex i + 1,
+// the last segment of a closed path returns to vertex 0. All functions
+// accept paths with missing tangents (read as zero) and bad indices (the
+// path is returned unchanged).
+
+// Tangent lists padded / cut to the vertex count.
+[[nodiscard]] PathData NormalizedPath(PathData path);
+
+// Closed, clockwise, starts at the top left corner (after its arc).
+[[nodiscard]] PathData RectanglePath(const QRectF &rect, double radius = 0.);
+
+// Closed, clockwise, four vertices, starts at the top.
+[[nodiscard]] PathData EllipsePath(const QRectF &rect);
+
+[[nodiscard]] QPainterPath PainterPath(const PathData &path);
+[[nodiscard]] int PathSegmentCount(const PathData &path);
+[[nodiscard]] QPointF PathPointAt(const PathData &path, int segment, double t);
+
+struct PathHit {
+	int segment = -1; // -1 for an empty path.
+	double t = 0.; // Position inside the segment, [0, 1].
+	QPointF point; // The closest point of the path.
+	double distance = 0.;
+};
+
+// The closest point of the path outline (not of its fill).
+[[nodiscard]] PathHit NearestPathPoint(const PathData &path, QPointF point);
+
+// Splits the segment at t, the shape of the path stays the same. The new
+// vertex gets the index segment + 1.
+[[nodiscard]] PathData WithInsertedVertex(
+	const PathData &path,
+	int segment,
+	double t);
+
+// The neighbours get connected with their remaining tangents.
+[[nodiscard]] PathData WithoutVertex(const PathData &path, int index);
+
+// Corner: both tangents zero. Smooth: symmetrical tangents along the line
+// between the neighbour vertices, a third of the way to each of them.
+[[nodiscard]] bool IsCornerVertex(const PathData &path, int index);
+[[nodiscard]] PathData WithCornerVertex(const PathData &path, int index);
+[[nodiscard]] PathData WithSmoothVertex(const PathData &path, int index);
+
+// The same outline drawn in the other direction (matters for trim paths),
+// vertex 0 stays vertex 0 of a closed path.
+[[nodiscard]] PathData ReversedPath(const PathData &path);
+
+// The round corners modifier as geometry: every corner vertex (both
+// tangents zero) is replaced with an arc of the radius, limited by half
+// of the adjacent straight segments. Smooth vertices are kept.
+[[nodiscard]] PathData RoundedPath(const PathData &path, double radius);
 
 enum class EasingPreset : uchar {
 	Linear,
@@ -497,13 +699,20 @@ struct PropertyInfo {
 	PropertyRef ref;
 	PropertyRole role = PropertyRole::Other;
 	PropertyType type = PropertyType::Scalar;
-	QString name; // Effect value / dash names, empty otherwise.
+	// Effect value / dash names, empty otherwise. A dash item without a
+	// name gets "d" (dash), "g" (gap) or "o" (offset) by its position.
+	QString name;
 	int dimensions = 1; // Numbers in the value (Scalar 1, Vector 2-3...).
 	int colorStops = 0; // Gradient: "g"."p".
 	bool animated = false;
 	bool spatial = false; // Has "ti" / "to" keyframe tangents.
 	bool expression = false; // Has an expression ("x"), not rendered.
 	int keyframes = 0;
+
+	// PropertyRole::Dash only: the last item of "d", which the renderer
+	// reads as the offset of the pattern. Unlike the dash and gap lengths
+	// it may be negative and its easing may overshoot.
+	bool dashOffset = false;
 };
 
 enum class ColorKind : uchar {
@@ -577,6 +786,11 @@ public:
 	// panel can call it freely.
 	[[nodiscard]] QByteArray toJson() const;
 	[[nodiscard]] QByteArray toTgs() const; // Oblivion::Lottie::PackTgs().
+
+	// JSON to hand to the renderer: toJson() (the same bytes) unless the
+	// document has values rlottie never returns from, see RenderSafeJson().
+	// Cached like toJson(). Never save it, it is for drawing only.
+	[[nodiscard]] QByteArray toRenderJson() const;
 
 	// Composition. frames() == int64(op) - int64(ip) like rlottie.
 	[[nodiscard]] QSize size() const;
@@ -656,6 +870,27 @@ public:
 	[[nodiscard]] std::optional<PropValue> baseValue(
 		const PropertyRef &ref) const;
 
+	// Values at several frames with one parse of the keyframes, for graphs
+	// and motion previews. Empty if the property is not found.
+	[[nodiscard]] std::vector<PropValue> valuesAt(
+		const PropertyRef &ref,
+		const std::vector<double> &frames) const;
+
+	// The value the renderer uses while a known optional property is not
+	// in the file: transform parts of layers / groups ("ks.o" -> 100...),
+	// mask "o" (100), "x" (0) and "f" ({ 0, 0 }), gradient "h" / "a" (0),
+	// rectangle "r" (0), round corners "r" (0), trim "o" (0), stroke "w".
+	// SetValueAt() / SetStaticValue() / AddKeyframe() create such a
+	// property on the first write. Empty for anything else.
+	[[nodiscard]] std::optional<PropValue> defaultValue(
+		const PropertyRef &ref) const;
+
+	// Gradient stops of a gradient fill / stroke at a frame of its time
+	// base, empty for other nodes.
+	[[nodiscard]] std::optional<GradientData> gradientAt(
+		NodeId shape,
+		double frame) const;
+
 	// Every animated property of the subtree (all when id == 0).
 	[[nodiscard]] std::vector<PropertyRef> animatedProperties(
 		NodeId id = 0) const;
@@ -676,6 +911,41 @@ private:
 	std::shared_ptr<const Data> _data;
 
 };
+
+// Renderer safety. A few values make rlottie (the copy bundled with this
+// app, so the Telegram Desktop that shows the sticker too) loop forever or
+// work for minutes. Each one was found in its sources and then confirmed
+// by rendering test files with a time limit:
+// - a keyframe with motion path tangents ("ti" / "to", the usual position
+//   keyframe) whose easing goes below zero: VBezier::tAtLength() never
+//   returns for a negative length. The easing rlottie uses is the one of
+//   the first keyframe in the file with the same name ("n") or, without a
+//   name, with the same handles to two decimals, so such a keyframe gets
+//   handles at zero or above (x within [0, 1]) and loses a name that
+//   another curve has as well;
+// - a negative stroke dash or gap length (the last item of "d" is the
+//   offset and may be anything), static or reached between keyframes;
+// - a dash pattern much shorter than the curve it runs on (dash + gap of
+//   0.2 on a 480 px circle);
+// - trim start / end below -100% (below minus the offset if the offset is
+//   above zero); small undershoots like -3% are fine and are kept;
+// - huge repeater copies and star points counts (loop counters).
+// The operations do not write such values: easing handles are limited for
+// motion paths, dashes, copies and points (see SetKeyframeHandles()),
+// values are kept in range, and a stroke / trim / repeater / star item is
+// checked as a whole after every write. For files from elsewhere
+// Validate() reports IssueType::RendererHang (an error, auto-fixable), and
+// everything drawn through Oblivion::Lottie (RenderFrame(), Renderer,
+// ExportSvg()) gets the clamped copy made by RenderSafeJson().
+inline constexpr auto kMaxRepeaterCopies = 512.;
+inline constexpr auto kMaxStarPoints = 1000.;
+inline constexpr auto kMinDashPeriod = 1.; // Dash + gap, all pairs together.
+
+// Plain Lottie JSON with the dangerous values clamped. Returns the same
+// bytes if there is nothing to clamp. Empty if the JSON can't be parsed:
+// rlottie draws what it has read before an error, so bytes nobody could
+// check must not get to it.
+[[nodiscard]] QByteArray RenderSafeJson(const QByteArray &json);
 
 // Result of an operation. Operations are pure: they return a new document
 // and never modify the given one. If nothing had to change the returned
@@ -784,10 +1054,10 @@ struct Edit {
 	const Document &document,
 	const std::vector<NodeId> &ids);
 
-// Moves a layer inside its composition or a shape item into a layer /
-// group (container), so that it ends up before the item that was at
-// index (index == count means the end; a group "tr" stays last). Track
-// matte pairs move together and are never split.
+// Moves a layer inside its composition, a mask inside its layer or a
+// shape item into a layer / group (container), so that it ends up before
+// the item that was at index (index == count means the end; a group "tr"
+// stays last). Track matte pairs move together and are never split.
 [[nodiscard]] Edit MoveNode(
 	const Document &document,
 	NodeId id,
@@ -814,6 +1084,11 @@ enum class ShapeTemplate : uchar {
 	Stroke,
 	GradientFill,
 	TrimPaths,
+
+	// Round 4.
+	GradientStroke, // Two stops, round caps and joins, width 4.
+	Repeater, // Three copies shifted to the right.
+	RoundCorners, // The "rd" modifier, see BakeRoundCorners().
 };
 
 // New layer at index (0 = top) of the composition (0 = root), covering
@@ -828,7 +1103,9 @@ enum class ShapeTemplate : uchar {
 	std::optional<ShapeTemplate> content = std::nullopt);
 
 // New shape item in a shape layer / group. index -1: paths and groups go
-// to the top, fills / strokes / trims before the group transform.
+// to the top, fills / strokes / trims / repeaters / round corners to the
+// end (before the group transform), so that they apply to everything
+// above them.
 [[nodiscard]] Edit AddShape(
 	const Document &document,
 	NodeId container,
@@ -896,6 +1173,312 @@ enum class TransformField : uchar {
 	int lightnessPercent,
 	const std::vector<NodeId> &scope = {});
 
+// After Effects features (round 4). The top comment tells what Telegram's
+// renderer draws. Frames are in the time base of the node, see
+// Document::localFrame().
+
+// Two edits made one after another (second computed from first.document)
+// as one edit for EditorController::perform(). Failed if either failed.
+[[nodiscard]] Edit Combined(Edit first, Edit second);
+
+// Masks. AddMask() adds a mask to a layer (index -1: the end of the list)
+// with opacity 100 and expansion 0 and turns "hasMask" on. The path is in
+// the layer's own coordinates (Document::transformAt(layer) maps them to
+// the canvas). Mask properties are edited with the common property
+// operations: { mask, "pt" } (path), "o" (opacity), "x" (expansion) and
+// "f" (feather, { x, y }); missing ones are created on the first write.
+// Of these Telegram draws only the path: opacity, expansion and feather
+// are kept for other players and for export (IssueType::MaskOptions).
+// Masks are reordered inside their layer with MoveNode() / ReorderNode()
+// (the order matters: each mask is combined with the result of those
+// before it), removed with DeleteNodes() and copied with DuplicateNodes().
+[[nodiscard]] Edit AddMask(
+	const Document &document,
+	NodeId layer,
+	const PathData &path,
+	MaskMode mode = MaskMode::Add,
+	const QString &name = QString(),
+	int index = -1);
+[[nodiscard]] Edit SetMaskMode(
+	const Document &document,
+	NodeId mask,
+	MaskMode mode);
+
+// Writes the "inv" flag as it is. Telegram's renderer does not read it,
+// to really invert a mask there use InvertMask().
+[[nodiscard]] Edit SetMaskInverted(
+	const Document &document,
+	NodeId mask,
+	bool inverted);
+
+// The mode that cuts the complement of the mask shape without the "inv"
+// flag, if there is one. The first mask of a layer: add <-> subtract,
+// intersect and difference -> subtract. The following masks: subtract
+// <-> intersect (add and difference have no such mode).
+[[nodiscard]] std::optional<MaskMode> InvertedMaskMode(
+	MaskMode mode,
+	bool first);
+
+// Inverts a mask in a way every renderer draws: switches the mode to
+// InvertedMaskMode() and clears "inv". Fails if there is no such mode.
+[[nodiscard]] Edit InvertMask(const Document &document, NodeId mask);
+
+// The usual first mask: a rectangle around what the layer shows at the
+// root frame (the whole canvas for an empty layer), in the layer's own
+// coordinates.
+[[nodiscard]] PathData DefaultMaskPath(
+	const Document &document,
+	NodeId layer,
+	double rootFrame);
+
+// Track mattes. A mode other than None makes `source` the matte of
+// `layer`: the source is moved right above the layer (the only place the
+// renderer looks for it) and marked with "td": 1. source 0 keeps the
+// current matte layer or takes the layer that is right above now. A
+// replaced matte layer becomes an ordinary visible layer ("td" removed).
+// Mode None removes the matte the same way: "tt" is removed and the matte
+// layer becomes an ordinary layer.
+//
+// Fails if there is no layer to use, if the source is the layer itself,
+// lives in another composition, is matted itself or already is the matte
+// of another layer (duplicate it first).
+[[nodiscard]] Edit SetTrackMatte(
+	const Document &document,
+	NodeId layer,
+	MatteMode mode,
+	NodeId source = 0);
+
+// Parenting. parent 0 removes the link. CanSetLayerParent(): both are
+// layers of one composition and the link makes no cycle.
+//
+// keepAtFrame (a frame of the layer's composition) keeps the layer where
+// it is on the canvas at that frame: position, rotation and scale are
+// rewritten relative to the new parent, all their keyframes get the same
+// correction (like After Effects does). Without it the values stay and
+// the layer jumps. A parent without a usable "ind" gets a unique one.
+[[nodiscard]] bool CanSetLayerParent(
+	const Document &document,
+	NodeId layer,
+	NodeId parent);
+[[nodiscard]] Edit SetLayerParent(
+	const Document &document,
+	NodeId layer,
+	NodeId parent,
+	std::optional<double> keepAtFrame = std::nullopt);
+
+// Plain (not animatable) options of shape items, see NodeInfo. Each fails
+// for a node of another type.
+[[nodiscard]] Edit SetGradientType(
+	const Document &document,
+	NodeId shape, // "gf" / "gs"
+	GradientType type);
+[[nodiscard]] Edit SetTrimMode(
+	const Document &document,
+	NodeId shape, // "tm"
+	TrimMode mode);
+[[nodiscard]] Edit SetLineCap(
+	const Document &document,
+	NodeId shape, // "st" / "gs"
+	LineCap cap);
+[[nodiscard]] Edit SetLineJoin(
+	const Document &document,
+	NodeId shape, // "st" / "gs"
+	LineJoin join);
+[[nodiscard]] Edit SetMiterLimit(
+	const Document &document,
+	NodeId shape, // "st" / "gs"
+	double limit);
+[[nodiscard]] Edit SetFillRule(
+	const Document &document,
+	NodeId shape, // "fl" / "gf"
+	FillRule rule);
+
+// Gradients ("gf" / "gs"). The start / end points, the radial highlight,
+// opacity and the stroke width are ordinary properties.
+//
+// SetGradient() writes the stops at the frame (a keyframe of an animated
+// gradient). When the number of color or opacity stops changes, every
+// other keyframe is rebuilt with the new number: its own gradient is
+// sampled at the new offsets.
+//
+// AddGradientStop() / RemoveGradientStop() change the number of stops in
+// every keyframe and keep the other stops of every keyframe. A new stop
+// takes the color (or opacity) the gradient has at its offset in that
+// keyframe. alpha selects the opacity stops: the first one comes with
+// fully opaque stops at both ends (the renderer needs at least two),
+// removing one of the last two removes both. The last color stop is never
+// removed. index is the position in Document::gradientAt().
+[[nodiscard]] Edit SetGradient(
+	const Document &document,
+	NodeId shape,
+	const GradientData &data,
+	double frame);
+[[nodiscard]] Edit AddGradientStop(
+	const Document &document,
+	NodeId shape,
+	double offset,
+	bool alpha = false);
+[[nodiscard]] Edit RemoveGradientStop(
+	const Document &document,
+	NodeId shape,
+	int index,
+	bool alpha = false);
+
+// Fill <-> gradient fill, stroke <-> gradient stroke (type is the target:
+// Fill, Stroke, GradientFill or GradientStroke). The node keeps its id,
+// name, opacity, fill rule, stroke width, caps, joins and dashes. A new
+// gradient goes from the old color to a darker one across the shapes of
+// the container at the frame, a new plain color is the first color stop.
+[[nodiscard]] Edit ConvertPaint(
+	const Document &document,
+	NodeId shape,
+	ShapeType type,
+	double frame = 0.);
+
+// Stroke dashes ("st" / "gs"). Every value is a property of its own
+// (PropertyRole::Dash) that can be animated with the common operations.
+// The items are told apart by their "n" names ("d" / "g" / "o"); a list
+// with a missing name is read by position like the renderer reads every
+// list: the last item is the offset, before it dash, gap, dash, gap...
+// (a dash without a gap gets a gap of its own length).
+struct DashInfo {
+	std::vector<PropertyRef> dashes; // { stroke, "d.N.v" }
+	std::vector<PropertyRef> gaps;
+	PropertyRef offset; // Invalid if the pattern has no offset.
+
+	[[nodiscard]] bool empty() const {
+		return dashes.empty();
+	}
+};
+[[nodiscard]] DashInfo DashesOf(const Document &document, NodeId stroke);
+
+// pattern: dash, gap, dash, gap... (a missing last gap repeats its dash),
+// empty removes the dashes. Writes static values in the order the
+// renderer needs (the offset last). Negative lengths become 0 and gaps
+// are widened if the whole pattern is shorter than kMinDashPeriod (both
+// hang the renderer).
+[[nodiscard]] Edit SetDashes(
+	const Document &document,
+	NodeId stroke,
+	const std::vector<double> &pattern,
+	double offset = 0.);
+
+// Adds / removes dash + gap pairs at the end and keeps the values and
+// keyframes of the others, 0 removes the dashes. Also puts the items in
+// the order the renderer needs.
+[[nodiscard]] Edit SetDashCount(
+	const Document &document,
+	NodeId stroke,
+	int pairs);
+
+// Rounded corners. Telegram's renderer ignores the round corners modifier
+// ("rd"), this turns it into geometry: the paths above it in the same
+// list (and in the groups above it) get rounded corners in every
+// keyframe, rectangles without their own roundness get it, then the
+// modifier is removed. An animated radius is taken at the frame.
+[[nodiscard]] Edit BakeRoundCorners(
+	const Document &document,
+	NodeId roundCorners,
+	double frame = 0.);
+
+// Paths. AddPath() adds a path item ("sh") to a shape layer / group, index
+// like AddShape().
+[[nodiscard]] Edit AddPath(
+	const Document &document,
+	NodeId container,
+	const PathData &path,
+	const QString &name,
+	int index = -1);
+
+// Path structure of { shape, "ks" } / { mask, "pt" }: applied to the
+// static value or to every keyframe, so that all of them keep the same
+// vertices (the renderer cuts a longer keyframe to the shorter one). To
+// move vertices and tangents use SetValueAt() with a path that has the
+// same number of vertices. RemovePathVertex() keeps at least two.
+[[nodiscard]] Edit InsertPathVertex(
+	const Document &document,
+	const PropertyRef &path,
+	int segment,
+	double t);
+[[nodiscard]] Edit RemovePathVertex(
+	const Document &document,
+	const PropertyRef &path,
+	int index);
+[[nodiscard]] Edit SetPathClosed(
+	const Document &document,
+	const PropertyRef &path,
+	bool closed);
+[[nodiscard]] Edit ReversePath(
+	const Document &document,
+	const PropertyRef &path);
+
+// Easing graph. The curve between two keyframes is a cubic bezier from
+// (0, 0) to (1, 1): x is the time progress, y the value progress. `out`
+// is the handle next to the keyframe the segment starts at, `in` the
+// handle next to the keyframe it ends at, both as points of that unit
+// square (x in [0, 1], y may leave it to overshoot). So a keyframe has an
+// in handle (stored in the previous keyframe's segment) and an out handle
+// (its own segment). To draw a handle in (frame, value) coordinates:
+// frame = t0 + x * (t1 - t0), value = v0 + y * (v1 - v0) for the segment
+// from keyframe (t0, v0) to keyframe (t1, v1).
+struct KeyframeHandles {
+	bool hasIn = false; // There is a previous keyframe.
+	bool hasOut = false; // There is a next keyframe.
+	bool holdIn = false; // The previous segment is hold: no in handle.
+	bool holdOut = false; // The own segment is hold: no out handle.
+	QPointF in = QPointF(1., 1.);
+	QPointF out = QPointF(0., 0.);
+	double previousTime = 0.; // Valid with hasIn.
+	double nextTime = 0.; // Valid with hasOut.
+};
+[[nodiscard]] std::optional<KeyframeHandles> HandlesOf(
+	const Document &document,
+	const KeyframeRef &keyframe);
+
+// Sets the given handles (x is clamped to [0, 1]): `in` changes the
+// previous keyframe's segment, `out` the keyframe's own one. A hold
+// segment becomes a bezier one. Sides that do not exist are ignored.
+//
+// y is limited to EasingRange(): [0, 1] (no overshoot) for properties
+// where a value outside of the keyframe values hangs the renderer (motion
+// path keyframes, dash and gap lengths, repeater copies, star points) and
+// [-2, 3] for the others, the dash offset included. Every operation that
+// takes an Easing clamps it the same way.
+[[nodiscard]] Edit SetKeyframeHandles(
+	const Document &document,
+	const KeyframeRef &keyframe,
+	std::optional<QPointF> in,
+	std::optional<QPointF> out);
+
+struct EasingLimits {
+	double minY = -2.;
+	double maxY = 3.;
+
+	// minY == 0: handles below the keyframe line are not allowed.
+	[[nodiscard]] bool overshoot() const {
+		return (minY < 0.) || (maxY > 1.);
+	}
+};
+[[nodiscard]] EasingLimits EasingRange(
+	const Document &document,
+	const PropertyRef &ref);
+
+// Motion path of a point property (position, anchor, gradient points...):
+// with it ("to" / "ti" tangents in the keyframes) the value moves along a
+// curve by its length and can't overshoot; without it every dimension is
+// interpolated on its own and the easing may leave [0, 1]. Turning it off
+// drops the tangents (the motion becomes straight lines), turning it on
+// adds zero tangents and limits the easing.
+[[nodiscard]] Edit SetMotionPath(
+	const Document &document,
+	const PropertyRef &ref,
+	bool enabled);
+
+// SetKeyframeEasing() with an easing of its own for every keyframe.
+[[nodiscard]] Edit SetKeyframeEasings(
+	const Document &document,
+	const std::vector<std::pair<KeyframeRef, Easing>> &easings);
+
 // Composition. SetCanvasSize with scaleContent fits the old canvas into
 // the new one (uniform scale, centered) by transforming the root layers
 // that have no parent; without it the content is centered unscaled.
@@ -949,6 +1532,31 @@ enum class IssueSeverity : uchar {
 	Warning, // Forbidden by Telegram's sticker guidelines.
 };
 
+// What an issue is about, so that the UI can say it in plain words:
+// "Telegram does not accept this" is not the same as "Telegram will not
+// draw this". Only .tgs is concerned, export to video / GIF / JSON keeps
+// everything.
+enum class IssueCategory : uchar {
+	// The file as a whole: canvas, frame rate, duration, size, version.
+	File,
+
+	// A feature Telegram does not accept in animated stickers: it is in
+	// the official requirements (core.telegram.org/stickers) and / or the
+	// official Bodymovin-TG exporter refuses to export it. The list:
+	// expressions, masks, mattes, layer effects, images, solids, texts, 3D
+	// layers, merge paths, star shapes, gradient strokes, repeaters, time
+	// stretching, time remapping, auto-oriented layers. Issue::rendered
+	// tells whether the renderer would draw it anyway.
+	Forbidden,
+
+	// Allowed, but Telegram's renderer (rlottie) ignores it or draws it
+	// differently from After Effects and other players.
+	NotRendered,
+
+	// Accepted and drawn, but worth a look.
+	Advice,
+};
+
 enum class IssueType : uchar {
 	// Errors.
 	InvalidComposition, // Bad "w" / "h" / "fr" / "ip" / "op".
@@ -978,6 +1586,66 @@ enum class IssueType : uchar {
 	GradientStrokes,
 	OutOfCanvas, // Content reaches the canvas edge (render check).
 	AutoOrient, // Auto-oriented layers ("ao": 1). Fix: turn it off.
+
+	// Round 4, warnings except RendererHang (Telegram takes such files).
+
+	// Forbidden. Track mattes are in Telegram's list of features a
+	// sticker must not use. They are drawn (alpha, luma and both
+	// inverted), but every pair is rendered through two full size
+	// buffers, which is slow. Nodes: the matted layers.
+	TrackMattes,
+
+	// NotRendered. A matted layer that is not drawn at all: it has no
+	// layer above it or the layer above is matted too. Nodes: such layers.
+	BrokenMattes,
+
+	// NotRendered. "tp" (the matte link of newer exports) names a layer
+	// that is not right above the matted one: Telegram uses the layer
+	// right above instead. Nodes: the matted layers.
+	MatteLinks,
+
+	// NotRendered. The layer has masks but no "hasMask": true, they are
+	// all ignored. Fix: turn "hasMask" on (the picture changes: the masks
+	// start to work). Nodes: the layers.
+	MasksOff,
+
+	// NotRendered. Mask mode lighten / darken or a missing mode: the mask
+	// is skipped; or every mask of the layer is "none" / skipped: the
+	// layer is not drawn at all. Fix: lighten -> add, darken -> intersect,
+	// masks are turned off for a layer that has only "none" masks (the
+	// picture changes). Nodes: the masks.
+	MaskModes,
+
+	// NotRendered. Mask opacity is not 100%, feather or expansion is set:
+	// all three are ignored, the mask is fully opaque with a sharp edge on
+	// its path. Fix: reset them (the picture in Telegram stays the same).
+	// Nodes: the masks.
+	MaskOptions,
+
+	// NotRendered. The mask is inverted ("inv"): the flag is ignored, the
+	// mask works as if it was not inverted. Fix: InvertMask() where a mode
+	// with the same result exists (the picture changes to the inverted
+	// one). Nodes: the masks.
+	MaskInverted,
+
+	// NotRendered. Keyframes of a path have different numbers of vertices:
+	// the longer ones are cut. Nodes: the shapes / masks.
+	PathVertices,
+
+	// NotRendered. Parser quirks: a shape item has keys before "ty" (all
+	// of them are ignored), or a layer has no "ddd": 0 before "ks" (its
+	// rotation is ignored). Fix: reorder the keys (the picture changes to
+	// what the file means). Nodes: the shapes / layers.
+	KeyOrder,
+
+	// NotRendered. "parent" names a missing layer, the layer itself or
+	// makes a cycle: the link is ignored. Fix: remove it. Nodes: layers.
+	ParentLinks,
+
+	// NotRendered, the only round 4 error: values that hang Telegram's
+	// renderer, see RenderSafeJson(). Fix: clamp them. Nodes: the layers,
+	// shapes and masks that have such values.
+	RendererHang,
 };
 
 struct Issue {
@@ -989,7 +1657,30 @@ struct Issue {
 	// Measured value: canvas width (CanvasSize), fps (FrameRate), seconds
 	// (Duration), gzipped bytes (FileSize), 0 otherwise.
 	double value = 0.;
+
+	// Filled by Validate(): CategoryOf(type), RenderedByTelegram(type) and
+	// FixChangesPicture(type).
+	IssueCategory category = IssueCategory::File;
+	bool rendered = true;
+	bool fixChangesPicture = false;
 };
+
+[[nodiscard]] IssueCategory CategoryOf(IssueType type);
+
+// Whether Telegram's renderer draws the feature the issue is about the
+// way After Effects does. true for a Forbidden issue means: the sticker
+// would look right, Telegram just does not allow the feature (masks,
+// track mattes, solids, repeaters, star shapes, gradient strokes, time
+// stretching and remapping, auto-orient). Always true for File / Advice
+// issues, false for NotRendered ones.
+[[nodiscard]] bool RenderedByTelegram(IssueType type);
+
+// The automatic fix changes what Telegram shows (to what the file was
+// meant to look like): MasksOff, MaskModes, MaskInverted, KeyOrder.
+// AutoFix() applies such fixes only when their type is named, never with
+// an empty list, so that "fix everything" can not change a sticker that
+// already looks right in Telegram.
+[[nodiscard]] bool FixChangesPicture(IssueType type);
 
 struct ValidateOptions {
 	bool measureSize = true; // Gzip the document (a few ms).
@@ -1002,15 +1693,25 @@ struct ValidationResult {
 	bool packedSizeEstimated = false; // PackTgs() unavailable, zlib estimate.
 
 	[[nodiscard]] bool ok() const; // No errors.
+
+	// Something AutoFix() without a list of types would fix (fixable
+	// issues whose fix does not change the picture).
 	[[nodiscard]] bool hasFixable() const;
+
+	// Issues of one category / the first issue of a type (null if none,
+	// the pointer lives as long as this result).
+	[[nodiscard]] std::vector<Issue> of(IssueCategory category) const;
+	[[nodiscard]] const Issue *find(IssueType type) const &;
+	const Issue *find(IssueType type) const && = delete;
 };
 
 [[nodiscard]] ValidationResult Validate(
 	const Document &document,
 	const ValidateOptions &options = {});
 
-// Applies the fixes of the given issue types (every fixable type when
-// empty), in a safe order, as one edit.
+// Applies the fixes of the given issue types, in a safe order, as one
+// edit. An empty list means every fixable type whose fix keeps the
+// picture (see FixChangesPicture()).
 [[nodiscard]] Edit AutoFix(
 	const Document &document,
 	const std::vector<IssueType> &types = {});
@@ -1041,6 +1742,19 @@ enum class Command : uchar {
 	Trim,
 	AutoFix,
 	Optimize,
+
+	// Round 4.
+	AddMask,
+	ChangeMask, // Mode / inverted.
+	TrackMatte,
+	Parent,
+	ShapeOption, // Gradient type, trim mode, caps, joins, fill rule.
+	Gradient, // Gradient stops.
+	ConvertPaint, // Fill <-> gradient fill, stroke <-> gradient stroke.
+	Dashes,
+	BakeCorners,
+	AddPath,
+	EditPath, // Vertices added / removed, closed / opened, reversed.
 };
 
 enum class ChangeSource : uchar {
@@ -1215,6 +1929,58 @@ public:
 	bool trimRange(double from, double to, bool rebase);
 	bool autoFix(const std::vector<IssueType> &types = {});
 	bool optimize(const OptimizeOptions &options = {});
+
+	// Round 4 shortcuts, the same rules: frames default to the current
+	// frame in the node's time base, added nodes get selected.
+	bool addMask(
+		NodeId layer,
+		const PathData &path,
+		MaskMode mode = MaskMode::Add,
+		const QString &name = QString());
+	bool setMaskMode(NodeId mask, MaskMode mode);
+	bool setMaskInverted(NodeId mask, bool inverted);
+	bool invertMask(NodeId mask);
+	bool setTrackMatte(NodeId layer, MatteMode mode, NodeId source = 0);
+	bool setLayerParent(NodeId layer, NodeId parent, bool keepPlace = true);
+	bool setGradientType(NodeId shape, GradientType type);
+	bool setTrimMode(NodeId shape, TrimMode mode);
+	bool setLineCap(NodeId shape, LineCap cap);
+	bool setLineJoin(NodeId shape, LineJoin join);
+	bool setMiterLimit(
+		NodeId shape,
+		double limit,
+		QByteArray mergeKey = QByteArray());
+	bool setFillRule(NodeId shape, FillRule rule);
+	bool setGradient(
+		NodeId shape,
+		const GradientData &data,
+		QByteArray mergeKey = QByteArray());
+	bool addGradientStop(NodeId shape, double offset, bool alpha = false);
+	bool removeGradientStop(NodeId shape, int index, bool alpha = false);
+	bool convertPaint(NodeId shape, ShapeType type);
+	bool setDashes(
+		NodeId stroke,
+		const std::vector<double> &pattern,
+		double offset = 0.,
+		QByteArray mergeKey = QByteArray());
+	bool setDashCount(NodeId stroke, int pairs);
+	bool bakeRoundCorners(NodeId roundCorners);
+	bool addPath(
+		NodeId container,
+		const PathData &path,
+		const QString &name);
+	bool insertPathVertex(const PropertyRef &path, int segment, double t);
+	bool removePathVertex(const PropertyRef &path, int index);
+	bool setPathClosed(const PropertyRef &path, bool closed);
+	bool reversePath(const PropertyRef &path);
+	bool setKeyframeHandles(
+		const KeyframeRef &keyframe,
+		std::optional<QPointF> in,
+		std::optional<QPointF> out,
+		QByteArray mergeKey = QByteArray());
+	bool setKeyframeEasings(
+		const std::vector<std::pair<KeyframeRef, Easing>> &easings);
+	bool setMotionPath(const PropertyRef &ref, bool enabled);
 
 	// Deletes the selected keyframes if any, the selected nodes otherwise.
 	bool deleteSelection();

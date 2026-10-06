@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/sticker_set_box.h"
 
+#include "oblivion/oblivion_sticker_export.h" // Oblivion
 #include "api/api_common.h"
 #include "api/api_stickers_creator.h"
 #include "api/api_toggling_media.h"
@@ -951,6 +952,8 @@ void StickerSetBox::updateButtons() {
 							: tr::lng_stickers_share_pack)(tr::now),
 						[=] { share(); closeBox(); },
 						&st::menuIconShare);
+					// Oblivion: "Save the whole set (.zip)".
+					Oblivion::AddStickerSetExportAction(raw, _show, _set);
 					if (fillSetCreatorFooter) {
 						fillSetCreatorFooter(raw);
 					}
@@ -1007,6 +1010,8 @@ void StickerSetBox::updateButtons() {
 						if (fillSetCreatorMenu) {
 							fillSetCreatorMenu(raw);
 						}
+						// Oblivion: "Save the whole set (.zip)".
+						Oblivion::AddStickerSetExportAction(raw, _show, _set);
 						if (fillSetCreatorFooter) {
 							fillSetCreatorFooter(raw);
 						} else {
@@ -1025,6 +1030,8 @@ void StickerSetBox::updateButtons() {
 								: tr::lng_stickers_archive_pack(tr::now)),
 							archive,
 							&st::menuIconArchive);
+						// Oblivion: "Save the whole set (.zip)".
+						Oblivion::AddStickerSetExportAction(raw, _show, _set);
 						if (fillSetCreatorFooter) {
 							fillSetCreatorFooter(raw);
 						}
@@ -1646,6 +1653,14 @@ void StickerSetBox::Inner::contextMenuEvent(QContextMenuEvent *e) {
 		this,
 		st::popupMenuWithIcons);
 	const auto details = _show->sendMenuDetails();
+	// Oblivion: "Save as" and "Save the whole set (.zip)".
+	const auto addOblivionExport = [&] {
+		Oblivion::AddStickerExportActions(
+			_menu.get(),
+			_show,
+			_pack[index],
+			Data::FileOriginStickerSet(_setId, _setAccessHash));
+	};
 	if (setType() == Data::StickersType::Emoji) {
 		if (const auto t = PrepareTextFromEmoji(_pack[index]); !t.empty()) {
 			_menu->addAction(tr::lng_mediaview_copy(tr::now), [=] {
@@ -1654,6 +1669,7 @@ void StickerSetBox::Inner::contextMenuEvent(QContextMenuEvent *e) {
 				}
 			}, &st::menuIconCopy);
 		}
+		addOblivionExport(); // Oblivion
 		if (!amSetCreator()) {
 			Api::AddAddToEmojiSetAction(
 				Ui::Menu::CreateAddActionCallback(_menu.get()),
@@ -1710,6 +1726,7 @@ void StickerSetBox::Inner::contextMenuEvent(QContextMenuEvent *e) {
 				_show,
 				document);
 		}
+		addOblivionExport(); // Oblivion
 		if (amSetCreator()) {
 			const auto addAction = Ui::Menu::CreateAddActionCallback(
 				_menu.get());
@@ -1730,6 +1747,8 @@ void StickerSetBox::Inner::contextMenuEvent(QContextMenuEvent *e) {
 			_show,
 			details,
 			SendMenu::DefaultCallback(_show, send));
+	} else {
+		addOblivionExport(); // Oblivion
 	}
 	if (_menu->empty()) {
 		_menu = nullptr;

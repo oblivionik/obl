@@ -823,6 +823,9 @@ private:
 	std::unique_ptr<Ui::RequestsBar> _requestsBar;
 	int _requestsBarHeight = 0;
 
+	// Oblivion: the bar of listening to music together, the lowest one.
+	object_ptr<Ui::RpWidget> _oblivionListenBar = { nullptr };
+
 	base::unique_qptr<Ui::SlideWrap<Ui::RpWidget>> _sponsoredMessageBar;
 	int _sponsoredMessageBarHeight = 0;
 

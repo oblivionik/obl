@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/click_handler_types.h"
 
 #include "oblivion/oblivion_forward_copy.h"
+#include "oblivion/oblivion_listen.h"
 
 #include "base/unixtime.h"
 #include "lang/lang_keys.h"
@@ -268,6 +269,10 @@ QString HiddenUrlClickHandler::dragText() const {
 }
 
 void HiddenUrlClickHandler::Open(QString url, QVariant context) {
+	// Oblivion: the headphones of a "listening together" message join it.
+	if (Oblivion::Listen::OpenControlLink(url, context)) {
+		return;
+	}
 	if (const auto external = UrlClickHandler::ExternalUrlFromInternalUrl(url);
 			!external.isEmpty()) {
 		url = external;

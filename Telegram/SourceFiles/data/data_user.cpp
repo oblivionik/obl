@@ -37,6 +37,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_peer_photo.h"
 #include "apiwrap.h"
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_badge.h"
 #include "window/notifications_manager.h"
 
 namespace {
@@ -925,7 +926,10 @@ void ApplyUserUpdate(not_null<UserData*> user, const MTPDuserFull &update) {
 		: update.is_phone_calls_available()
 		? UserData::CallsStatus::Enabled
 		: UserData::CallsStatus::Disabled);
-	user->setAbout(qs(update.vabout().value_or_empty()));
+	// Oblivion: the invisible badge marker is noted and kept out of the bio.
+	user->setAbout(Oblivion::Badge::AboutLoaded(
+		user,
+		qs(update.vabout().value_or_empty())));
 	user->setCommonChatsCount(update.vcommon_chats_count().v);
 	user->setPeerGiftsCount(update.vstargifts_count().value_or_empty());
 	user->setMainProfileTab(Data::ParseProfileTab(update.vmain_tab()));

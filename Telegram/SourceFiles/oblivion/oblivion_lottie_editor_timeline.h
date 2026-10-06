@@ -19,6 +19,7 @@ namespace Oblivion::LottieEdit {
 
 class EditorController;
 class GlyphButton;
+class GraphEditor;
 
 // Bottom panel of the Lottie editor.
 //
@@ -40,6 +41,12 @@ class GlyphButton;
 //    presets, copy / paste (at the current frame) and delete.
 //  - Wheel scrolls rows, Shift+wheel / horizontal scroll moves in time,
 //    Cmd+wheel zooms the time axis.
+//  - The graph button of the transport (or "Easing graph" in the keyframe
+//    menu) shows the easing graph of the active property in place of the
+//    keyframe tracks (GraphEditor, oblivion_lottie_editor_graph.h): value
+//    and speed curves with bezier handles and the easing presets. The
+//    ruler, the playhead and the names column stay, a click on a property
+//    name chooses what the graph shows.
 class TimelinePanel final : public Ui::RpWidget {
 public:
 	TimelinePanel(QWidget *parent, not_null<EditorController*> controller);
@@ -57,6 +64,12 @@ public:
 	// Width of the names column, EditorWidget aligns it with the layers
 	// panel above (0: the default width).
 	void setNamesWidth(int width);
+
+	// The easing graph instead of the keyframe tracks (kept for the app
+	// session when the user switches it).
+	[[nodiscard]] bool graphShown() const;
+	void setGraphShown(bool shown);
+	[[nodiscard]] not_null<GraphEditor*> graph() const;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -126,6 +139,8 @@ private:
 
 	void setupControls();
 	void updateControlsGeometry();
+	void updateGraphGeometry();
+	void showGraph(bool shown, bool remember);
 	void refreshPlayButton();
 	void invalidateRows();
 	void ensureRows();
@@ -194,6 +209,9 @@ private:
 	GlyphButton *_loop = nullptr;
 	GlyphButton *_zoomOut = nullptr;
 	GlyphButton *_zoomIn = nullptr;
+	GlyphButton *_graph = nullptr;
+	GraphEditor *_graphEditor = nullptr;
+	bool _graphShown = false;
 
 	std::vector<Row> _rows;
 	bool _rowsDirty = true;

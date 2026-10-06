@@ -53,6 +53,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "main/main_domain.h"
 #include "mtproto/mtproto_dc_options.h"
+#include "oblivion/oblivion_badge.h"
 #include "window/window_session_controller.h"
 #include "window/window_controller.h"
 #include "window/window_peer_menu.h"
@@ -739,7 +740,10 @@ void SetupBio(
 		}
 		changed->fire(*current != text);
 		const auto limit = self->isPremium() ? premiumLimit : defaultLimit;
-		const auto countLeft = limit - Ui::ComputeFieldCharacterCount(bio);
+		// Oblivion: the invisible badge marker takes a part of the limit.
+		const auto countLeft = limit
+			- Oblivion::Badge::ReservedBioLength(self)
+			- Ui::ComputeFieldCharacterCount(bio);
 		countdown->setText(QString::number(countLeft));
 		countdown->setTextColorOverride(
 			countLeft < 0 ? st::boxTextFgError->c : std::optional<QColor>());

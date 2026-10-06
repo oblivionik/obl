@@ -101,7 +101,7 @@ class Show;
 //   Cmd+- zoom in / out, Cmd+0 fit (zoom 1, no pan), Cmd+W close,
 //   Alt+arrows move the selection by 1 px (Shift: 10 px), J / K previous /
 //   next keyframe, Cmd+C / Cmd+V copy / paste the selected keyframes (at
-//   the current frame).
+//   the current frame), V / P the selection / the pen tool of the canvas.
 // Text fields get every key first: a key they accept (typing, Space,
 // arrows, Delete, their own Cmd+Z...) never reaches these shortcuts. The
 // editor claims its modified keys in ShortcutOverride, so the app-wide
@@ -109,6 +109,8 @@ class Show;
 // "Saved Messages"...) don't take them while the editor is focused.
 // Editing keys (undo / redo, delete, duplicate, paste, nudge) are ignored
 // while a mouse button is held, so they can't interfere with a drag.
+// Delete works once per press, a held key does not repeat it: the repeat
+// would go on from the selected keyframes to the nodes that own them.
 //
 // Selection model (EditorController): node selection, selected keyframes
 // and the active property. Changing the node selection drops keyframes /
@@ -116,8 +118,9 @@ class Show;
 // thing and Delete / paste act on what is visible.
 //
 // Toolbar: New Open Save Export (.tgs / .json / current frame as PNG or
-// SVG) | Undo Redo | name · info | canvas background, zoom out, zoom %
-// (menu), zoom in | TGS check status (opens the check box) | done.
+// SVG) | Undo Redo | name · info | selection tool, pen tool | canvas
+// background, zoom out, zoom % (menu), zoom in | TGS check status (opens
+// the check box) | done.
 namespace Oblivion::LottieEdit {
 
 class CanvasPanel;
@@ -183,10 +186,52 @@ void CloseAllWindows();
 
 // "Telegram sticker check" box: issues with "Fix" / "Select" actions.
 // Uses controller->uiShow(), does nothing without it.
+//
+// The issues are grouped by what they mean for a sticker: what Telegram
+// rejects, features it does not accept in animated stickers (masks,
+// repeaters, gradient strokes...), what its renderer does not draw or
+// draws differently, and advice. Only .tgs stickers are concerned: export
+// to JSON, video and GIF keeps everything, the box says so.
 void ShowValidationBox(not_null<EditorController*> controller);
 void ValidationBox(
 	not_null<Ui::GenericBox*> box,
 	not_null<EditorController*> controller);
+
+// What the check is shown for.
+enum class ValidationPurpose : uchar {
+	Check, // The status button of the toolbar: a list and fixes.
+	StickerPack, // Before "Add to sticker pack".
+	ExportTgs, // Before a .tgs file is written.
+	Done, // Before EditorArgs::done gets the .tgs (send as a sticker...).
+};
+
+struct ValidationArgs {
+	ValidationPurpose purpose = ValidationPurpose::Check;
+
+	// The "continue" button (its text depends on the purpose): called
+	// after the box is closed. Not offered to a sticker pack while there
+	// are errors (the pack would refuse the sticker anyway).
+	Fn<void()> proceed;
+};
+void ValidationBoxFor(
+	not_null<Ui::GenericBox*> box,
+	not_null<EditorController*> controller,
+	ValidationArgs &&args);
+
+// Runs proceed right away if the document has nothing Telegram would
+// reject, refuse to draw or not accept (advice alone does not stop
+// anybody), otherwise shows the check box with a button that continues.
+// The check itself runs off the main thread. Without uiShow() (tests)
+// it just proceeds.
+void CheckBeforeSticker(
+	not_null<EditorController*> controller,
+	ValidationPurpose purpose,
+	Fn<void()> proceed);
+
+// Whether the result has something CheckBeforeSticker() stops for.
+[[nodiscard]] bool NeedsStickerWarning(const ValidationResult &result);
+
+[[nodiscard]] QString IssueCategoryText(IssueCategory category);
 
 // Localized texts, main thread.
 //
@@ -312,6 +357,9 @@ enum class Glyph : uchar {
 	BackgroundDark,
 	BackgroundLight,
 	Keyframe,
+	Graph, // An easing curve (the graph of the timeline).
+	Cursor, // The selection tool.
+	Pen, // The pen tool.
 };
 
 // Paints the glyph centered in rect (designed for a 24x24 area).

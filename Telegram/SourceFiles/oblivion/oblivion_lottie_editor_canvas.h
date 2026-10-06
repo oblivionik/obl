@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/unique_qptr.h"
 #include "oblivion/oblivion_lottie_doc.h"
+#include "oblivion/oblivion_lottie_editor_masks.h"
 #include "ui/rp_widget.h"
 
 #include <QtGui/QPainterPath>
@@ -50,6 +51,23 @@ enum class CanvasBackground : uchar {
 //  - Dragging moves the selected layers / groups / shapes (their position,
 //    auto-keyframed at the current frame if animated) as one undo step,
 //    Shift keeps the move horizontal or vertical, Esc cancels.
+//  - Masks of the selected layers are outlined with a dashed line.
+//  - The pen tool (CanvasTool::Pen, the toolbar or P; V goes back to the
+//    selection) edits the points of the selected path item or mask:
+//    dragging a point moves it, dragging a handle bends the curve (a smooth
+//    point keeps both handles on one line, Alt moves one handle alone),
+//    a click on the outline adds a point, a double click or Alt+click on
+//    a point switches it between a corner and a smooth one, Alt+drag pulls
+//    new handles out of it, Delete removes the selected point (and only
+//    it: the press that removed a point, held or repeated, does not go on
+//    to delete the path, that takes a click on the canvas first). With the
+//    last (or the first) point of an open path selected a click on an
+//    empty place continues the path, a click on its other end closes it.
+//    With a shape layer or a group selected two clicks start a new path in
+//    it (not next to a selected rectangle / ellipse, which is to be
+//    converted to a path); the paths and masks inside the selection are
+//    outlined and a click on one of them selects it. Every drag is one undo
+//    step, Esc cancels it, then drops the point selection.
 class CanvasPanel final : public Ui::RpWidget {
 public:
 	CanvasPanel(QWidget *parent, not_null<EditorController*> controller);
@@ -79,6 +97,18 @@ public:
 	// The frame for the current document and frame is on the screen.
 	[[nodiscard]] bool frameReady() const;
 
+	// The tool of this editor (CurrentTool() of the controller).
+	[[nodiscard]] CanvasTool tool() const;
+	void setTool(CanvasTool tool);
+
+	// The point of the edited path the pen has selected, -1 for none.
+	[[nodiscard]] int selectedPathVertex() const;
+	void selectPathVertex(int index);
+
+	// A rectangle / an ellipse of the selection becomes a path item (the
+	// pen works on paths only), false if the selection is something else.
+	bool convertSelectionToPath();
+
 protected:
 	void paintEvent(QPaintEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
@@ -107,6 +137,27 @@ private:
 	};
 	struct MoveTarget;
 	struct Drag;
+
+	// The path the pen edits: the selected path item / mask at the
+	// current frame.
+	struct PenTarget {
+		NodeId node = 0;
+		PropertyRef ref;
+		PathData path; // In its own coordinates.
+		QTransform toCanvas; // Path coordinates -> composition.
+		double localFrame = 0.;
+
+		[[nodiscard]] bool valid() const {
+			return ref.valid();
+		}
+	};
+	struct PenGeometry {
+		PenTarget target;
+		// Other paths / masks of the selection, composition coordinates.
+		std::vector<std::pair<NodeId, QPainterPath>> candidates;
+		// Masks of the selected layers, composition coordinates.
+		std::vector<std::pair<NodeId, QPainterPath>> masks;
+	};
 
 	[[nodiscard]] QRectF canvasRect() const;
 	[[nodiscard]] QRectF canvasRect(double scale, QPointF pan) const;
@@ -142,6 +193,34 @@ private:
 	void paintOverlay(QPainter &p);
 	void paintInfo(QPainter &p);
 
+	void ensurePenGeometry();
+	void resetPen();
+	[[nodiscard]] double pickRadius() const;
+	[[nodiscard]] QTransform penToView() const;
+	[[nodiscard]] PathPick penPick(QPointF point);
+	[[nodiscard]] NodeId pickCandidate(QPointF point);
+	void penPress(QPointF point, Qt::KeyboardModifiers modifiers);
+	void penHover(QPointF point);
+	void penDoubleClick(QPointF point);
+	bool penKey(not_null<QKeyEvent*> e);
+	// part Vertex with the mode Mirrored pulls new handles out of the
+	// vertex, with any other mode it moves the vertex.
+	void startPenDrag(
+		QPointF point,
+		int vertex,
+		PathPart part,
+		TangentMode mode);
+	void applyPenDrag(QPointF point, Qt::KeyboardModifiers modifiers);
+	bool startNewPath(NodeId container, QPointF first, QPointF second);
+	bool performPen(Edit &&edit);
+	void toggleVertex(int index);
+	void removeVertex(int index);
+	void addPenMenuItems(QPointF point);
+	[[nodiscard]] QString penHint();
+	void paintMasks(QPainter &p);
+	void paintPen(QPainter &p);
+	void paintHint(QPainter &p);
+
 	const not_null<EditorController*> _controller;
 	const std::unique_ptr<FrameRenderer> _renderer;
 	rpl::variable<CanvasBackground> _background;
@@ -166,6 +245,20 @@ private:
 	NodeId _hovered = 0;
 	QPainterPath _hoverPath;
 	bool _hoverPathValid = false;
+
+	// The pen tool.
+	CanvasTool _tool = CanvasTool::Select;
+	PenGeometry _pen;
+	bool _penValid = false;
+	int _penVertex = -1;
+	// A point was just removed: one more Delete is taken for a slip of the
+	// finger and not for "delete the whole path" until the next click.
+	bool _penPointRemoved = false;
+	PathPick _penOver;
+	// The first point of a new path (composition coordinates) waits for
+	// the second one in this shape layer / group.
+	std::optional<QPointF> _penPending;
+	NodeId _penPendingContainer = 0;
 
 	std::optional<QPointF> _cursor; // Composition coordinates.
 	std::unique_ptr<Drag> _drag;

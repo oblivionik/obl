@@ -7,8 +7,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/window_peer_menu.h"
 
+#include "oblivion/oblivion_chat_stats_ui.h"
 #include "oblivion/oblivion_deleted.h"
 #include "oblivion/oblivion_ghost.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_local_names.h"
 #include "oblivion/oblivion_online.h"
 #include "oblivion/oblivion_profile_history.h"
@@ -1898,9 +1900,12 @@ void Filler::fillHistoryActions() {
 	addDirectMessages();
 	addExportChat();
 	addTranslate();
+	// Oblivion: listen together to what the player has now.
+	Oblivion::Listen::AddStartAction(_addAction, _controller, _peer);
 	Oblivion::AddOnlineActions(_addAction, _controller, _peer);
 	Oblivion::AddLocalNameActions(_controller, _request.key, _addAction);
 	Oblivion::AddProfileHistoryAction(_controller, _request.key, _addAction);
+	Oblivion::AddChatStatsAction(_controller, _request.key, _addAction);
 	Oblivion::AddDeletedMessagesAction(_controller, _peer, _addAction);
 	addReport();
 	addClearHistory();
@@ -1917,6 +1922,7 @@ void Filler::fillProfileActions() {
 	Oblivion::AddOnlineActions(_addAction, _controller, _peer);
 	Oblivion::AddLocalNameActions(_controller, _request.key, _addAction);
 	Oblivion::AddProfileHistoryAction(_controller, _request.key, _addAction);
+	Oblivion::AddChatStatsAction(_controller, _request.key, _addAction);
 	addBotToGroup();
 	addNewMembers();
 	addSendGift();

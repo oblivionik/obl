@@ -28,6 +28,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text_options.h"
 #include "ui/ui_utility.h"
 #include "window/themes/window_theme.h"
+#include "base/event_filter.h"
 #include "base/unique_qptr.h"
 #include "styles/style_layers.h"
 #include "styles/style_widgets.h"
@@ -38,6 +39,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QTimer>
+#include <QtGui/QWindow>
 
 #include <cctype>
 #include <cstdlib>
@@ -720,6 +722,24 @@ void FitWidget(not_null<QWidget*> widget, int width, int height) {
 	}
 }
 
+// The widgets send themselves a mouse move after a scroll or a change of
+// the layout (Ui::SendSynteticMouseEvent), with the place of the real
+// pointer on the screen. A scene is never on the screen, so that place
+// means nothing to it, but a button of the scene that happens to be there
+// would be painted as hovered. No scene moves the mouse by events: what
+// has to look hovered in a picture is told so directly.
+void IgnoreRealPointer(not_null<QWidget*> shown) {
+	const auto handle = shown->window()->windowHandle();
+	if (!handle) {
+		return;
+	}
+	base::install_event_filter(handle, [](not_null<QEvent*> e) {
+		return (e->type() == QEvent::MouseMove)
+			? base::EventFilterResult::Cancel
+			: base::EventFilterResult::Continue;
+	});
+}
+
 [[nodiscard]] Rendered RenderScene(
 		const SceneDescriptor &scene,
 		const QString &theme,
@@ -764,6 +784,7 @@ void FitWidget(not_null<QWidget*> widget, int width, int height) {
 
 		if (isBox) {
 			raw->show();
+			IgnoreRealPointer(raw);
 			Ui::SendPendingMoveResizeEvents(raw);
 			const auto layers = SceneLayers(raw);
 			auto box = scene.box(layers->uiShow());
@@ -808,8 +829,10 @@ void FitWidget(not_null<QWidget*> widget, int width, int height) {
 			}
 		}
 		raw->show();
+		IgnoreRealPointer(raw);
 		if (const auto top = separate.data()) {
 			top->show();
+			IgnoreRealPointer(top);
 			Ui::SendPendingMoveResizeEvents(top);
 		}
 		Ui::SendPendingMoveResizeEvents(raw);

@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/stickers_list_widget.h"
 
 #include "oblivion/oblivion_interface.h"
+#include "oblivion/oblivion_sticker_export.h" // Oblivion
 #include "base/options.h"
 #include "base/timer_rpl.h"
 #include "core/application.h"
@@ -2626,6 +2627,16 @@ base::unique_qptr<Ui::PopupMenu> StickersListWidget::fillContextMenu(
 		}, &icons->menuRecentRemove);
 	}
 
+	// Oblivion: "Save as" and "Save the whole set (.zip)".
+	if (_features.openStickerSets) {
+		Oblivion::AddStickerExportActions(
+			menu.get(),
+			_show,
+			document,
+			Data::FileOrigin(),
+			icons);
+	}
+
 	SendMenu::AttachSendMenuEffect(
 		menu,
 		_show,
@@ -2723,6 +2734,12 @@ base::unique_qptr<Ui::PopupMenu> FillStickerSetContextMenu(
 			});
 		},
 		&icons.menuSetCopyLink);
+	// Oblivion: "Save the whole set (.zip)".
+	Oblivion::AddStickerSetExportAction(
+		menu.get(),
+		show,
+		set->identifier(),
+		&icons);
 	if (installed) {
 		menu->addSeparator();
 		menu->addAction(

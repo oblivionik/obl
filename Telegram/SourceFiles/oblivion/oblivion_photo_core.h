@@ -341,6 +341,16 @@ inline constexpr auto kMaxEffects = 32;
 	QSize maxSize = QSize(),
 	const std::atomic<bool> *cancelled = nullptr);
 
+// Everything of Render() except the geometry (adjustments, filter,
+// effects, vignette, grain), applied in place to an image of any size:
+// what the layer effects that wrap this pipeline use. The image is
+// converted to Format_ARGB32_Premultiplied and detached. False if the
+// image is null or it was cancelled (the pixels are undefined then).
+[[nodiscard]] bool ApplyEdits(
+	QImage &image,
+	const EditState &state,
+	const std::atomic<bool> *cancelled = nullptr);
+
 // Square side x side preview of the edited image: the geometry output is
 // scaled to cover the square and center-cropped, then the whole pipeline
 // runs at that size. Pass the PrepareSource() image, not the full source.

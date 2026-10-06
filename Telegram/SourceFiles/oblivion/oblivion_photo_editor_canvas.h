@@ -20,6 +20,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 // In the crop mode the frame is always fit and a crop rectangle
 // (normalized to the frame) is edited with the mouse, optionally keeping
 // an aspect ratio (Shift keeps the current one while dragging).
+//
+// Outside of the crop mode the current canvas tool (see Tool in
+// oblivion_photo_editor.h), if there is one, gets the left button, the
+// hover, the wheel and paints its overlay over the frame. Space + drag
+// and the middle button always pan.
+namespace Oblivion::Photo {
+class Tool;
+struct ToolMouseEvent;
+} // namespace Oblivion::Photo
+
 namespace Oblivion::Photo::EditorUi {
 
 class Canvas final : public Ui::RpWidget {
@@ -51,6 +61,20 @@ public:
 	[[nodiscard]] rpl::producer<> cropFinished() const;
 
 	void setPanMode(bool enabled);
+
+	// The current tool, null for the plain view. The provider is asked
+	// on every event, toolChanged() must be called when its answer
+	// changes (it drops a drag the old tool had).
+	void setToolProvider(Fn<Tool*()> provider);
+	void toolChanged();
+	// True from a press the tool took till its release (or till the tool
+	// is replaced meanwhile).
+	[[nodiscard]] rpl::producer<bool> toolDragValue() const;
+	// Document (canvas) coordinates -> pixels of the frame, see
+	// OutputTransform() in oblivion_photo_doc.h.
+	void setFrameTransform(const QTransform &documentToFrame);
+	[[nodiscard]] QTransform documentToWidget() const;
+	[[nodiscard]] float64 documentScale() const;
 
 	// Output sizes (in pixels of the result) worth rendering: for the
 	// frame fit into the widget and for the current zoom.
@@ -92,6 +116,7 @@ private:
 		TopRight,
 		BottomLeft,
 		BottomRight,
+		Tool,
 	};
 
 	[[nodiscard]] QRectF contentRect() const;
@@ -112,7 +137,15 @@ private:
 	void updateCursor(QPointF point);
 	void updateCropDrag(QPointF point, Qt::KeyboardModifiers modifiers);
 	void finishDrag();
+	void finishLostDrag(Qt::KeyboardModifiers modifiers);
 	void updateZoomControls();
+	[[nodiscard]] Tool *activeTool() const;
+	[[nodiscard]] ToolMouseEvent toolEvent(
+		QPointF position,
+		Qt::MouseButton button,
+		Qt::MouseButtons buttons,
+		Qt::KeyboardModifiers modifiers) const;
+	void paintTool(QPainter &p);
 
 	void paintCheckerboard(QPainter &p, QRectF target);
 	void paintImage(QPainter &p, const QImage &image, QRectF target);
@@ -140,8 +173,12 @@ private:
 
 	Drag _drag = Drag::None;
 	QPointF _dragStart;
+	QPointF _dragLast; // Where a tool drag saw the mouse last.
 	QPointF _dragPan;
 	QRectF _dragCrop;
+
+	Fn<Tool*()> _toolProvider;
+	QTransform _documentToFrame;
 
 	Ui::InfiniteRadialAnimation _radial;
 	ZoomControls *_zoomControls = nullptr;
@@ -150,6 +187,7 @@ private:
 	rpl::event_stream<> _cropFinished;
 	rpl::event_stream<> _viewChanges;
 	rpl::variable<float64> _zoomPercent = 100.;
+	rpl::variable<bool> _toolDrag = false;
 
 };
 

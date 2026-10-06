@@ -10,7 +10,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "oblivion/oblivion_lottie_doc.h"
 #include "oblivion/oblivion_lottie_editor.h"
+#include "oblivion/oblivion_lottie_editor_palette.h"
+#include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/effects/animation_value.h"
+#include "ui/layers/show.h"
 #include "ui/painter.h"
 #include "ui/widgets/popup_menu.h"
 #include "styles/style_menu_icons.h"
@@ -19,7 +22,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtGui/QContextMenuEvent>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QGuiApplication>
 #include <QtGui/QNativeGestureEvent>
+#include <QtGui/QPainterPathStroker>
 #include <QtGui/QWheelEvent>
 
 #include <cmath>
@@ -48,6 +53,16 @@ constexpr auto kLightBackdrop = QColor(0xff, 0xff, 0xff);
 // so they are white in both themes (like in other design tools): a dark
 // fill of the night palette reads as black squares on the artwork.
 constexpr auto kHandleFill = QColor(0xff, 0xff, 0xff);
+
+// Mask outlines are a part of the same overlay: one color in both themes
+// that is far from the accent of the selection.
+constexpr auto kMaskOutline = QColor(0xff, 0x8a, 0x1f);
+constexpr auto kOutlineUnder = QColor(0xff, 0xff, 0xff, 0xa0);
+
+constexpr auto kPenRadius = 7; // How close the cursor has to be.
+constexpr auto kPenVertex = 4; // Half size of a point mark.
+constexpr auto kPenHandle = 3;
+constexpr auto kMaxPenCandidates = 48;
 
 [[nodiscard]] int Scaled(int value) {
 	return style::ConvertScale(value);
@@ -213,6 +228,9 @@ struct CanvasPanel::Drag {
 		None,
 		Move,
 		Pan,
+		PenVertex, // A point of the path follows the cursor.
+		PenTangent, // One of its handles does.
+		PenPull, // New mirrored handles are pulled out of a point.
 	};
 	Type type = Type::None;
 	QPointF press; // Panel coordinates.
@@ -224,6 +242,22 @@ struct CanvasPanel::Drag {
 	std::vector<MoveTarget> targets;
 	QPointF delta; // Last applied, canvas pixels.
 	QByteArray mergeKey;
+
+	// Pen: the path at the press, every move is computed from it.
+	PropertyRef penRef;
+	PathData penPath;
+	QTransform penFromView; // Panel -> path coordinates.
+	double penFrame = 0.;
+	int penVertex = -1;
+	bool penOut = false;
+	TangentMode penMode = TangentMode::Free;
+	bool penToggleOnClick = false; // Alt+click: corner <-> smooth.
+
+	[[nodiscard]] bool pen() const {
+		return (type == Type::PenVertex)
+			|| (type == Type::PenTangent)
+			|| (type == Type::PenPull);
+	}
 };
 
 CanvasPanel::CanvasPanel(
@@ -232,7 +266,8 @@ CanvasPanel::CanvasPanel(
 : RpWidget(parent)
 , _controller(controller)
 , _renderer(std::make_unique<FrameRenderer>())
-, _background(LastBackground()) {
+, _background(LastBackground())
+, _tool(CurrentTool(controller)) {
 	setMouseTracking(true);
 
 	_controller->documentChanged(
@@ -241,6 +276,7 @@ CanvasPanel::CanvasPanel(
 			if (_drag) {
 				_drag = nullptr;
 			}
+			resetPen();
 			_controller->setZoom(1.);
 			_controller->setPan(QPointF());
 		}
@@ -248,6 +284,24 @@ CanvasPanel::CanvasPanel(
 		refreshScale();
 		requestFrame();
 		update();
+	}, lifetime());
+
+	_controller->selectionChanged(
+	) | rpl::on_next([=] {
+		resetPen();
+	}, lifetime());
+
+	CurrentToolValue(
+		_controller
+	) | rpl::on_next([=](CanvasTool tool) {
+		if (_tool == tool) {
+			return;
+		}
+		finishDrag(true);
+		_tool = tool;
+		resetPen();
+		setHovered(0);
+		updateCursor(mapFromGlobal(QCursor::pos()));
 	}, lifetime());
 
 	rpl::merge(
@@ -453,6 +507,7 @@ void CanvasPanel::invalidateGeometry() {
 	_layerOutlinesValid = false;
 	_overlayValid = false;
 	_hoverPathValid = false;
+	_penValid = false;
 }
 
 void CanvasPanel::ensureGeometry() {
@@ -760,7 +815,7 @@ void CanvasPanel::finishDrag(bool cancel) {
 		return;
 	}
 	const auto drag = std::move(_drag);
-	if (drag->type == Drag::Type::Move && drag->applied) {
+	if ((drag->type == Drag::Type::Move || drag->pen()) && drag->applied) {
 		if (cancel) {
 			_controller->cancelGesture(drag->mergeKey);
 		} else {
@@ -783,6 +838,12 @@ void CanvasPanel::setHovered(NodeId id) {
 void CanvasPanel::updateCursor(QPointF point) {
 	if (_drag && _drag->type == Drag::Type::Pan && _drag->started) {
 		setCursor(Qt::ClosedHandCursor);
+	} else if (_tool == CanvasTool::Pen) {
+		const auto grabs = (_drag && _drag->pen())
+			|| (_penOver.part == PathPart::Vertex)
+			|| (_penOver.part == PathPart::InTangent)
+			|| (_penOver.part == PathPart::OutTangent);
+		setCursor(grabs ? Qt::SizeAllCursor : Qt::CrossCursor);
 	} else if (_drag && _drag->type == Drag::Type::Move && _drag->started) {
 		setCursor(Qt::SizeAllCursor);
 	} else if (!_drag && selectionContains(point)) {
@@ -818,6 +879,11 @@ void CanvasPanel::mousePressEvent(QMouseEvent *e) {
 		return;
 	}
 	const auto modifiers = e->modifiers();
+	if (_tool == CanvasTool::Pen) {
+		penPress(point, modifiers);
+		updateCursor(point);
+		return;
+	}
 	const auto toggle = (modifiers & Qt::ControlModifier) != 0;
 	const auto add = (modifiers & Qt::ShiftModifier) != 0;
 	const auto deepest = (modifiers & Qt::AltModifier) != 0;
@@ -864,6 +930,10 @@ void CanvasPanel::mouseMoveEvent(QMouseEvent *e) {
 		update();
 	}
 	if (!_drag) {
+		if (_tool == CanvasTool::Pen) {
+			penHover(point);
+			return;
+		}
 		setHovered(hitTest(point, (e->modifiers() & Qt::AltModifier)
 			? HitDepth::Deepest
 			: HitDepth::Keep));
@@ -878,6 +948,11 @@ void CanvasPanel::mouseMoveEvent(QMouseEvent *e) {
 		_drag->started = true;
 		if (_drag->type == Drag::Type::Move) {
 			startMove();
+		} else if (_drag->pen()) {
+			_controller->setPlaying(false);
+			_drag->start = _controller->document();
+			_drag->mergeKey = "canvas-pen-" + QByteArray::number(++_gestures);
+			_controller->beginGesture(_drag->mergeKey);
 		}
 		updateCursor(point);
 	}
@@ -904,6 +979,11 @@ void CanvasPanel::mouseMoveEvent(QMouseEvent *e) {
 			_drag->startPan + (point - _drag->press) / scale,
 			scale));
 		break;
+	case Drag::Type::PenVertex:
+	case Drag::Type::PenTangent:
+	case Drag::Type::PenPull:
+		applyPenDrag(point, e->modifiers());
+		break;
 	case Drag::Type::None:
 		break;
 	}
@@ -917,11 +997,21 @@ void CanvasPanel::mouseReleaseEvent(QMouseEvent *e) {
 		return;
 	}
 	const auto clickSelect = (!_drag->started) ? _drag->clickSelect : 0;
+	const auto toggleVertexIndex = (!_drag->started && _drag->penToggleOnClick)
+		? _drag->penVertex
+		: -1;
 	finishDrag(false);
 	if (clickSelect) {
 		_controller->select(clickSelect);
 	}
-	updateCursor(e->position());
+	if (toggleVertexIndex >= 0) {
+		toggleVertex(toggleVertexIndex);
+	}
+	if (_tool == CanvasTool::Pen) {
+		penHover(e->position());
+	} else {
+		updateCursor(e->position());
+	}
 }
 
 void CanvasPanel::mouseDoubleClickEvent(QMouseEvent *e) {
@@ -929,6 +1019,10 @@ void CanvasPanel::mouseDoubleClickEvent(QMouseEvent *e) {
 		return;
 	}
 	finishDrag(false);
+	if (_tool == CanvasTool::Pen) {
+		penDoubleClick(e->position());
+		return;
+	}
 	if (const auto deeper = hitTest(e->position(), HitDepth::Deeper)) {
 		_controller->select(deeper);
 	}
@@ -987,6 +1081,8 @@ void CanvasPanel::keyPressEvent(QKeyEvent *e) {
 		finishDrag(true);
 		updateCursor(mapFromGlobal(QCursor::pos()));
 		return;
+	} else if (_tool == CanvasTool::Pen && penKey(e)) {
+		return;
 	}
 	RpWidget::keyPressEvent(e);
 }
@@ -1004,11 +1100,15 @@ void CanvasPanel::contextMenuEvent(QContextMenuEvent *e) {
 	if (_drag) {
 		return;
 	}
-	const auto hit = hitTest(e->pos(), HitDepth::Keep);
-	if (hit && !_controller->isSelected(hit)) {
-		_controller->select(hit);
-	} else if (!hit && !selectionContains(e->pos())) {
-		_controller->clearSelection();
+	ensurePenGeometry();
+	if (_tool != CanvasTool::Pen || !_pen.target.valid()) {
+		// The pen keeps the path it works on, the menu is about its points.
+		const auto hit = hitTest(e->pos(), HitDepth::Keep);
+		if (hit && !_controller->isSelected(hit)) {
+			_controller->select(hit);
+		} else if (!hit && !selectionContains(e->pos())) {
+			_controller->clearSelection();
+		}
 	}
 	showMenu(e->globalPos());
 	e->accept();
@@ -1020,6 +1120,7 @@ void CanvasPanel::showMenu(QPoint globalPosition) {
 		st::popupMenuWithIcons);
 	const auto &document = _controller->document();
 	const auto selection = _controller->selection();
+	addPenMenuItems(QPointF(mapFromGlobal(globalPosition)));
 	if (!selection.empty()) {
 		const auto primary = _controller->primarySelection();
 		const auto layer = document.owningLayer(primary);
@@ -1079,7 +1180,10 @@ void CanvasPanel::paintEvent(QPaintEvent *e) {
 	p.drawRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5));
 
 	paintOverlay(p);
+	paintMasks(p);
+	paintPen(p);
 	paintInfo(p);
+	paintHint(p);
 }
 
 void CanvasPanel::paintBackground(QPainter &p, const QRectF &rect) {
@@ -1125,6 +1229,7 @@ void CanvasPanel::paintBackground(QPainter &p, const QRectF &rect) {
 void CanvasPanel::paintOverlay(QPainter &p) {
 	ensureOverlay();
 	ensureHoverPath();
+	ensurePenGeometry();
 	if (_overlay.empty() && _hoverPath.isEmpty()) {
 		return;
 	}
@@ -1140,6 +1245,13 @@ void CanvasPanel::paintOverlay(QPainter &p) {
 		p.drawPath(view.map(_hoverPath));
 	}
 	for (const auto &item : _overlay) {
+		if (_tool == CanvasTool::Pen
+			&& _pen.target.valid()
+			&& item.id == _pen.target.node) {
+			// The pen draws the path itself with its points, a box around
+			// it would only be in the way.
+			continue;
+		}
 		if (item.primary && !item.outline.isEmpty()) {
 			auto pen = QPen(anim::with_alpha(accent, 0.45));
 			pen.setWidthF(1.);
@@ -1227,5 +1339,1038 @@ void CanvasPanel::paintInfo(QPainter &p) {
 		rect.y() + padding.top() + font->ascent,
 		text);
 }
+
+// The pen tool.
+
+CanvasTool CanvasPanel::tool() const {
+	return _tool;
+}
+
+void CanvasPanel::setTool(CanvasTool tool) {
+	SetCurrentTool(_controller, tool);
+}
+
+int CanvasPanel::selectedPathVertex() const {
+	return _penVertex;
+}
+
+void CanvasPanel::selectPathVertex(int index) {
+	ensurePenGeometry();
+	const auto count = int(_pen.target.path.vertices.size());
+	_penVertex = (_pen.target.valid() && index >= 0 && index < count)
+		? index
+		: -1;
+	update();
+}
+
+bool CanvasPanel::convertSelectionToPath() {
+	const auto id = _controller->primarySelection();
+	const auto &document = _controller->document();
+	if (!CanConvertToPath(document, id)) {
+		return false;
+	}
+	auto edit = ConvertToPath(document, id, _controller->localFrame(id));
+	auto created = edit.created;
+	_controller->setPlaying(false);
+	if (!_controller->perform(Command::EditPath, std::move(edit))) {
+		return false;
+	}
+	if (!created.empty()) {
+		_controller->setSelection(std::move(created));
+	}
+	return true;
+}
+
+void CanvasPanel::resetPen() {
+	_penVertex = -1;
+	_penPointRemoved = false;
+	_penOver = PathPick();
+	_penPending = std::nullopt;
+	_penPendingContainer = 0;
+	_penValid = false;
+	update();
+}
+
+void CanvasPanel::ensurePenGeometry() {
+	ensureGeometry();
+	if (_penValid) {
+		return;
+	}
+	_penValid = true;
+	_pen = PenGeometry();
+	const auto &document = _controller->document();
+	const auto frame = _controller->currentFrame();
+	const auto pathOf = [&](NodeId id) -> std::optional<PathData> {
+		const auto ref = PathPropertyOf(document, id);
+		if (!ref) {
+			return std::nullopt;
+		}
+		const auto value = document.valueAt(
+			ref,
+			document.localFrame(id, frame));
+		return (value && value->path)
+			? std::make_optional(NormalizedPath(*value->path))
+			: std::nullopt;
+	};
+	const auto outline = [&](NodeId id) {
+		const auto path = pathOf(id);
+		return path
+			? document.transformAt(id, frame).map(PainterPath(*path))
+			: QPainterPath();
+	};
+
+	auto layers = std::vector<NodeId>();
+	for (const auto id : _controller->selection()) {
+		const auto node = document.node(id);
+		const auto layer = !node
+			? NodeId(0)
+			: (node->kind == NodeKind::Layer)
+			? id
+			: (node->kind == NodeKind::Mask)
+			? node->layer
+			: NodeId(0);
+		if (layer && !ranges::contains(layers, layer)) {
+			layers.push_back(layer);
+		}
+	}
+	for (const auto layer : layers) {
+		const auto node = document.node(layer);
+		if (!node) {
+			continue;
+		}
+		for (const auto mask : node->masks) {
+			if (int(_pen.masks.size()) >= kMaxPenCandidates) {
+				break;
+			}
+			auto path = outline(mask);
+			if (!path.isEmpty()) {
+				_pen.masks.emplace_back(mask, std::move(path));
+			}
+		}
+	}
+	if (_tool != CanvasTool::Pen) {
+		return;
+	}
+	const auto primary = _controller->primarySelection();
+	if (auto path = pathOf(primary)) {
+		_pen.target.node = primary;
+		_pen.target.ref = PathPropertyOf(document, primary);
+		_pen.target.path = std::move(*path);
+		_pen.target.toCanvas = document.transformAt(primary, frame);
+		_pen.target.localFrame = document.localFrame(primary, frame);
+	}
+	for (const auto id : PathCandidates(
+			document,
+			primary,
+			kMaxPenCandidates)) {
+		if (id == _pen.target.node) {
+			continue;
+		}
+		auto path = outline(id);
+		if (!path.isEmpty()) {
+			_pen.candidates.emplace_back(id, std::move(path));
+		}
+	}
+	if (_penVertex >= int(_pen.target.path.vertices.size())) {
+		_penVertex = -1;
+	}
+}
+
+double CanvasPanel::pickRadius() const {
+	return Scaled(kPenRadius);
+}
+
+QTransform CanvasPanel::penToView() const {
+	return _pen.target.toCanvas * viewTransform();
+}
+
+PathPick CanvasPanel::penPick(QPointF point) {
+	ensurePenGeometry();
+	if (!_pen.target.valid()) {
+		return PathPick();
+	}
+	return PickPathPart(
+		_pen.target.path,
+		penToView(),
+		point,
+		pickRadius(),
+		_penVertex);
+}
+
+NodeId CanvasPanel::pickCandidate(QPointF point) {
+	ensurePenGeometry();
+	const auto scale = this->scale();
+	if (scale <= 0.) {
+		return 0;
+	}
+	const auto canvas = toCanvas(point);
+	auto stroker = QPainterPathStroker();
+	stroker.setWidth(2. * pickRadius() / scale);
+	for (const auto list : { &_pen.candidates, &_pen.masks }) {
+		for (const auto &[id, outline] : *list) {
+			if (id != _pen.target.node
+				&& stroker.createStroke(outline).contains(canvas)) {
+				return id;
+			}
+		}
+	}
+	return 0;
+}
+
+bool CanvasPanel::performPen(Edit &&edit) {
+	_controller->setPlaying(false);
+	return _controller->perform(Command::EditPath, std::move(edit));
+}
+
+void CanvasPanel::toggleVertex(int index) {
+	ensurePenGeometry();
+	const auto &target = _pen.target;
+	if (!target.valid()
+		|| index < 0
+		|| index >= int(target.path.vertices.size())) {
+		return;
+	}
+	performPen(SetPathAt(
+		_controller->document(),
+		target.ref,
+		WithToggledVertex(target.path, index),
+		target.localFrame));
+}
+
+void CanvasPanel::removeVertex(int index) {
+	ensurePenGeometry();
+	const auto target = _pen.target;
+	if (!target.valid()
+		|| index < 0
+		|| index >= int(target.path.vertices.size())) {
+		return;
+	} else if (target.path.vertices.size() < 3) {
+		if (const auto show = _controller->uiShow()) {
+			show->showToast(
+				tr::lng_oblivion_lottie_mask_pen_min_points(tr::now));
+		}
+		return;
+	}
+	if (performPen(RemovePathVertex(
+			_controller->document(),
+			target.ref,
+			index))) {
+		_penVertex = -1;
+		_penPointRemoved = true;
+		update();
+	}
+}
+
+void CanvasPanel::startPenDrag(
+		QPointF point,
+		int vertex,
+		PathPart part,
+		TangentMode mode) {
+	ensurePenGeometry();
+	const auto &target = _pen.target;
+	if (!target.valid()
+		|| vertex < 0
+		|| vertex >= int(target.path.vertices.size())) {
+		return;
+	}
+	auto invertible = false;
+	const auto inverse = penToView().inverted(&invertible);
+	if (!invertible) {
+		return;
+	}
+	_drag = std::make_unique<Drag>();
+	_drag->type = (part != PathPart::Vertex)
+		? Drag::Type::PenTangent
+		: (mode == TangentMode::Mirrored)
+		? Drag::Type::PenPull
+		: Drag::Type::PenVertex;
+	_drag->press = point;
+	_drag->penRef = target.ref;
+	_drag->penPath = target.path;
+	_drag->penFromView = inverse;
+	_drag->penFrame = target.localFrame;
+	_drag->penVertex = vertex;
+	_drag->penOut = (part == PathPart::OutTangent);
+	_drag->penMode = mode;
+}
+
+void CanvasPanel::applyPenDrag(
+		QPointF point,
+		Qt::KeyboardModifiers modifiers) {
+	if (!_drag || !_drag->pen()) {
+		return;
+	}
+	const auto &start = _drag->penPath;
+	const auto index = _drag->penVertex;
+	if (index < 0 || index >= int(start.vertices.size())) {
+		return;
+	}
+	if ((modifiers & Qt::ShiftModifier)
+		&& _drag->type == Drag::Type::PenVertex) {
+		const auto delta = point - _drag->press;
+		if (std::abs(delta.x()) >= std::abs(delta.y())) {
+			point.setY(_drag->press.y());
+		} else {
+			point.setX(_drag->press.x());
+		}
+	}
+	const auto rounded = [](QPointF value) {
+		return QPointF(RoundPosition(value.x()), RoundPosition(value.y()));
+	};
+	const auto local = _drag->penFromView.map(point);
+	const auto shift = local - _drag->penFromView.map(_drag->press);
+	auto path = PathData();
+	switch (_drag->type) {
+	case Drag::Type::PenVertex:
+		path = WithMovedVertex(
+			start,
+			index,
+			rounded(start.vertices[index] + shift));
+		break;
+	case Drag::Type::PenTangent: {
+		const auto own = _drag->penOut
+			? start.outTangents[index]
+			: start.inTangents[index];
+		path = WithMovedTangent(
+			start,
+			index,
+			_drag->penOut,
+			rounded(own + shift),
+			(modifiers & Qt::AltModifier)
+				? TangentMode::Free
+				: _drag->penMode);
+	} break;
+	case Drag::Type::PenPull:
+		path = WithMovedTangent(
+			start,
+			index,
+			true,
+			rounded(local - start.vertices[index]),
+			TangentMode::Mirrored);
+		break;
+	default:
+		return;
+	}
+	if (_controller->perform(
+			Command::EditPath,
+			SetPathAt(_drag->start, _drag->penRef, path, _drag->penFrame),
+			_drag->mergeKey)) {
+		_drag->applied = true;
+	}
+}
+
+bool CanvasPanel::startNewPath(
+		NodeId container,
+		QPointF first,
+		QPointF second) {
+	const auto &document = _controller->document();
+	const auto node = document.node(container);
+	if (!node) {
+		return false;
+	}
+	auto invertible = false;
+	const auto inverse = document.transformAt(
+		container,
+		_controller->currentFrame()).inverted(&invertible);
+	if (!invertible) {
+		return false;
+	}
+	const auto local = [&](QPointF canvas) {
+		const auto mapped = inverse.map(canvas);
+		return QPointF(RoundPosition(mapped.x()), RoundPosition(mapped.y()));
+	};
+	auto path = PathData();
+	path.vertices = { local(first), local(second) };
+	path.inTangents = { QPointF(), QPointF() };
+	path.outTangents = { QPointF(), QPointF() };
+	const auto name = ShapeTypeText(ShapeType::Path);
+	_controller->setPlaying(false);
+	if (node->kind != NodeKind::Layer) {
+		// A group: the path joins what the group already paints with.
+		return _controller->addPath(container, path, name);
+	}
+	// A shape layer: a group of its own with a stroke, so that the new
+	// path is seen at once.
+	auto group = AddShape(
+		document,
+		container,
+		ShapeTemplate::Group,
+		ShapeTypeText(ShapeType::Group));
+	if (!group) {
+		return false;
+	}
+	auto groupId = NodeId(0);
+	for (const auto id : group.created) {
+		const auto created = group.document.node(id);
+		if (created
+			&& created->kind == NodeKind::Shape
+			&& created->shapeType == ShapeType::Group) {
+			groupId = id;
+			break;
+		}
+	}
+	if (!groupId) {
+		return false;
+	}
+	auto added = AddPath(group.document, groupId, path, name);
+	if (!added || added.created.empty()) {
+		return false;
+	}
+	const auto pathId = added.created.front();
+	auto stroke = AddShape(
+		added.document,
+		groupId,
+		ShapeTemplate::Stroke,
+		ShapeTypeText(ShapeType::Stroke));
+	if (!stroke) {
+		return false;
+	}
+	auto edit = Combined(
+		Combined(std::move(group), std::move(added)),
+		std::move(stroke));
+	if (!_controller->perform(Command::AddPath, std::move(edit))) {
+		return false;
+	}
+	_controller->setSelection({ pathId });
+	return true;
+}
+
+void CanvasPanel::penPress(QPointF point, Qt::KeyboardModifiers modifiers) {
+	_penPointRemoved = false;
+	ensurePenGeometry();
+	const auto alt = (modifiers & Qt::AltModifier) != 0;
+	// A copy: the edits below rebuild the cached geometry.
+	const auto target = _pen.target;
+	if (target.valid()) {
+		const auto count = int(target.path.vertices.size());
+		const auto last = count - 1;
+		const auto pick = penPick(point);
+		switch (pick.part) {
+		case PathPart::InTangent:
+		case PathPart::OutTangent:
+			startPenDrag(
+				point,
+				pick.index,
+				pick.part,
+				(!alt && IsSmoothVertex(target.path, pick.index))
+					? TangentMode::Aligned
+					: TangentMode::Free);
+			return;
+		case PathPart::Vertex: {
+			const auto closes = !target.path.closed
+				&& (count >= 3)
+				&& ((_penVertex == last && pick.index == 0)
+					|| (_penVertex == 0 && pick.index == last));
+			if (closes && !alt) {
+				performPen(SetPathClosed(
+					_controller->document(),
+					target.ref,
+					true));
+				_penVertex = pick.index;
+				update();
+				return;
+			}
+			_penVertex = pick.index;
+			update();
+			startPenDrag(
+				point,
+				pick.index,
+				PathPart::Vertex,
+				alt ? TangentMode::Mirrored : TangentMode::Free);
+			if (_drag && alt) {
+				_drag->penToggleOnClick = true;
+			}
+		} return;
+		case PathPart::Segment:
+			if (performPen(InsertPathVertex(
+					_controller->document(),
+					target.ref,
+					pick.index,
+					pick.t))) {
+				_penVertex = pick.index + 1;
+				update();
+				startPenDrag(
+					point,
+					_penVertex,
+					PathPart::Vertex,
+					TangentMode::Free);
+			}
+			return;
+		case PathPart::None:
+			break;
+		}
+		const auto atEnd = (_penVertex == last);
+		const auto atStart = !atEnd && (_penVertex == 0);
+		if (!target.path.closed && _penVertex >= 0 && (atEnd || atStart)) {
+			auto invertible = false;
+			const auto inverse = penToView().inverted(&invertible);
+			if (!invertible) {
+				return;
+			}
+			const auto mapped = inverse.map(point);
+			const auto position = QPointF(
+				RoundPosition(mapped.x()),
+				RoundPosition(mapped.y()));
+			if (performPen(AppendPathVertex(
+					_controller->document(),
+					target.ref,
+					position,
+					atStart,
+					target.localFrame))) {
+				_penVertex = atStart ? 0 : count;
+				update();
+				// A drag right after the click pulls the handles of the
+				// new point, a plain click leaves it a corner.
+				startPenDrag(
+					point,
+					_penVertex,
+					PathPart::Vertex,
+					TangentMode::Mirrored);
+			}
+			return;
+		} else if (_penVertex >= 0) {
+			_penVertex = -1;
+			update();
+			return;
+		}
+	}
+	if (const auto candidate = pickCandidate(point)) {
+		_controller->select(candidate);
+		return;
+	}
+	const auto &document = _controller->document();
+	const auto container = target.valid()
+		? NodeId(0)
+		: NewPathContainerFor(document, _controller->primarySelection());
+	if (container) {
+		const auto canvas = toCanvas(point);
+		if (!_penPending || _penPendingContainer != container) {
+			_penPending = canvas;
+			_penPendingContainer = container;
+			update();
+			return;
+		}
+		const auto first = *base::take(_penPending);
+		_penPendingContainer = 0;
+		if (startNewPath(container, first, canvas)) {
+			// Its last point is selected: the next clicks continue it.
+			_penValid = false;
+			selectPathVertex(1);
+		}
+		update();
+		return;
+	}
+	// Like a click of the selection tool: another layer to work on.
+	const auto hit = hitTest(point, HitDepth::Keep);
+	if (hit && !_controller->isSelected(hit)) {
+		if (!target.valid()
+			|| document.owningLayer(target.node) != document.owningLayer(hit)) {
+			_controller->select(hit);
+		}
+	} else if (!hit && !target.valid()) {
+		_controller->clearSelection();
+	}
+}
+
+void CanvasPanel::penHover(QPointF point) {
+	const auto pick = penPick(point);
+	if (pick.part != _penOver.part
+		|| pick.index != _penOver.index
+		|| pick.part == PathPart::Segment) {
+		_penOver = pick;
+		update();
+	}
+	ensurePenGeometry();
+	// Without a path to work on the layers answer to the cursor, a click
+	// picks one of them.
+	const auto picking = !_pen.target.valid()
+		&& !_penPending
+		&& !NewPathContainerFor(
+			_controller->document(),
+			_controller->primarySelection());
+	setHovered(picking ? hitTest(point, HitDepth::Keep) : NodeId(0));
+	updateCursor(point);
+}
+
+void CanvasPanel::penDoubleClick(QPointF point) {
+	const auto pick = penPick(point);
+	if (pick.part == PathPart::Vertex) {
+		_penVertex = pick.index;
+		toggleVertex(pick.index);
+	} else if (!_pen.target.valid() && !_penPending) {
+		if (const auto deeper = hitTest(point, HitDepth::Deeper)) {
+			_controller->select(deeper);
+		}
+	}
+}
+
+bool CanvasPanel::penKey(not_null<QKeyEvent*> e) {
+	const auto modifiers = e->modifiers()
+		& (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+	if (modifiers) {
+		return false;
+	}
+	switch (e->key()) {
+	case Qt::Key_Escape:
+	case Qt::Key_Return:
+	case Qt::Key_Enter:
+		if (_penPending || _penVertex >= 0) {
+			_penPending = std::nullopt;
+			_penPendingContainer = 0;
+			_penVertex = -1;
+			update();
+			return true;
+		}
+		return false;
+	case Qt::Key_Delete:
+	case Qt::Key_Backspace:
+		ensurePenGeometry();
+		if (_penPending) {
+			// The first point of a path that is not there yet goes, not
+			// the layer the path was meant for.
+			_penPending = std::nullopt;
+			_penPendingContainer = 0;
+			update();
+			return true;
+		} else if (!_pen.target.valid()) {
+			return false;
+		} else if (_penVertex >= 0) {
+			if (!e->isAutoRepeat()
+				&& QGuiApplication::mouseButtons() == Qt::NoButton) {
+				removeVertex(_penVertex);
+			}
+			return true;
+		}
+		// Without a selected point Delete goes on to the path itself. Not
+		// while the key is held and not right after it removed a point: one
+		// press too many would take the whole path or mask. The next click
+		// on the canvas lets Delete through again.
+		return _penPointRemoved || e->isAutoRepeat();
+	}
+	return false;
+}
+
+void CanvasPanel::addPenMenuItems(QPointF point) {
+	ensurePenGeometry();
+	const auto &document = _controller->document();
+	const auto primary = _controller->primarySelection();
+	const auto before = _menu->actions().size();
+	if (_tool == CanvasTool::Pen && _pen.target.valid()) {
+		const auto ref = _pen.target.ref;
+		const auto closed = _pen.target.path.closed;
+		const auto pick = penPick(point);
+		if (pick.part == PathPart::Vertex) {
+			const auto index = pick.index;
+			_penVertex = index;
+			update();
+			_menu->addAction(
+				(IsCornerVertex(_pen.target.path, index)
+					? tr::lng_oblivion_lottie_mask_pen_make_smooth(tr::now)
+					: tr::lng_oblivion_lottie_mask_pen_make_corner(tr::now)),
+				[=] { toggleVertex(index); },
+				&st::menuIconEdit);
+			_menu->addAction(
+				tr::lng_oblivion_lottie_mask_pen_delete_point(tr::now),
+				[=] { removeVertex(index); },
+				&st::menuIconDelete);
+		} else if (pick.part == PathPart::Segment) {
+			const auto segment = pick.index;
+			const auto t = pick.t;
+			_menu->addAction(
+				tr::lng_oblivion_lottie_mask_pen_add_point(tr::now),
+				[=] {
+					_controller->setPlaying(false);
+					if (_controller->insertPathVertex(ref, segment, t)) {
+						_penValid = false;
+						selectPathVertex(segment + 1);
+					}
+				},
+				&st::menuIconAdd);
+		}
+		_menu->addAction(
+			(closed
+				? tr::lng_oblivion_lottie_mask_pen_open(tr::now)
+				: tr::lng_oblivion_lottie_mask_pen_close(tr::now)),
+			[=] { _controller->setPathClosed(ref, !closed); },
+			&st::menuIconLink);
+		_menu->addAction(
+			tr::lng_oblivion_lottie_mask_pen_reverse(tr::now),
+			[=] { _controller->reversePath(ref); },
+			&st::menuIconReschedule);
+	} else if (_tool != CanvasTool::Pen
+		&& !PathCandidates(document, primary, 1).empty()) {
+		_menu->addAction(
+			tr::lng_oblivion_lottie_mask_pen_edit(tr::now),
+			[=] { setTool(CanvasTool::Pen); },
+			&st::menuIconEdit);
+	}
+	if (CanConvertToPath(document, primary)) {
+		_menu->addAction(
+			tr::lng_oblivion_lottie_mask_pen_convert(tr::now),
+			[=] { convertSelectionToPath(); },
+			&st::menuIconEdit);
+	}
+	if (_tool == CanvasTool::Pen) {
+		_menu->addAction(
+			CanvasToolText(CanvasTool::Select),
+			[=] { setTool(CanvasTool::Select); },
+			&st::menuIconSelect);
+	}
+	if (_menu->actions().size() != before) {
+		_menu->addSeparator();
+	}
+}
+
+QString CanvasPanel::penHint() {
+	if (_tool != CanvasTool::Pen) {
+		return QString();
+	}
+	ensurePenGeometry();
+	const auto &document = _controller->document();
+	const auto primary = _controller->primarySelection();
+	if (_pen.target.valid()) {
+		const auto &path = _pen.target.path;
+		const auto last = int(path.vertices.size()) - 1;
+		return (!path.closed && (_penVertex == last || _penVertex == 0))
+			? tr::lng_oblivion_lottie_mask_pen_hint_continue(tr::now)
+			: tr::lng_oblivion_lottie_mask_pen_hint_edit(tr::now);
+	} else if (_penPending) {
+		return tr::lng_oblivion_lottie_mask_pen_hint_second(tr::now);
+	} else if (CanConvertToPath(document, primary)) {
+		return tr::lng_oblivion_lottie_mask_pen_hint_shape(tr::now);
+	} else if (PathContainerFor(document, primary)) {
+		return _pen.candidates.empty()
+			? tr::lng_oblivion_lottie_mask_pen_hint_new(tr::now)
+			: tr::lng_oblivion_lottie_mask_pen_hint_pick_or_new(tr::now);
+	} else if (!_pen.candidates.empty()) {
+		return tr::lng_oblivion_lottie_mask_pen_hint_pick(tr::now);
+	}
+	return tr::lng_oblivion_lottie_mask_pen_hint_select(tr::now);
+}
+
+void CanvasPanel::paintMasks(QPainter &p) {
+	ensurePenGeometry();
+	if (_pen.masks.empty()) {
+		return;
+	}
+	auto hq = PainterHighQualityEnabler(p);
+	const auto view = viewTransform();
+	p.setBrush(Qt::NoBrush);
+	for (const auto &[id, outline] : _pen.masks) {
+		if (_tool == CanvasTool::Pen && id == _pen.target.node) {
+			continue;
+		}
+		const auto mapped = view.map(outline);
+		// A light line under the dashes keeps them seen on any artwork.
+		auto under = QPen(kOutlineUnder);
+		under.setWidthF(Scaled(1) * 3.);
+		p.setPen(under);
+		p.drawPath(mapped);
+		auto pen = QPen(kMaskOutline);
+		pen.setWidthF(Scaled(1) * 1.5);
+		pen.setDashPattern({ 4., 3. });
+		p.setPen(pen);
+		p.drawPath(mapped);
+	}
+}
+
+void CanvasPanel::paintPen(QPainter &p) {
+	if (_tool != CanvasTool::Pen) {
+		return;
+	}
+	ensurePenGeometry();
+	auto hq = PainterHighQualityEnabler(p);
+	const auto view = viewTransform();
+	const auto accent = st::windowActiveTextFg->c;
+	const auto line = Scaled(1) * 1.;
+	p.setBrush(Qt::NoBrush);
+
+	// What a click can pick: the other paths and masks of the selection.
+	for (const auto &[id, outline] : _pen.candidates) {
+		const auto mapped = view.map(outline);
+		auto under = QPen(kOutlineUnder);
+		under.setWidthF(line * 2.5);
+		p.setPen(under);
+		p.drawPath(mapped);
+		auto pen = QPen(anim::with_alpha(accent, 0.75));
+		pen.setWidthF(line);
+		pen.setDashPattern({ 3., 3. });
+		p.setPen(pen);
+		p.drawPath(mapped);
+	}
+
+	if (_penPending) {
+		const auto first = view.map(*_penPending);
+		if (_cursor) {
+			auto pen = QPen(accent);
+			pen.setWidthF(line * 1.5);
+			pen.setDashPattern({ 3., 3. });
+			p.setPen(pen);
+			p.drawLine(first, view.map(*_cursor));
+		}
+		auto border = QPen(accent);
+		border.setWidthF(line * 1.5);
+		p.setPen(border);
+		p.setBrush(kHandleFill);
+		const auto half = Scaled(kPenVertex) * 1.;
+		p.drawRect(QRectF(
+			first.x() - half,
+			first.y() - half,
+			half * 2.,
+			half * 2.));
+		p.setBrush(Qt::NoBrush);
+	}
+
+	const auto &target = _pen.target;
+	if (!target.valid()) {
+		return;
+	}
+	const auto toView = penToView();
+	const auto path = MappedPath(target.path, toView);
+	const auto outline = PainterPath(path);
+	auto under = QPen(kOutlineUnder);
+	under.setWidthF(line * 3.5);
+	p.setPen(under);
+	p.drawPath(outline);
+	auto stroke = QPen(accent);
+	stroke.setWidthF(line * 1.5);
+	p.setPen(stroke);
+	p.drawPath(outline);
+
+	const auto count = int(path.vertices.size());
+	const auto dragged = (_drag && _drag->pen()) ? _drag->penVertex : -1;
+	// Handles of the selected point.
+	if (_penVertex >= 0 && _penVertex < count) {
+		const auto vertex = path.vertices[_penVertex];
+		const auto radius = Scaled(kPenHandle) * 1.;
+		const auto paintHandle = [&](QPointF tangent, PathPart part) {
+			if (std::hypot(tangent.x(), tangent.y()) < 0.5) {
+				return;
+			}
+			const auto over = (_penOver.part == part)
+				&& (_penOver.index == _penVertex);
+			auto link = QPen(accent);
+			link.setWidthF(line);
+			p.setPen(link);
+			p.drawLine(vertex, vertex + tangent);
+			auto border = QPen(accent);
+			border.setWidthF(line * 1.5);
+			p.setPen(border);
+			p.setBrush(over ? QBrush(accent) : QBrush(kHandleFill));
+			p.drawEllipse(
+				vertex + tangent,
+				over ? (radius + 1.) : radius,
+				over ? (radius + 1.) : radius);
+			p.setBrush(Qt::NoBrush);
+		};
+		paintHandle(path.inTangents[_penVertex], PathPart::InTangent);
+		paintHandle(path.outTangents[_penVertex], PathPart::OutTangent);
+	}
+	// Points: squares for corners, circles for smooth ones.
+	for (auto i = 0; i != count; ++i) {
+		const auto selected = (i == _penVertex);
+		const auto over = (_penOver.part == PathPart::Vertex)
+			&& (_penOver.index == i);
+		const auto half = Scaled(kPenVertex)
+			+ ((over || i == dragged) ? 1. : 0.);
+		const auto center = path.vertices[i];
+		auto border = QPen(accent);
+		border.setWidthF(line * 1.5);
+		p.setPen(border);
+		p.setBrush(selected ? QBrush(accent) : QBrush(kHandleFill));
+		if (IsCornerVertex(target.path, i)) {
+			p.drawRect(QRectF(
+				center.x() - half,
+				center.y() - half,
+				half * 2.,
+				half * 2.));
+		} else {
+			p.drawEllipse(center, half * 1.1, half * 1.1);
+		}
+	}
+	p.setBrush(Qt::NoBrush);
+	// Where a click adds a point.
+	if (_penOver.part == PathPart::Segment && (!_drag || !_drag->started)) {
+		const auto center = toView.map(_penOver.point);
+		const auto size = Scaled(4) * 1.;
+		p.setPen(Qt::NoPen);
+		p.setBrush(kHandleFill);
+		p.drawEllipse(center, size + 2., size + 2.);
+		auto plus = QPen(accent);
+		plus.setWidthF(line * 1.5);
+		plus.setCapStyle(Qt::RoundCap);
+		p.setPen(plus);
+		p.drawLine(
+			center - QPointF(size - 1., 0.),
+			center + QPointF(size - 1., 0.));
+		p.drawLine(
+			center - QPointF(0., size - 1.),
+			center + QPointF(0., size - 1.));
+		p.setBrush(Qt::NoBrush);
+	}
+}
+
+void CanvasPanel::paintHint(QPainter &p) {
+	const auto text = penHint();
+	if (text.isEmpty()) {
+		return;
+	}
+	const auto &font = st::normalFont;
+	const auto padding = QMargins(Scaled(10), Scaled(4), Scaled(10), Scaled(4));
+	const auto skip = Scaled(8);
+	const auto available = width()
+		- 2 * skip
+		- padding.left()
+		- padding.right();
+	if (available < Scaled(80)) {
+		return;
+	}
+	const auto elided = font->elided(text, available);
+	const auto size = QSize(
+		font->width(elided) + padding.left() + padding.right(),
+		font->height + padding.top() + padding.bottom());
+	const auto rect = QRect(
+		QPoint((width() - size.width()) / 2, skip),
+		size);
+	auto hq = PainterHighQualityEnabler(p);
+	// The pill lies half over the artboard, which may be white as the pill
+	// itself: a hairline keeps its shape, and the text is the instruction
+	// for the tool, so it is written in the main text color.
+	auto border = QPen(st::shadowFg);
+	border.setWidthF(st::lineWidth);
+	p.setPen(border);
+	p.setBrush(anim::with_alpha(st::windowBg->c, 0.95));
+	const auto half = st::lineWidth / 2.;
+	p.drawRoundedRect(
+		QRectF(rect).adjusted(half, half, -half, -half),
+		size.height() / 2.,
+		size.height() / 2.);
+	p.setFont(font);
+	p.setPen(st::windowFg);
+	p.drawText(
+		rect.x() + padding.left(),
+		rect.y() + padding.top() + font->ascent,
+		elided);
+}
+
+// Snapshot scenes (OBLIVION_SELFTEST=ui, see oblivion_ui_snapshots.h).
+
+namespace {
+
+[[nodiscard]] QWidget *CreateCanvasScene(not_null<Ui::RpWidget*> parent) {
+	return Ui::CreateChild<PanelSceneHost>(
+		parent.get(),
+		u":/animations/palette.tgs"_q,
+		[](QWidget *parent, not_null<EditorController*> controller) {
+			return not_null<Ui::RpWidget*>(
+				Ui::CreateChild<CanvasPanel>(parent, controller));
+		});
+}
+
+[[nodiscard]] not_null<CanvasPanel*> SceneCanvas(not_null<QWidget*> widget) {
+	const auto host = static_cast<PanelSceneHost*>(widget.get());
+	return static_cast<CanvasPanel*>(host->panel().get());
+}
+
+[[nodiscard]] bool SceneCanvasReady(not_null<QWidget*> widget) {
+	return SceneCanvas(widget)->frameReady();
+}
+
+// The path item that takes the most of the canvas at the frame and has
+// a handful of points (the most interesting one to show with the pen).
+[[nodiscard]] NodeId LargestPath(const Document &document, int frame) {
+	auto result = NodeId(0);
+	auto best = 0.;
+	const auto canvas = QRectF(QPointF(), QSizeF(document.size()));
+	for (const auto &node : document.nodes()) {
+		if (node.kind != NodeKind::Shape
+			|| node.shapeType != ShapeType::Path
+			|| node.hidden) {
+			continue;
+		}
+		const auto value = document.valueAt(
+			PropertyRef{ node.id, QByteArray("ks") },
+			document.localFrame(node.id, frame));
+		const auto points = (value && value->path)
+			? int(value->path->vertices.size())
+			: 0;
+		if (points < 4 || points > 14) {
+			continue;
+		}
+		const auto bounds = document.transformAt(node.id, frame).map(
+			PainterPath(*value->path)).boundingRect();
+		if (!canvas.contains(bounds)) {
+			continue;
+		}
+		const auto area = bounds.width() * bounds.height();
+		if (area > best) {
+			best = area;
+			result = node.id;
+		}
+	}
+	return result;
+}
+
+const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
+	using namespace SelfTest;
+
+	// The pen on a path item: its points, the handles of the selected one.
+	RegisterScene(SceneDescriptor{
+		.name = u"lottie_canvas_pen"_q,
+		.size = QSize(720, 560),
+		.create = CreateCanvasScene,
+		.prepare = [](not_null<QWidget*> widget) {
+			const auto host = static_cast<PanelSceneHost*>(widget.get());
+			const auto controller = host->controller();
+			const auto canvas = SceneCanvas(widget);
+			canvas->setBackground(CanvasBackground::Light);
+			controller->setCurrentFrame(controller->firstFrame() + 90);
+			if (const auto path = LargestPath(
+					controller->document(),
+					controller->currentFrame())) {
+				controller->select(path);
+			}
+			canvas->setTool(CanvasTool::Pen);
+			canvas->selectPathVertex(1);
+		},
+		.ready = SceneCanvasReady,
+	});
+
+	// A layer with a mask: the dashed mask outline in the selection tool.
+	RegisterScene(SceneDescriptor{
+		.name = u"lottie_canvas_mask"_q,
+		.size = QSize(720, 560),
+		.create = CreateCanvasScene,
+		.prepare = [](not_null<QWidget*> widget) {
+			const auto host = static_cast<PanelSceneHost*>(widget.get());
+			const auto controller = host->controller();
+			const auto canvas = SceneCanvas(widget);
+			canvas->setBackground(CanvasBackground::Checker);
+			canvas->setTool(CanvasTool::Select);
+			controller->setCurrentFrame(controller->firstFrame() + 90);
+			const auto &document = controller->document();
+			if (const auto layer = FindNodeByName(
+					document,
+					u"BOARD FRONT"_q,
+					NodeKind::Layer)) {
+				const auto bounds = DefaultMaskPath(
+					document,
+					layer,
+					controller->currentFrame());
+				auto rect = PainterPath(bounds).boundingRect();
+				rect = rect.marginsRemoved(QMarginsF(
+					rect.width() * 0.18,
+					rect.height() * 0.12,
+					rect.width() * 0.18,
+					rect.height() * 0.3));
+				controller->addMask(layer, EllipsePath(rect));
+				controller->select(layer);
+			}
+		},
+		.ready = SceneCanvasReady,
+	});
+});
+
+} // namespace
 
 } // namespace Oblivion::LottieEdit

@@ -12,6 +12,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <QtGui/QImage>
 
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace Ui {
+class DynamicImage;
+} // namespace Ui
+
 // The session-free part of the own sticker packs (oblivion_sticker_packs.h):
 // turning an image, a Lottie animation or a video into the file Telegram
 // accepts as a sticker, and the rules of the pack short names.
@@ -21,6 +29,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 //  - video: WebM VP9 without audio, the longer side exactly 512, up to
 //    3 s and 30 frames per second, up to 256 KB (made by
 //    Oblivion::VideoCore::MakeVideoSticker).
+//
+// Custom emoji sets take the same three kinds of files: a static emoji is
+// a 100x100 WebP, a video one is a 100x100 WebM, an animated one is the
+// same 512x512 .tgs an animated sticker is (the apps scale it down).
 //
 // Everything is synchronous, keeps no state and is safe to call from any
 // thread, the UI calls it through crl::async.
@@ -34,11 +46,37 @@ inline constexpr auto kTitleMaxLength = 64;
 inline constexpr auto kShortNameMaxLength = 64;
 inline constexpr auto kDefaultOutline = 8; // Pixels of a 512px sticker.
 
+// Custom emoji: Api::kEmojiStickerSideMax and Api::kEmojiInOwnedSetMax of
+// api/api_stickers_creator.h, the size of a static one is kept within
+// what a video one may take (VideoCore::kEmojiMaxBytes).
+inline constexpr auto kEmojiSide = 100;
+inline constexpr auto kEmojiStaticMaxBytes = 64 * 1024;
+inline constexpr auto kMaxEmojiInSet = 200;
+
 enum class Format : uchar {
 	Static,
 	Animated,
 	Video,
 };
+
+// What a set holds: its files and its limits depend on that.
+enum class PackKind : uchar {
+	Stickers,
+	Emoji,
+};
+
+[[nodiscard]] int SideFor(PackKind kind); // 512 or 100.
+[[nodiscard]] int MaxInSet(PackKind kind); // 120 or 200.
+
+// The size the picture of a file takes in a sticker or in an emoji: the
+// longer side is exactly SideFor(kind), bigger pictures are scaled down
+// and smaller ones up, the proportions are kept, a side is at least 1.
+// Empty for an empty size.
+[[nodiscard]] QSize FitSize(QSize source, PackKind kind);
+
+// The size of the file itself: FitSize() for a sticker, and always the
+// 100x100 square for an emoji (the picture is centered in it).
+[[nodiscard]] QSize CanvasSize(QSize source, PackKind kind);
 
 // What is uploaded.
 struct Prepared {
@@ -76,12 +114,24 @@ struct StaticOptions {
 [[nodiscard]] bool HasTransparency(const QImage &image);
 
 // WebP of an image from ComposeSticker(), the quality is lowered until
-// the file fits kStaticMaxBytes. Invalid on errors.
-[[nodiscard]] Prepared EncodeStatic(const QImage &composed);
+// the file fits maxBytes. Invalid on errors.
+[[nodiscard]] Prepared EncodeStatic(
+	const QImage &composed,
+	int maxBytes = kStaticMaxBytes);
 [[nodiscard]] Prepared PrepareStatic(
 	const QImage &image,
 	StaticOptions options = {});
 [[nodiscard]] bool WebpSupported();
+
+// The image as it is shown in a custom emoji: always kEmojiSide x
+// kEmojiSide, ARGB32_Premultiplied. The transparent margins are cropped
+// first (an emoji is small, the picture takes all the place it can), then
+// the picture is fitted and centered on a transparent square. Null for
+// a null or an empty image.
+[[nodiscard]] QImage ComposeEmoji(const QImage &image);
+
+// WebP of ComposeEmoji(), within kEmojiStaticMaxBytes.
+[[nodiscard]] Prepared PrepareEmoji(const QImage &image);
 
 // Animated stickers: the TGS validator of oblivion_lottie_doc.h.
 struct LottieCheck {
@@ -135,6 +185,14 @@ struct VideoCheck {
 // Is this file a ready video sticker? Anything else goes through
 // VideoCore::MakeVideoSticker() first.
 [[nodiscard]] VideoCheck CheckVideoSticker(const QByteArray &webm);
+
+// The same for a ready video emoji: exactly kEmojiSide x kEmojiSide and
+// up to VideoCore::kEmojiMaxBytes, the other limits are those of a video
+// sticker (Dimensions and FileSize tell about the emoji limits here).
+[[nodiscard]] VideoCheck CheckVideoEmoji(const QByteArray &webm);
+[[nodiscard]] VideoCheck CheckVideoFor(
+	PackKind kind,
+	const QByteArray &webm);
 
 // Invalid if the check is not ok().
 [[nodiscard]] Prepared PrepareVideo(
@@ -252,6 +310,108 @@ struct ExportFile {
 	const Prepared &prepared,
 	const QImage &composed,
 	const QString &hint);
+
+// The own sets of an account the way the boxes see them: plain data, so
+// that a box can be shown with samples and without a session (the UI
+// snapshots). Filled by oblivion_sticker_packs.cpp.
+struct OwnPack {
+	uint64 id = 0;
+	uint64 accessHash = 0;
+	QString title;
+	QString shortName;
+	int count = 0;
+	bool emoji = false;
+	bool masks = false;
+	std::shared_ptr<Ui::DynamicImage> thumbnail;
+
+	// A usual sticker set, not a custom emoji or a masks one.
+	[[nodiscard]] bool regular() const {
+		return !emoji && !masks;
+	}
+	[[nodiscard]] PackKind kind() const {
+		return emoji ? PackKind::Emoji : PackKind::Stickers;
+	}
+};
+
+struct OwnPacks {
+	std::vector<OwnPack> list;
+	bool loaded = false;
+	bool failed = false;
+};
+
+// A set that doesn't exist yet: the server creates a set only together
+// with its first sticker.
+struct NewPack {
+	QString title;
+	QString shortName;
+	bool emoji = false; // A custom emoji set.
+};
+
+// Where a sticker goes.
+struct PackTarget {
+	std::optional<OwnPack> pack;
+	std::optional<NewPack> create;
+
+	explicit operator bool() const {
+		return pack.has_value() || create.has_value();
+	}
+};
+
+// The session part of the batch box (oblivion_sticker_batch.h), made by
+// MakeStickerBatchBackend() of oblivion_sticker_packs.h. Main thread only.
+struct BatchUpload {
+	// Of the item in the queue, not zero. When the same item is uploaded
+	// again after a FLOOD_WAIT on adding it to the set, the file that is
+	// already on the server is not sent the second time. Only the very
+	// same file: an item that was trimmed or converted for another kind
+	// of a set in between keeps its id, but not its bytes.
+	uint64 id = 0;
+
+	Prepared sticker;
+	QString emoji;
+	PackTarget target;
+};
+
+struct BatchHandlers {
+	Fn<void(float64 progress)> progress; // Of the file upload.
+	Fn<void()> finishing; // The file is there, adding it to the set.
+
+	// The set as it is after the sticker was added. For a new set it is
+	// called when the set is also installed for the account.
+	Fn<void(OwnPack pack, bool created)> done;
+
+	// The error type of the server ("FLOOD_WAIT_17", "STICKERS_TOO_MUCH"),
+	// empty if the file itself couldn't be uploaded. Nothing is retried
+	// by the backend: the queue decides when to try again.
+	Fn<void(QString error)> fail;
+};
+
+struct BatchBackend {
+	// Each call gives a producer that starts with the current list.
+	Fn<rpl::producer<OwnPacks>()> packs;
+	Fn<void()> reload;
+
+	// Asks for the title and the short name of a new set of this kind.
+	Fn<void(PackKind kind, QString title, Fn<void(NewPack)> done)> createPack;
+
+	// One sticker at a time: one request in flight, the file, then
+	// messages.uploadMedia, then the request that adds it to the set.
+	// Returns the way to cancel it, no handler is called after that.
+	Fn<Fn<void()>(BatchUpload, BatchHandlers)> upload;
+
+	// The uploads have ended for now (the queue is done, paused or the
+	// box is being closed): the sticker panel and the lists of the own
+	// sets are refreshed once, not after every sticker.
+	Fn<void()> finished;
+
+	Fn<void(OwnPack)> openPack;
+
+	// A new set whose request was sent by a box that was closed before the
+	// answer came: the set exists, but it was not installed for the account
+	// the way upload does that. The sticker (the emoji) panel is refreshed
+	// when the request ends.
+	Fn<void(OwnPack)> install;
+};
 
 // Self-checks for OBLIVION_SELFTEST=sticker_packs, see oblivion_selftest.h.
 // Runs before Core::Application exists (no Core::App(), no session).

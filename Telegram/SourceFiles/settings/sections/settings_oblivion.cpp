@@ -18,6 +18,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
 #include "oblivion/oblivion_app_icon.h"
+#include "oblivion/oblivion_badge.h"
 #include "oblivion/oblivion_deleted.h"
 #include "oblivion/oblivion_gift_catalog.h"
 #include "oblivion/oblivion_lottie_editor.h"
@@ -26,6 +27,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_photo_integration.h"
 #include "oblivion/oblivion_playlists.h"
 #include "oblivion/oblivion_settings.h"
+#include "oblivion/oblivion_sticker_batch.h"
 #include "oblivion/oblivion_sticker_packs.h"
 #include "oblivion/oblivion_sticker_studio.h"
 #include "oblivion/oblivion_transcribe.h"
@@ -805,6 +807,22 @@ void BuildToolsSection(SectionBuilder &builder) {
 			u"фильтры"_q,
 		},
 	});
+	// Round 4: photo collage.
+	builder.addButton({
+		.id = u"oblivion/photo_collage"_q,
+		.title = tr::lng_oblivion_photo_collage_settings(),
+		.icon = { &st::menuIconPhotoSet },
+		.onClick = [=] { Oblivion::ShowPhotoCollage(controller); },
+		.keywords = {
+			u"collage"_q,
+			u"photo"_q,
+			u"grid"_q,
+			u"коллаж"_q,
+			u"фото"_q,
+			u"сетка"_q,
+		},
+	});
+	// Round 4: photo collage end.
 	builder.addButton({
 		.id = u"oblivion/video_editor"_q,
 		.title = tr::lng_oblivion_tools_video_editor(),
@@ -852,8 +870,64 @@ void BuildToolsSection(SectionBuilder &builder) {
 			u"файл"_q,
 		},
 	});
+	// Round 4: sticker batch.
+	builder.addButton({
+		.id = u"oblivion/sticker_batch"_q,
+		.title = tr::lng_oblivion_sbatch_settings(),
+		.icon = { &st::menuIconShowAll },
+		.onClick = [=] { Oblivion::ShowStickerBatch(controller); },
+		.keywords = {
+			u"sticker"_q,
+			u"emoji"_q,
+			u"batch"_q,
+			u"bulk"_q,
+			u"pack"_q,
+			u"стикеры"_q,
+			u"эмодзи"_q,
+			u"пакетное"_q,
+			u"массовое"_q,
+			u"набор"_q,
+		},
+	});
+	// Round 4: sticker batch end.
 	AddSectionEnd(builder, tr::lng_oblivion_tools_about());
 }
+
+// Round 4: badge.
+void AddBadgeToggle(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	// The toggle only shows the state of the badge for the account of
+	// this window: a click asks the badge module, which switches it after
+	// the consent and with the marker really written to the bio of that
+	// account (or removed from it), and never right away.
+	const auto button = builder.addButton({
+		.id = u"oblivion/badge"_q,
+		.title = tr::lng_oblivion_badge_settings(),
+		.icon = { &st::menuIconSigned },
+		.onClick = [=] {
+			Oblivion::Badge::SetEnabled(
+				controller,
+				!Oblivion::Badge::Enabled(&controller->session()));
+		},
+		.keywords = {
+			u"badge"_q,
+			u"mark"_q,
+			u"bio"_q,
+			u"oblivion"_q,
+			u"значок"_q,
+			u"галочка"_q,
+			u"метка"_q,
+			u"о себе"_q,
+		},
+	});
+	if (button && controller) {
+		button->toggleOn(
+			Oblivion::Badge::EnabledValue(&controller->session()),
+			true);
+	}
+}
+// Round 4: badge end.
 
 void BuildInterfaceSection(SectionBuilder &builder) {
 	const auto controller = builder.controller();
@@ -1003,7 +1077,50 @@ void BuildInterfaceSection(SectionBuilder &builder) {
 			u"чаты"_q,
 		},
 	});
-	AddSectionEnd(builder);
+	// Round 4: attach tools.
+	AddToggle(builder, {
+		.id = u"oblivion/attach_tools"_q,
+		.title = tr::lng_oblivion_attach_settings(),
+		.icon = &st::menuIconFile,
+		.getter = &Oblivion::Settings::attachTools,
+		.setter = &Oblivion::Settings::setAttachTools,
+		.keywords = {
+			u"attach"_q,
+			u"files"_q,
+			u"tools"_q,
+			u"buttons"_q,
+			u"send"_q,
+			u"файлы"_q,
+			u"отправка"_q,
+			u"инструменты"_q,
+			u"кнопки"_q,
+		},
+	});
+	// Round 4: attach tools end.
+	// Round 4: listen together.
+	AddToggle(builder, {
+		.id = u"oblivion/listen_together"_q,
+		.title = tr::lng_oblivion_listen_settings(),
+		.icon = &st::menuIconGroups,
+		.getter = &Oblivion::Settings::listenTogether,
+		.setter = &Oblivion::Settings::setListenTogether,
+		.keywords = {
+			u"listen"_q,
+			u"together"_q,
+			u"music"_q,
+			u"sync"_q,
+			u"слушать"_q,
+			u"вместе"_q,
+			u"музыка"_q,
+			u"совместно"_q,
+		},
+	});
+	AddSectionEnd(builder, tr::lng_oblivion_listen_settings_about());
+	// Round 4: listen together end.
+	// Round 4: badge.
+	AddBadgeToggle(builder);
+	AddSectionEnd(builder, tr::lng_oblivion_badge_settings_about());
+	// Round 4: badge end.
 }
 
 void BuildVisualSection(SectionBuilder &builder) {

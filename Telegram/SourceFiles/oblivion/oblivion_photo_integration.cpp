@@ -16,6 +16,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/weak_qptr.h"
 #include "boxes/send_files_box.h"
 #include "chat_helpers/compose/compose_show.h"
+#include "core/application.h"
 #include "core/file_utilities.h"
 #include "core/mime_type.h"
 #include "data/data_chat_participant_status.h"
@@ -35,6 +36,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item_helpers.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_photo_collage.h"
 #include "oblivion/oblivion_photo_core.h"
 #include "oblivion/oblivion_photo_editor.h"
 #include "oblivion/oblivion_settings.h"
@@ -46,6 +48,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/localimageloader.h"
 #include "storage/storage_media_prepare.h"
 #include "ui/abstract_button.h"
+#include "ui/boxes/confirm_box.h"
 #include "ui/chat/attach/attach_prepare.h"
 #include "ui/image/image.h"
 #include "ui/layers/generic_box.h"
@@ -99,6 +102,7 @@ constexpr auto kDropZoneHeight = 176;
 constexpr auto kEstimateDelay = crl::time(400);
 constexpr auto kMaxDocumentSize = int64(256) * 1024 * 1024;
 constexpr auto kMaxKeptOriginals = 16;
+constexpr auto kKeptNoticeDuration = crl::time(8000);
 constexpr auto kSceneWidth = 480;
 constexpr auto kKeptOriginalsName = "oblivion_photo_originals";
 
@@ -664,6 +668,7 @@ public:
 		qint64 key = 0;
 		QImage source;
 		Photo::EditState state;
+		std::shared_ptr<const Photo::Document> document;
 	};
 
 	explicit KeptOriginals(QObject *parent) : QObject(parent) {
@@ -1590,6 +1595,10 @@ struct EditSession {
 	QImage source;
 	Photo::EditState state;
 	QString name;
+
+	// The whole layered edit of the last result: with it "continue
+	// editing" brings back the layers too, not only the state.
+	std::shared_ptr<const Photo::Document> document;
 };
 
 [[nodiscard]] std::vector<Photo::PhotoEditorAction> SendActions(
@@ -1638,23 +1647,145 @@ struct EditSession {
 	return list;
 }
 
+// An edit of an editor that was closed not by the user (the passcode
+// lock, a switch to another account, a chat opened from a notification)
+// is kept by the editor, see Photo::InterruptedPhotoEdit. Here the user is
+// told about it by a toast in the active window (after the passcode is
+// entered, if the application is locked), it is offered when the editor
+// is opened the next time and dropped when its account is logged out.
+struct KeptNotice {
+	bool pending = false;
+	bool scheduled = false;
+	bool waiting = false;
+	rpl::lifetime lifetime;
+};
+
+[[nodiscard]] KeptNotice &PendingKeptNotice() {
+	static auto result = KeptNotice();
+	return result;
+}
+
+void FlushKeptNotice();
+
+void ScheduleKeptNotice() {
+	if (!std::exchange(PendingKeptNotice().scheduled, true)) {
+		crl::on_main([] {
+			FlushKeptNotice();
+		});
+	}
+}
+
+void FlushKeptNotice() {
+	auto &notice = PendingKeptNotice();
+	notice.scheduled = false;
+	if (!Core::IsAppLaunched() || Core::Quitting()) {
+		return;
+	} else if (Core::App().passcodeLocked()) {
+		if (!std::exchange(notice.waiting, true)) {
+			notice.lifetime.destroy();
+			Core::App().passcodeLockChanges(
+			) | rpl::filter([](bool locked) {
+				return !locked;
+			}) | rpl::take(1) | rpl::on_next([] {
+				// The windows are unlocked right after this.
+				PendingKeptNotice().waiting = false;
+				ScheduleKeptNotice();
+			}, notice.lifetime);
+		}
+		return;
+	}
+	const auto pending = base::take(notice.pending);
+	const auto window = Core::App().activePrimaryWindow();
+	if (pending && window && Photo::InterruptedPhotoEditId()) {
+		window->showToast(
+			tr::lng_oblivion_photo_panel_kept(tr::now),
+			kKeptNoticeDuration);
+	}
+}
+
+// PhotoEditorOptions::interrupted for an editor of this account. It is
+// called from the main queue, the account may be logged out by then.
+[[nodiscard]] Fn<void(int)> InterruptedHandler(
+		not_null<Main::Session*> session) {
+	const auto weak = base::make_weak(session);
+	return [=](int id) {
+		if (!Core::IsAppLaunched()
+			|| Core::Quitting()
+			|| !id
+			|| (Photo::InterruptedPhotoEditId() != id)) {
+			return;
+		}
+		const auto strong = weak.get();
+		if (!strong) {
+			// Nothing of an account stays after it is logged out.
+			Photo::DropInterruptedPhotoEdit(id);
+			return;
+		}
+		strong->lifetime().add([=] {
+			Photo::DropInterruptedPhotoEdit(id);
+		});
+		PendingKeptNotice().pending = true;
+		ScheduleKeptNotice();
+	};
+}
+
 void ShowExportBox(
 	not_null<Window::SessionController*> controller,
 	std::shared_ptr<EditSession> session,
 	base::weak_ptr<Data::Thread> weakThread,
 	QImage image);
+void ShowInterruptedEditor(not_null<Window::SessionController*> controller);
 
-// Shows the editor with the session original and state. The first time
-// (updated is null) "Done" shows the result box, later it updates it.
-void ShowEditorFor(
+// The edit kept from an interrupted editor is offered first: fresh opens
+// what was asked for when there is none or the user starts a new one (the
+// kept one is dropped then). fresh must check what it uses, it may be
+// called long after.
+void OfferInterruptedOr(
+		not_null<Window::SessionController*> controller,
+		Fn<void()> fresh) {
+	if (!Photo::InterruptedPhotoEditId()) {
+		fresh();
+		return;
+	}
+	const auto weak = base::make_weak(controller);
+	const auto box = controller->show(Ui::MakeConfirmBox({
+		.text = tr::lng_oblivion_photo_panel_restore_text(),
+		.confirmed = [=](Fn<void()> close) {
+			const auto strong = weak.get();
+			close();
+			if (strong) {
+				ShowInterruptedEditor(strong);
+			}
+		},
+		.cancelled = [=](Fn<void()> close) {
+			const auto open = fresh;
+			close();
+			Photo::DropInterruptedPhotoEdit();
+			open();
+		},
+		.confirmText = tr::lng_oblivion_photo_panel_restore_continue(),
+		.cancelText = tr::lng_oblivion_photo_panel_restore_new(),
+		.strictCancel = true,
+	}));
+	if (const auto raw = box.get()) {
+		// A click outside closes all the boxes: the send files box under
+		// this question as well, with what is attached. Escape closes
+		// only the question, the kept edit stays.
+		raw->setCloseByOutsideClick(false);
+	}
+}
+
+// The editor options of a session: "Done" keeps the edit in the session
+// (so "continue editing" restores it with its layers) and, the first time
+// (updated is null), shows the result box, later it updates it.
+[[nodiscard]] Photo::PhotoEditorOptions EditorOptionsFor(
 		not_null<Window::SessionController*> controller,
 		std::shared_ptr<EditSession> session,
 		base::weak_ptr<Data::Thread> weakThread,
 		Fn<void(QImage)> updated) {
 	const auto weak = base::make_weak(controller);
-	const auto show = controller->uiShow();
-	const auto weakShow = std::weak_ptr<Ui::Show>(show);
-	Photo::ShowPhotoEditor(show, session->source, {
+	const auto weakShow = std::weak_ptr<Ui::Show>(controller->uiShow());
+	return {
 		.fileName = session->name,
 		.state = session->state,
 		.done = [=](Photo::PhotoEditorResult result) {
@@ -1666,6 +1797,7 @@ void ShowEditorFor(
 				return;
 			}
 			session->state = result.state;
+			session->document = result.document;
 			if (!result.source.isNull()) {
 				session->source = std::move(result.source);
 			}
@@ -1680,7 +1812,96 @@ void ShowEditorFor(
 			}
 		},
 		.actions = SendActions(weak, weakThread, session->name),
+		.document = session->document,
+		.interrupted = InterruptedHandler(&controller->session()),
+	};
+}
+
+// Shows the editor with the session original and state (or the whole
+// layered document of its last result).
+void ShowEditorFor(
+		not_null<Window::SessionController*> controller,
+		std::shared_ptr<EditSession> session,
+		base::weak_ptr<Data::Thread> weakThread,
+		Fn<void(QImage)> updated) {
+	const auto source = session->source;
+	Photo::ShowPhotoEditor(
+		controller->uiShow(),
+		source,
+		EditorOptionsFor(
+			controller,
+			std::move(session),
+			std::move(weakThread),
+			std::move(updated)));
+}
+
+// The kept edit has no original anymore: like a collage it is a document
+// from the start, "continue editing" restores it from the last result.
+void ShowInterruptedEditor(not_null<Window::SessionController*> controller) {
+	if (Core::App().passcodeLocked()) {
+		// Photo::ShowPhotoEditor() shows nothing above the passcode
+		// screen: the kept edit is not taken for an editor that will not
+		// be there.
+		return;
+	}
+	auto kept = Photo::TakeInterruptedPhotoEdit();
+	if (!kept.document || kept.document->empty()) {
+		return;
+	}
+	auto session = std::make_shared<EditSession>(EditSession{
+		.name = kept.fileName.isEmpty() ? NowName() : kept.fileName,
+		.document = std::move(kept.document),
 	});
+	auto options = EditorOptionsFor(
+		controller,
+		std::move(session),
+		nullptr,
+		nullptr);
+	options.unsaved = true;
+	Photo::ShowPhotoEditor(
+		controller->uiShow(),
+		QImage(),
+		std::move(options));
+}
+
+// The result box is closed with the layers of the window just as the
+// editor is. When it is not the user who closes it, the edit it shows
+// the result of is kept the same way. Only the document is remembered
+// here: this runs while the window is being torn down.
+void KeepResultWhenInterrupted(
+		not_null<Window::SessionController*> controller,
+		not_null<Ui::BoxContent*> box,
+		std::shared_ptr<EditSession> session) {
+	const auto weak = base::make_weak(controller);
+	const auto handler = InterruptedHandler(&controller->session());
+	box->boxClosing() | rpl::on_next([=] {
+		if (!Core::IsAppLaunched() || Core::Quitting()) {
+			return;
+		}
+		// The user closes the box only in an unlocked window that still
+		// shows this controller. A window that switches to another
+		// account (or whose account is logged out) replaces its session
+		// controller first and closes the layers after that, the old one
+		// is still alive here, see Window::Controller::showAccount.
+		const auto strong = weak.get();
+		const auto byUser = strong
+			&& !Core::App().passcodeLocked()
+			&& (strong->window().sessionController() == strong);
+		// An editor opened from this box ("continue editing") is closed
+		// with it and has kept what is newer.
+		if (byUser || Photo::InterruptedPhotoEditId()) {
+			return;
+		}
+		const auto id = Photo::KeepInterruptedPhotoEdit({
+			.document = session->document,
+			.fileName = session->name,
+		});
+		if (id) {
+			crl::on_main([=] {
+				handler(id);
+			});
+		}
+	}, box->lifetime());
 }
 
 void ShowExportBox(
@@ -1720,7 +1941,10 @@ void ShowExportBox(
 			AddToStickerPack(strong, std::move(source));
 		}
 	};
-	controller->show(Box(ExportBox, std::move(args)));
+	const auto box = controller->show(Box(ExportBox, std::move(args)));
+	if (const auto raw = box.get()) {
+		KeepResultWhenInterrupted(controller, raw, session);
+	}
 }
 
 // Snapshot scenes (OBLIVION_SELFTEST=ui), see oblivion_ui_snapshots.h.
@@ -1812,14 +2036,41 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 
 void ShowPhotoEditorImport(not_null<Window::SessionController*> controller) {
 	const auto weak = base::make_weak(controller);
-	controller->show(Box(ImportBox, ImportArgs{
-		.show = controller->uiShow(),
-		.opened = [=](QImage image, QString name) {
-			if (const auto strong = weak.get()) {
-				ShowPhotoEditorWithImage(strong, std::move(image), name);
-			}
-		},
-	}));
+	OfferInterruptedOr(controller, [=] {
+		const auto strong = weak.get();
+		if (!strong) {
+			return;
+		}
+		strong->show(Box(ImportBox, ImportArgs{
+			.show = strong->uiShow(),
+			.opened = [=](QImage image, QString name) {
+				if (const auto strong = weak.get()) {
+					ShowPhotoEditorWithImage(
+						strong,
+						std::move(image),
+						name);
+				}
+			},
+		}));
+	});
+}
+
+void ShowPhotoCollage(not_null<Window::SessionController*> controller) {
+	const auto weak = base::make_weak(controller);
+	OfferInterruptedOr(controller, [=] {
+		const auto strong = weak.get();
+		if (!strong) {
+			return;
+		}
+		// The session has no original: the collage is a document from the
+		// start, "continue editing" restores it from the last result.
+		auto session = std::make_shared<EditSession>(EditSession{
+			.name = TimeName(u"collage"_q, QDateTime::currentDateTime()),
+		});
+		Photo::ChoosePhotosForCollage(
+			strong->uiShow(),
+			EditorOptionsFor(strong, std::move(session), nullptr, nullptr));
+	});
 }
 
 void ShowPhotoEditorWithImage(
@@ -1832,11 +2083,17 @@ void ShowPhotoEditorWithImage(
 			tr::lng_oblivion_photo_io_open_failed(tr::now));
 		return;
 	}
-	auto session = std::make_shared<EditSession>(EditSession{
+	const auto session = std::make_shared<EditSession>(EditSession{
 		.source = std::move(image),
 		.name = name.isEmpty() ? NowName() : name,
 	});
-	ShowEditorFor(controller, std::move(session), thread, nullptr);
+	const auto weak = base::make_weak(controller);
+	const auto weakThread = base::weak_ptr<Data::Thread>(thread);
+	OfferInterruptedOr(controller, [=] {
+		if (const auto strong = weak.get()) {
+			ShowEditorFor(strong, session, weakThread, nullptr);
+		}
+	});
 }
 
 void ShowPhotoEditorForPhoto(
@@ -2050,8 +2307,12 @@ void AddPhotoEditorAction(
 	}, &st::menuIconPalette);
 }
 
-void AddAttachPhotoEditorAction(
-		not_null<Ui::PopupMenu*> menu,
+namespace {
+
+// What opens the editor for an attached static image, null for any other
+// file. Everything needed is copied from the file right away: the list of
+// the box may change before the result is called.
+[[nodiscard]] Fn<void()> AttachPhotoEditorOpener(
 		std::shared_ptr<ChatHelpers::Show> show,
 		not_null<QWidget*> box,
 		const Ui::PreparedFile &file,
@@ -2062,11 +2323,13 @@ void AddAttachPhotoEditorAction(
 	const auto image = file.information
 		? std::get_if<ImageInfo>(&file.information->media)
 		: nullptr;
-	if (!image
+	if (!show
+		|| !replace
+		|| !image
 		|| image->animated
 		|| image->data.isNull()
 		|| (file.type != Type::Photo && file.type != Type::File)) {
-		return;
+		return nullptr;
 	}
 	const auto key = image->data.cacheKey();
 	const auto data = image->data;
@@ -2077,7 +2340,10 @@ void AddAttachPhotoEditorAction(
 		? QFileInfo(file.path).fileName()
 		: QString();
 	const auto originals = QPointer<KeptOriginals>(Originals(box).get());
-	menu->addAction(tr::lng_oblivion_photo_io_attach_action(tr::now), [=] {
+	const auto open = [=] {
+		if (!show->valid()) {
+			return;
+		}
 		auto session = EditSession{
 			.name = fileName.isEmpty() ? NowName() : EditedName(fileName),
 		};
@@ -2088,6 +2354,7 @@ void AddAttachPhotoEditorAction(
 			// Edited here before: continue from the untouched original.
 			session.source = kept->source;
 			session.state = kept->state;
+			session.document = kept->document;
 		} else {
 			// The built-in editor changes are applied first (on the main
 			// thread, they may contain painted stickers).
@@ -2111,6 +2378,7 @@ void AddAttachPhotoEditorAction(
 				}
 				const auto edited = result.image;
 				const auto state = result.state;
+				const auto document = result.document;
 				const auto original = result.source.isNull()
 					? source
 					: result.source;
@@ -2121,12 +2389,64 @@ void AddAttachPhotoEditorAction(
 							.key = edited.cacheKey(),
 							.source = original,
 							.state = state,
+							.document = document,
 						});
 					}
 				});
 			},
+			.document = session.document,
+			.interrupted = InterruptedHandler(&show->session()),
 		});
-	}, &st::menuIconPalette);
+	};
+	return [=] {
+		// An edit kept from an interrupted editor is offered first. It is
+		// continued on its own, not as this attachment: its picture has
+		// nothing to do with the attached one.
+		const auto window = show->valid() ? show->resolveWindow() : nullptr;
+		if (window) {
+			OfferInterruptedOr(window, open);
+		} else {
+			open();
+		}
+	};
+}
+
+} // namespace
+
+void AddAttachPhotoEditorAction(
+		not_null<Ui::PopupMenu*> menu,
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<QWidget*> box,
+		const Ui::PreparedFile &file,
+		Fn<void(Fn<void(Ui::PreparedFile&)> apply)> replace) {
+	auto open = AttachPhotoEditorOpener(
+		std::move(show),
+		box,
+		file,
+		std::move(replace));
+	if (open) {
+		menu->addAction(
+			tr::lng_oblivion_photo_io_attach_action(tr::now),
+			std::move(open),
+			&st::menuIconPalette);
+	}
+}
+
+bool OpenAttachPhotoEditor(
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<QWidget*> box,
+		const Ui::PreparedFile &file,
+		Fn<void(Fn<void(Ui::PreparedFile&)> apply)> replace) {
+	const auto open = AttachPhotoEditorOpener(
+		std::move(show),
+		box,
+		file,
+		std::move(replace));
+	if (!open) {
+		return false;
+	}
+	open();
+	return true;
 }
 
 void AddMediaViewPhotoEditorAction(

@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/emoji_list_widget.h"
 
 #include "oblivion/oblivion_interface.h"
+#include "oblivion/oblivion_sticker_export.h" // Oblivion
 #include "window/window_media_preview.h"
 #include "api/api_peer_photo.h"
 #include "apiwrap.h"
@@ -2045,6 +2046,15 @@ void EmojiListWidget::fillRecentMenu(
 				tr::lng_emoji_view_pack(tr::now),
 				crl::guard(this, [=] { displaySet(document); }),
 				&st().icons.menuEmojiViewPack);
+		}
+		// Oblivion: "Save as" and "Save the whole set (.zip)".
+		if (_features.openStickerSets) {
+			Oblivion::AddStickerExportActions(
+				menu,
+				_show,
+				document,
+				Data::FileOrigin(),
+				&st().icons);
 		}
 	} else if (recent && emoji) {
 		addAction(tr::lng_emoji_copy(tr::now), [=] {

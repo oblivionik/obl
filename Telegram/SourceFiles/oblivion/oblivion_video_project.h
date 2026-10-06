@@ -8,16 +8,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "oblivion/oblivion_video_core.h"
+#include "oblivion/oblivion_video_fx.h"
 
 #include <QtCore/QRectF>
 
 // What the video editor (oblivion_video_editor.h) edits and how it becomes
 // a file: clips cut from several videos and joined, one crop, rotation and
-// speed for all of them, the sound kept or not.
+// speed for all of them, the sound kept or not, a stack of video effects
+// (oblivion_video_fx.h) over the whole result.
 //
 // The geometry: every video is rotated and fitted into the canvas (the
 // rotated frame of the first clip, the others are centered in it on black,
-// on transparent in a sticker), the crop is a part of the canvas.
+// on transparent in a sticker), the crop is a part of the canvas. The
+// effects get the frames of the result: cropped, rotated and scaled, one
+// after another with the time each of them has in the result.
 //
 // Everything is synchronous, keeps no global state and is safe to call
 // from any thread, Export() goes through crl::async.
@@ -68,6 +72,9 @@ struct State {
 	int rotation = 0; // Clockwise degrees: 0, 90, 180 or 270.
 	int speed = 100; // Percent, kMinSpeed..kMaxSpeed.
 	bool mute = false;
+
+	// Applied to every frame of the result, in all the formats.
+	VideoFx::Stack fx;
 
 	friend inline bool operator==(const State &, const State &) = default;
 };
@@ -139,6 +146,24 @@ enum class Format : uchar {
 
 [[nodiscard]] QString FormatExtension(Format format); // "mp4", "gif", "webm"
 
+// For the preview of the effects in the editor: what Export() gives to the
+// effects, made of a whole frame of a clip the way its source shows it.
+//
+// The size of those frames: the crop (in the pixels of the canvas) scaled
+// down to fit the longer side, never up.
+[[nodiscard]] QSize PreviewSize(QSize crop, int maxSide);
+
+// frame: a whole frame of a source, upright, of any size. It is rotated,
+// fitted into the canvas on black and the crop (in the pixels of the
+// canvas) is taken from it. Always ARGB32_Premultiplied of the output size,
+// black for a null frame.
+[[nodiscard]] QImage ComposePreview(
+	const QImage &frame,
+	QSize canvas,
+	QRect crop,
+	QSize output,
+	int rotation);
+
 struct ExportOptions {
 	Format format = Format::Mp4;
 	int maxSide = 0; // The longer side, 0 = the default of the format.
@@ -184,6 +209,8 @@ struct ExportResult {
 // Heavy and synchronous, call it off the main thread. progress (0..1)
 // is called on the calling thread, cancel (may be null) is polled all
 // the time. A sticker takes the first three seconds of the result.
+// The effects of the state are applied to every frame, in the order the
+// frames go in the result.
 [[nodiscard]] ExportResult Export(
 	const Project &project,
 	const ExportOptions &options,

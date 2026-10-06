@@ -1584,8 +1584,16 @@ PRIVATE
     oblivion/oblivion_app_icon.cpp
     oblivion/oblivion_app_icon.h
     oblivion/oblivion_app_icon_mac.mm
+    oblivion/oblivion_attach_tools.cpp
+    oblivion/oblivion_attach_tools.h
     oblivion/oblivion_audio.cpp
     oblivion/oblivion_audio.h
+    oblivion/oblivion_badge.cpp
+    oblivion/oblivion_badge.h
+    oblivion/oblivion_chat_stats.cpp
+    oblivion/oblivion_chat_stats.h
+    oblivion/oblivion_chat_stats_ui.cpp
+    oblivion/oblivion_chat_stats_ui.h
     oblivion/oblivion_deleted.cpp
     oblivion/oblivion_deleted.h
     oblivion/oblivion_deleted_store.cpp
@@ -1602,6 +1610,10 @@ PRIVATE
     oblivion/oblivion_interface.h
     oblivion/oblivion_lang.cpp
     oblivion/oblivion_lang.h
+    oblivion/oblivion_listen.cpp
+    oblivion/oblivion_listen.h
+    oblivion/oblivion_listen_ui.cpp
+    oblivion/oblivion_listen_ui.h
     oblivion/oblivion_local_names.cpp
     oblivion/oblivion_local_names.h
     oblivion/oblivion_lottie.cpp
@@ -1612,10 +1624,14 @@ PRIVATE
     oblivion/oblivion_lottie_editor.h
     oblivion/oblivion_lottie_editor_canvas.cpp
     oblivion/oblivion_lottie_editor_canvas.h
+    oblivion/oblivion_lottie_editor_graph.cpp
+    oblivion/oblivion_lottie_editor_graph.h
     oblivion/oblivion_lottie_editor_inspector.cpp
     oblivion/oblivion_lottie_editor_inspector.h
     oblivion/oblivion_lottie_editor_layers.cpp
     oblivion/oblivion_lottie_editor_layers.h
+    oblivion/oblivion_lottie_editor_masks.cpp
+    oblivion/oblivion_lottie_editor_masks.h
     oblivion/oblivion_lottie_editor_palette.cpp
     oblivion/oblivion_lottie_editor_palette.h
     oblivion/oblivion_lottie_editor_timeline.cpp
@@ -1630,16 +1646,42 @@ PRIVATE
     oblivion/oblivion_noise.h
     oblivion/oblivion_online.cpp
     oblivion/oblivion_online.h
+    oblivion/oblivion_photo_checks.cpp
+    oblivion/oblivion_photo_collage.cpp
+    oblivion/oblivion_photo_collage.h
     oblivion/oblivion_photo_core.cpp
     oblivion/oblivion_photo_core.h
+    oblivion/oblivion_photo_doc.cpp
+    oblivion/oblivion_photo_doc.h
+    oblivion/oblivion_photo_draw.cpp
+    oblivion/oblivion_photo_draw.h
     oblivion/oblivion_photo_editor.cpp
     oblivion/oblivion_photo_editor.h
     oblivion/oblivion_photo_editor_canvas.cpp
     oblivion/oblivion_photo_editor_canvas.h
     oblivion/oblivion_photo_editor_controls.cpp
     oblivion/oblivion_photo_editor_controls.h
+    oblivion/oblivion_photo_fx.cpp
+    oblivion/oblivion_photo_fx.h
+    oblivion/oblivion_photo_fx_adjust.cpp
+    oblivion/oblivion_photo_fx_adjust.h
+    oblivion/oblivion_photo_fx_adjust_ui.cpp
+    oblivion/oblivion_photo_fx_blur.cpp
+    oblivion/oblivion_photo_fx_blur.h
+    oblivion/oblivion_photo_fx_distort.cpp
+    oblivion/oblivion_photo_fx_distort.h
+    oblivion/oblivion_photo_fx_glitch.cpp
+    oblivion/oblivion_photo_fx_glitch.h
+    oblivion/oblivion_photo_fx_lofi.cpp
+    oblivion/oblivion_photo_fx_lofi.h
     oblivion/oblivion_photo_integration.cpp
     oblivion/oblivion_photo_integration.h
+    oblivion/oblivion_photo_layers_ui.cpp
+    oblivion/oblivion_photo_layers_ui.h
+    oblivion/oblivion_photo_panels.cpp
+    oblivion/oblivion_photo_panels.h
+    oblivion/oblivion_photo_transform.cpp
+    oblivion/oblivion_photo_transform.h
     oblivion/oblivion_playlists.cpp
     oblivion/oblivion_playlists.h
     oblivion/oblivion_profile_history.cpp
@@ -1656,6 +1698,10 @@ PRIVATE
     oblivion/oblivion_sending.h
     oblivion/oblivion_settings.cpp
     oblivion/oblivion_settings.h
+    oblivion/oblivion_sticker_batch.cpp
+    oblivion/oblivion_sticker_batch.h
+    oblivion/oblivion_sticker_export.cpp
+    oblivion/oblivion_sticker_export.h
     oblivion/oblivion_sticker_packs.cpp
     oblivion/oblivion_sticker_packs.h
     oblivion/oblivion_sticker_packs_core.cpp
@@ -1676,6 +1722,10 @@ PRIVATE
     oblivion/oblivion_video_core.h
     oblivion/oblivion_video_editor.cpp
     oblivion/oblivion_video_editor.h
+    oblivion/oblivion_video_fx.cpp
+    oblivion/oblivion_video_fx.h
+    oblivion/oblivion_video_fx_ui.cpp
+    oblivion/oblivion_video_fx_ui.h
     oblivion/oblivion_video_project.cpp
     oblivion/oblivion_video_project.h
     oblivion/oblivion_vision.cpp

@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_photo_core.h"
 
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_photo_fx.h"
 
 #include <QtCore/QBuffer>
 #include <QtCore/QElapsedTimer>
@@ -3262,6 +3263,130 @@ QImage Render(
 		result.setColorSpace(source.colorSpace());
 	}
 	return result;
+}
+
+bool ApplyEdits(
+		QImage &image,
+		const EditState &original,
+		const std::atomic<bool> *cancelled) {
+	if (image.isNull()) {
+		return false;
+	}
+	const auto state = Normalized(original);
+	if (!HasColorEdits(state)) {
+		return !Cancelled(cancelled);
+	}
+	if (image.format() != QImage::Format_ARGB32_Premultiplied) {
+		image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+	}
+	image.bits();
+	if (image.isNull()) {
+		return false;
+	}
+	const auto transparent = HasTransparency(image);
+	return ApplyPipeline(image, state, cancelled, transparent);
+}
+
+//
+// The shared helpers of the layer effects, see oblivion_photo_fx.h.
+//
+
+void FxDetail::RunParallel(
+		int count,
+		int grain,
+		void (*call)(void *context, int from, int till),
+		void *context) {
+	ParallelFor(count, grain, [&](int from, int till) {
+		call(context, from, till);
+	});
+}
+
+uint32 FxSample(const QImage &image, float x, float y) {
+	return SampleBilinear(
+		reinterpret_cast<const Pixel*>(image.constBits()),
+		image.width(),
+		image.height(),
+		int(image.bytesPerLine() / 4),
+		x,
+		y);
+}
+
+uint32 FxSampleClear(const QImage &image, float x, float y) {
+	const auto width = image.width();
+	const auto height = image.height();
+	if (x <= -1.f || y <= -1.f || x >= float(width) || y >= float(height)) {
+		return 0;
+	}
+	const auto x0 = int(std::floor(x));
+	const auto y0 = int(std::floor(y));
+	const auto dx = Weight256(x - x0);
+	const auto dy = Weight256(y - y0);
+	const auto data = reinterpret_cast<const Pixel*>(image.constBits());
+	const auto stride = int(image.bytesPerLine() / 4);
+	const auto at = [&](int px, int py) {
+		return (px < 0 || py < 0 || px >= width || py >= height)
+			? Pixel(0)
+			: data[ptrdiff_t(py) * stride + px];
+	};
+	return Interpolate(
+		Interpolate(at(x0, y0), at(x0 + 1, y0), dx),
+		Interpolate(at(x0, y0 + 1), at(x0 + 1, y0 + 1), dx),
+		dy);
+}
+
+uint32 FxHash32(uint32 x, uint32 y, uint32 seed) {
+	return Hash(x, y, seed);
+}
+
+float FxNoise(uint32 x, uint32 y, uint32 seed) {
+	return HashSigned(x, y, seed);
+}
+
+uint64 FxRandom::next() {
+	auto z = (state += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return z ^ (z >> 31);
+}
+
+float FxRandom::unit() {
+	return float(next() >> 40) * (1.f / 16777216.f);
+}
+
+int FxRandom::range(int from, int till) {
+	if (till <= from) {
+		return from;
+	}
+	return from + int(next() % uint64(till - from + 1));
+}
+
+void FxGaussianBlur(QImage &image, double sigma) {
+	if (sigma <= 0. || !FxPrepare(image)) {
+		return;
+	}
+	BlurPixels(Wrap(image), float(sigma));
+}
+
+void FxGaussianBlur(
+		std::vector<float> &plane,
+		int width,
+		int height,
+		double sigma) {
+	if (sigma <= 0.
+		|| width <= 0
+		|| height <= 0
+		|| plane.size() < size_t(width) * height) {
+		return;
+	}
+	BlurPlane(plane, width, height, float(sigma));
+}
+
+double FxSrgbToLinear(double value) {
+	return SrgbToLinear(value);
+}
+
+double FxLinearToSrgb(double value) {
+	return LinearToSrgb(value);
 }
 
 QImage Thumbnail(const QImage &source, const EditState &original, int side) {

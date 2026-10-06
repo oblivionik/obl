@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_lottie.h"
 
+#include "oblivion/oblivion_lottie_doc.h"
 #include "core/application.h"
 #include "lang/lang_keys.h"
 #include "lottie/lottie_common.h"
@@ -1664,13 +1665,125 @@ private:
 	return result;
 }
 
+// A few values make rlottie loop forever or allocate without end (see
+// LottieEdit::RenderSafeJson()). This is a cheap check whether the JSON
+// can have one of them at all, so that the usual file is not parsed twice:
+// each of them needs a stroke dash array ("d": [), a trim path / repeater
+// / star item ("tm" / "rp" / "sr" as a value), or a motion path keyframe
+// ("ti" / "to") together with an easing handle below zero ("y": -) or
+// with an "x" outside of [0, 1]. Keys and values written with escapes
+// would not be seen, so a backslash anywhere is enough as well. False
+// positives only cost the second parse.
+[[nodiscard]] bool MayNeedRenderGuard(const QByteArray &json) {
+	if (json.contains('\\')) {
+		return true;
+	}
+	const auto data = json.constData();
+	const auto size = json.size();
+	const auto space = [&](qsizetype i) {
+		return (data[i] == ' ')
+			|| (data[i] == '\t')
+			|| (data[i] == '\n')
+			|| (data[i] == '\r');
+	};
+	const auto after = [&](qsizetype i) {
+		while (i < size && space(i)) {
+			++i;
+		}
+		return i;
+	};
+	// The position after ':' if a key ends right before i, -1 otherwise.
+	const auto value = [&](qsizetype i) {
+		i = after(i);
+		return (i < size && data[i] == ':') ? after(i + 1) : qsizetype(-1);
+	};
+	const auto digit = [&](qsizetype i) {
+		return (i < size) && (data[i] >= '0') && (data[i] <= '9');
+	};
+	// Whether the number at i can be above one: an exponent is not read.
+	const auto aboveOne = [&](qsizetype i) {
+		if (!digit(i)) {
+			return false;
+		} else if (data[i] > '1' || digit(i + 1)) {
+			return true;
+		}
+		const auto one = (data[i] == '1');
+		auto fraction = false;
+		++i;
+		if (i < size && data[i] == '.') {
+			for (++i; digit(i); ++i) {
+				fraction = fraction || (data[i] != '0');
+			}
+		}
+		const auto exponent = (i < size)
+			&& (data[i] == 'e' || data[i] == 'E');
+		return exponent || (one && fraction);
+	};
+	auto motionPath = false;
+	auto oddEasing = false;
+	for (auto i = json.indexOf('"'); i >= 0; i = json.indexOf('"', i + 1)) {
+		if (i + 2 < size && data[i + 2] == '"') {
+			const auto from = value(i + 3);
+			const auto key = data[i + 1];
+			if (from < 0 || from >= size) {
+				continue;
+			} else if (key == 'd') {
+				if (data[from] == '[') {
+					return true;
+				}
+			} else if (key == 'y' || key == 'x') {
+				const auto number = (data[from] == '[')
+					? after(from + 1)
+					: from;
+				if (number < size
+					&& ((data[number] == '-')
+						|| (key == 'x' && aboveOne(number)))) {
+					oddEasing = true;
+				}
+			}
+		} else if (i + 3 < size && data[i + 3] == '"') {
+			const auto first = data[i + 1];
+			const auto second = data[i + 2];
+			if (first == 't' && (second == 'i' || second == 'o')) {
+				if (value(i + 4) >= 0) {
+					motionPath = true;
+				}
+			} else if ((first == 't' && second == 'm')
+				|| (first == 'r' && second == 'p')
+				|| (first == 's' && second == 'r')) {
+				auto before = i - 1;
+				while (before >= 0 && space(before)) {
+					--before;
+				}
+				if (before >= 0 && data[before] == ':') {
+					return true;
+				}
+			}
+		}
+		if (motionPath && oddEasing) {
+			return true;
+		}
+	}
+	return false;
+}
+
 [[nodiscard]] std::unique_ptr<rlottie::Animation> LoadAnimation(
 		const QByteArray &json) {
 	if (json.isEmpty()) {
 		return nullptr;
 	}
+	// rlottie gets a copy with the dangerous values clamped, the callers
+	// keep (and cache by) the bytes they passed. A file that may have such
+	// values and can't be read here is not drawn at all: rlottie would
+	// draw the part of it that comes before the error.
+	const auto safe = MayNeedRenderGuard(json)
+		? LottieEdit::RenderSafeJson(json)
+		: json;
+	if (safe.isEmpty()) {
+		return nullptr;
+	}
 	return ::Lottie::LoadAnimationFromData(
-		::Lottie::ReadUtf8(json),
+		::Lottie::ReadUtf8(safe),
 		std::string(),
 		std::string(),
 		false);

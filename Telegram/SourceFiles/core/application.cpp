@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/application.h"
 
 #include "oblivion/oblivion_app_icon.h"
+#include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_lottie_editor.h"
 #include "oblivion/oblivion_video_editor.h"
 #include "oblivion/oblivion_voice_changer.h"
@@ -1857,6 +1858,10 @@ void QuitAttempt() {
 bool Application::readyToQuit() {
 	auto prevented = false;
 	if (_calls->isQuitPrevent()) {
+		prevented = true;
+	}
+	// Oblivion: the "ended" edit of a hosted listening together session.
+	if (Oblivion::Listen::IsQuitPrevent()) {
 		prevented = true;
 	}
 	if (_domain->started()) {

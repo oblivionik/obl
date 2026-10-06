@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_photo_editor_canvas.h"
 
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_photo_editor.h"
 #include "oblivion/oblivion_photo_editor_controls.h"
 #include "ui/effects/animation_value.h"
 #include "ui/painter.h"
@@ -421,6 +422,14 @@ void Canvas::setCropMode(bool enabled) {
 		return;
 	}
 	_cropMode = enabled;
+	if (_drag == Drag::Tool) {
+		// The crop frame takes the canvas in the middle of a drag (a tab
+		// shortcut): the tool gets no release, so it drops what it did.
+		if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+			tool->cancel();
+		}
+		_toolDrag = false;
+	}
 	_drag = Drag::None;
 	_zoom = 1.;
 	_pan = QPointF();
@@ -453,7 +462,7 @@ void Canvas::setGridVisible(bool visible) {
 }
 
 bool Canvas::cropDragging() const {
-	return _drag != Drag::None && _drag != Drag::Pan;
+	return _drag != Drag::None && _drag != Drag::Pan && _drag != Drag::Tool;
 }
 
 rpl::producer<QRectF> Canvas::cropChanges() const {
@@ -468,9 +477,118 @@ void Canvas::setPanMode(bool enabled) {
 	if (_panMode != enabled) {
 		_panMode = enabled;
 		if (_drag == Drag::None) {
-			updateCursor(mapFromGlobal(QCursor::pos()));
+			if (enabled) {
+				// The hand takes the mouse: no brush ring stays behind.
+				if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+					tool->mouseLeave();
+				}
+				updateCursor(mapFromGlobal(QCursor::pos()));
+			} else {
+				toolChanged();
+			}
 		}
 	}
+}
+
+void Canvas::setToolProvider(Fn<Tool*()> provider) {
+	_toolProvider = std::move(provider);
+	toolChanged();
+}
+
+rpl::producer<bool> Canvas::toolDragValue() const {
+	return _toolDrag.value();
+}
+
+void Canvas::toolChanged() {
+	if (_drag == Drag::Tool) {
+		_drag = Drag::None;
+		_toolDrag = false;
+	}
+	if (_drag == Drag::None) {
+		const auto point = QPointF(mapFromGlobal(QCursor::pos()));
+		if (const auto tool = activeTool()) {
+			setCursor(rect().contains(point.toPoint())
+				? tool->cursor(toolEvent(
+					point,
+					Qt::NoButton,
+					Qt::NoButton,
+					Qt::NoModifier))
+				: QCursor(Qt::ArrowCursor));
+		} else {
+			updateCursor(point);
+		}
+	}
+	update();
+}
+
+void Canvas::setFrameTransform(const QTransform &documentToFrame) {
+	if (_documentToFrame != documentToFrame) {
+		_documentToFrame = documentToFrame;
+		update();
+	}
+}
+
+QTransform Canvas::documentToWidget() const {
+	const auto image = imageRect();
+	const auto scale = this->scale();
+	return _documentToFrame
+		* QTransform::fromScale(scale, scale)
+		* QTransform::fromTranslate(image.x(), image.y());
+}
+
+float64 Canvas::documentScale() const {
+	const auto determinant = std::abs(_documentToFrame.determinant());
+	return scale() * ((determinant > 0.) ? std::sqrt(determinant) : 1.);
+}
+
+Tool *Canvas::activeTool() const {
+	return (_cropMode || _panMode || _comparing || _frame.isEmpty())
+		? nullptr
+		: _toolProvider
+		? _toolProvider()
+		: nullptr;
+}
+
+ToolMouseEvent Canvas::toolEvent(
+		QPointF position,
+		Qt::MouseButton button,
+		Qt::MouseButtons buttons,
+		Qt::KeyboardModifiers modifiers) const {
+	auto invertible = false;
+	const auto inverted = documentToWidget().inverted(&invertible);
+	return {
+		.document = invertible ? inverted.map(position) : position,
+		.widget = position,
+		.button = button,
+		.buttons = buttons,
+		.modifiers = modifiers,
+		.scale = documentScale(),
+	};
+}
+
+void Canvas::paintTool(QPainter &p) {
+	if (_cropMode || _comparing || _frame.isEmpty() || !_toolProvider) {
+		return;
+	}
+	const auto tool = _toolProvider();
+	if (!tool) {
+		return;
+	}
+	auto invertible = false;
+	const auto transform = documentToWidget();
+	const auto inverted = _documentToFrame.inverted(&invertible);
+	const auto size = invertible
+		? inverted.mapRect(QRectF(QPointF(), QSizeF(_frame))).size().toSize()
+		: _frame;
+	p.save();
+	p.setRenderHint(QPainter::Antialiasing);
+	tool->paint(p, {
+		.documentToWidget = transform,
+		.scale = documentScale(),
+		.documentSize = size,
+		.widgetRect = rect(),
+	});
+	p.restore();
 }
 
 QRectF Canvas::contentRect() const {
@@ -727,6 +845,25 @@ void Canvas::wheelEvent(QWheelEvent *e) {
 		e->ignore();
 		return;
 	}
+	if (const auto tool = activeTool()) {
+		const auto event = toolEvent(
+			e->position(),
+			Qt::NoButton,
+			e->buttons(),
+			e->modifiers());
+		const auto handled = tool->wheel({
+			.document = event.document,
+			.widget = event.widget,
+			.angleDelta = QPointF(e->angleDelta()),
+			.pixelDelta = QPointF(e->pixelDelta()),
+			.modifiers = event.modifiers,
+			.scale = event.scale,
+		});
+		if (handled) {
+			e->accept();
+			return;
+		}
+	}
 	const auto angle = e->angleDelta();
 	if (e->modifiers() & Qt::ControlModifier) {
 		const auto delta = angle.y() ? angle.y() : angle.x();
@@ -807,13 +944,65 @@ void Canvas::updateCursor(QPointF point) {
 	case Drag::TopRight:
 	case Drag::BottomLeft: setCursor(Qt::SizeBDiagCursor); return;
 	case Drag::Pan: setCursor(Qt::ClosedHandCursor); return;
+	case Drag::Tool: return;
 	case Drag::None: break;
 	}
 	setCursor(pannable() ? Qt::OpenHandCursor : Qt::ArrowCursor);
 }
 
+// The release that ends a drag never came: a dialog or a menu took the
+// mouse meanwhile. The drag ends where the mouse was seen last, otherwise
+// a brush would go on drawing under a mouse that only hovers.
+void Canvas::finishLostDrag(Qt::KeyboardModifiers modifiers) {
+	if (_drag == Drag::Tool) {
+		_drag = Drag::None;
+		if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+			tool->mouseRelease(toolEvent(
+				_dragLast,
+				Qt::LeftButton,
+				Qt::NoButton,
+				modifiers));
+		}
+		_toolDrag = false;
+	} else if (_drag != Drag::None) {
+		finishDrag();
+	}
+}
+
 void Canvas::mousePressEvent(QMouseEvent *e) {
 	const auto point = e->position();
+	if (_drag != Drag::None) {
+		if (e->button() != Qt::LeftButton) {
+			// One more button while something is dragged changes nothing.
+			return;
+		}
+		finishLostDrag(e->modifiers());
+	}
+	if (e->button() == Qt::LeftButton) {
+		if (const auto tool = activeTool()) {
+			const auto event = toolEvent(
+				point,
+				e->button(),
+				e->buttons(),
+				e->modifiers());
+			// The tool may apply changes right in the press: they belong
+			// to the same interaction.
+			_toolDrag = true;
+			const auto taken = tool->mousePress(event);
+			// The press could have replaced the tool: the new one didn't
+			// get it, so there is nothing for it to continue.
+			if (taken && activeTool() == tool) {
+				_drag = Drag::Tool;
+				_dragStart = point;
+				_dragLast = point;
+				return;
+			}
+			_toolDrag = false;
+			if (taken) {
+				return;
+			}
+		}
+	}
 	if (e->button() == Qt::MiddleButton
 		|| (e->button() == Qt::LeftButton && _panMode)) {
 		if (pannable()) {
@@ -826,6 +1015,13 @@ void Canvas::mousePressEvent(QMouseEvent *e) {
 			? Drag::Pan
 			: Drag::None;
 	}
+	if (_drag == Drag::Pan && !_cropMode) {
+		// The photo is dragged with the hand: the hover overlay of the
+		// tool (a brush ring) would stay where the mouse was.
+		if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+			tool->mouseLeave();
+		}
+	}
 	_dragStart = point;
 	_dragPan = _pan;
 	_dragCrop = cropFrameRect();
@@ -837,12 +1033,33 @@ void Canvas::mousePressEvent(QMouseEvent *e) {
 
 void Canvas::mouseMoveEvent(QMouseEvent *e) {
 	const auto point = e->position();
-	if (_drag == Drag::Pan) {
+	if (_drag != Drag::None
+		&& !(e->buttons() & (Qt::LeftButton | Qt::MiddleButton))) {
+		finishLostDrag(e->modifiers());
+	}
+	if (_drag == Drag::Tool) {
+		_dragLast = point;
+		if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+			tool->mouseMove(toolEvent(
+				point,
+				Qt::NoButton,
+				e->buttons(),
+				e->modifiers()));
+		}
+	} else if (_drag == Drag::Pan) {
 		_pan = _dragPan + (point - _dragStart);
 		clampPan();
 		update();
 	} else if (cropDragging()) {
 		updateCropDrag(point, e->modifiers());
+	} else if (const auto tool = activeTool()) {
+		const auto event = toolEvent(
+			point,
+			Qt::NoButton,
+			e->buttons(),
+			e->modifiers());
+		tool->mouseMove(event);
+		setCursor(tool->cursor(event));
 	} else {
 		updateCursor(point);
 	}
@@ -901,8 +1118,40 @@ void Canvas::updateCropDrag(
 }
 
 void Canvas::mouseReleaseEvent(QMouseEvent *e) {
+	if (_drag == Drag::Tool) {
+		if (e->button() != Qt::LeftButton) {
+			return;
+		}
+		_drag = Drag::None;
+		const auto event = toolEvent(
+			e->position(),
+			e->button(),
+			e->buttons(),
+			e->modifiers());
+		if (const auto tool = _toolProvider ? _toolProvider() : nullptr) {
+			tool->mouseRelease(event);
+		}
+		// After the release: what the tool applied in it is still a part
+		// of the interaction.
+		_toolDrag = false;
+		// The release could have replaced the tool.
+		if (const auto tool = activeTool()) {
+			setCursor(tool->cursor(event));
+		} else {
+			updateCursor(e->position());
+		}
+		return;
+	}
 	finishDrag();
-	updateCursor(e->position());
+	if (const auto tool = activeTool()) {
+		setCursor(tool->cursor(toolEvent(
+			e->position(),
+			Qt::NoButton,
+			e->buttons(),
+			e->modifiers())));
+	} else {
+		updateCursor(e->position());
+	}
 }
 
 void Canvas::finishDrag() {
@@ -915,6 +1164,27 @@ void Canvas::finishDrag() {
 }
 
 void Canvas::mouseDoubleClickEvent(QMouseEvent *e) {
+	if (e->button() == Qt::LeftButton && _drag == Drag::None) {
+		if (const auto tool = activeTool()) {
+			const auto event = toolEvent(
+				e->position(),
+				e->button(),
+				e->buttons(),
+				e->modifiers());
+			if (tool->mouseDoubleClick(event)) {
+				return;
+			}
+			_toolDrag = true;
+			if (tool->mousePress(event) && activeTool() == tool) {
+				_drag = Drag::Tool;
+				_dragStart = e->position();
+				_dragLast = e->position();
+			} else {
+				_toolDrag = false;
+			}
+			return;
+		}
+	}
 	if (!_cropMode && e->button() == Qt::LeftButton && !_frame.isEmpty()) {
 		toggleZoom(e->position());
 	}
@@ -931,6 +1201,9 @@ void Canvas::enterEventHook(QEnterEvent *e) {
 void Canvas::leaveEventHook(QEvent *e) {
 	if (_drag == Drag::None) {
 		setCursor(Qt::ArrowCursor);
+		if (const auto tool = activeTool()) {
+			tool->mouseLeave();
+		}
 	}
 	if (_hovered) {
 		_hovered = false;
@@ -1123,6 +1396,8 @@ void Canvas::paintEvent(QPaintEvent *e) {
 	paintImage(p, showBefore ? _before : _image, target);
 	if (_cropMode) {
 		paintCrop(p);
+	} else {
+		paintTool(p);
 	}
 	if (showBefore) {
 		paintBadge(p);

@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/profile/info_profile_top_bar.h"
 
+#include "oblivion/oblivion_badge.h"
 #include "oblivion/oblivion_settings.h"
 #include "api/api_peer_colors.h"
 #include "api/api_peer_photo.h"
@@ -439,6 +440,12 @@ TopBar::TopBar(
 		updateLabelsPosition();
 	}, _title->lifetime());
 
+	// Oblivion: the mark of an Oblivion user after the name and its badges.
+	_oblivionBadge = Oblivion::Badge::CreateWidget(this, _peer).release();
+	_oblivionBadge->shownValue() | rpl::skip(1) | rpl::on_next([=] {
+		updateLabelsPosition();
+	}, _oblivionBadge->lifetime());
+
 	setupUniqueBadgeTooltip();
 	setupButtons(controller, descriptor.source);
 	setupSwipeBack(controller);
@@ -646,6 +653,14 @@ void TopBar::adjustColors(const std::optional<QColor> &edgeColor) {
 		? _verifiedSt.get()
 		: &st::infoColoredPeerBadge
 		: nullptr);
+	if (_oblivionBadge) {
+		// Oblivion: on a coloured cover the mark takes the title colour.
+		Oblivion::Badge::SetWidgetColor(
+			_oblivionBadge,
+			(shouldOverrideBadges
+				? std::optional<QColor>(st::groupCallMembersFg->c)
+				: std::nullopt));
+	}
 
 	if (_starsRating) {
 		const auto shouldOverrideRating = shouldOverride(st::windowBgActive);
@@ -1841,6 +1856,11 @@ void TopBar::updateTitlePosition(float64 progressCurrent) {
 	if (verifiedWidget || badgeWidget) {
 		badgesWidth += st::infoVerifiedCheckPosition.x();
 	}
+	// Oblivion: the mark of an Oblivion user, the last one after the name.
+	const auto oblivionBadge = (_oblivionBadge && !_oblivionBadge->isHidden())
+		? _oblivionBadge->width()
+		: 0;
+	badgesWidth += oblivionBadge;
 	const auto titleWidth = width()
 		- interpolatedPadding
 		- reservedRight
@@ -1873,6 +1893,7 @@ void TopBar::updateTitlePosition(float64 progressCurrent) {
 		totalElementsWidth += st::infoVerifiedCheckPosition.x();
 	}
 	totalElementsWidth += botVerifySkip;
+	totalElementsWidth += oblivionBadge; // Oblivion
 
 	auto titleLeft = anim::interpolate(
 		titleMostLeft,
@@ -1897,6 +1918,17 @@ void TopBar::updateTitlePosition(float64 progressCurrent) {
 			badgeLeft + (badgeWidget ? badgeWidget->width() : 0),
 			badgeTop,
 			badgeBottom);
+	}
+	if (oblivionBadge) {
+		// Oblivion: after the upstream badges, centered in the title height.
+		_oblivionBadge->moveToLeft(
+			(badgeLeft
+				+ (badgeWidget ? badgeWidget->width() : 0)
+				+ (verifiedWidget ? verifiedWidget->width() : 0)
+				+ ((badgeWidget || verifiedWidget)
+					? st::infoVerifiedCheckPosition.x()
+					: 0)),
+			badgeTop + (badgeBottom - badgeTop - _oblivionBadge->height()) / 2);
 	}
 }
 

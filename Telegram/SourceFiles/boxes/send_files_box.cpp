@@ -20,6 +20,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/message_field.h"
 #include "menu/menu_checked_action.h"
 #include "menu/menu_send.h"
+#include "oblivion/oblivion_attach_tools.h"
 #include "oblivion/oblivion_round_video.h"
 #include "oblivion/oblivion_photo_integration.h"
 #include "oblivion/oblivion_video_editor.h"
@@ -870,6 +871,7 @@ void SendFilesBox::prepare() {
 	setupSendWayControls();
 	preparePreview();
 	initPreview();
+	setupOblivionTools(); // Oblivion
 	SetupShadowsToScrollContent(this, _scroll, _inner->heightValue());
 	setCloseByOutsideClick(false);
 
@@ -912,6 +914,61 @@ void SendFilesBox::setupDragArea() {
 	areas.photo->setDroppedCallback(droppedCallback(true));
 }
 
+// Oblivion: the row of tools for the attached file. Only in the usual
+// box: the ones with a palette of their own (stories) stay as they are.
+void SendFilesBox::setupOblivionTools() {
+	if (&_st != &st::defaultComposeControls) {
+		return;
+	}
+	_oblivionTools = Oblivion::CreateAttachToolsRow(this, {
+		.show = _show,
+		.peer = _toPeer,
+		.sendType = _sendType,
+		.sendMenuDetails = _sendMenuDetails,
+		.replyTo = [=] { return _replyTo; },
+		.list = [=]() -> const Ui::PreparedList& {
+			applyBlockChanges();
+			return _list;
+		},
+		.listChanges = _oblivionListChanges.events(),
+		.replace = crl::guard(this, [=](
+				int index,
+				Fn<void(Ui::PreparedFile&)> apply) {
+			applyBlockChanges();
+			if (index >= 0 && index < int(_list.files.size())) {
+				refreshAllAfterChanges(index, [&] {
+					apply(_list.files[index]);
+				});
+			}
+		}),
+		.canSend = [=](const Ui::PreparedFile &file) {
+			const auto compress = _sendWay.current().sendImagesAsPhotos();
+			return !_check || _check(file, compress, false);
+		},
+		.closeBox = crl::guard(this, [=] { oblivionCloseTakenAway(); }),
+		.busy = [=] { return _preparing; },
+	});
+	if (const auto raw = _oblivionTools.data()) {
+		raw->resizeToWidth(st::sendMediaPreviewSize);
+		raw->heightValue() | rpl::on_next([=] {
+			updateBoxSize();
+			updateControlsGeometry();
+		}, raw->lifetime());
+	}
+}
+
+// Oblivion: closes the box for a tool that has taken its only file away.
+// The caption is handed over only where somebody takes it (the message
+// field of a chat). A box nobody listens to (a reply to a story, a text
+// sent as a file) is left to its "cancelled" callback, which puts back
+// the text from before the box: a caption marked as taken would skip it.
+void SendFilesBox::oblivionCloseTakenAway() {
+	if (_textWithTagsRequests.has_consumers()) {
+		requestToTakeTextWithTags();
+	}
+	closeBox();
+}
+
 void SendFilesBox::refreshAllAfterChanges(int fromItem, Fn<void()> perform) {
 	auto fromBlock = 0;
 	for (auto count = int(_blocks.size()); fromBlock != count; ++fromBlock) {
@@ -938,6 +995,7 @@ void SendFilesBox::refreshAllAfterChanges(int fromItem, Fn<void()> perform) {
 	}
 	_inner->resizeToWidth(st::boxWideWidth);
 	refreshControls();
+	_oblivionListChanges.fire({}); // Oblivion
 	captionResized();
 }
 
@@ -1241,23 +1299,30 @@ void SendFilesBox::addMenuButton() {
 			_sendMenuCallback,
 			&_st.tabbed.icons,
 			position);
-		Oblivion::AddSendAsRoundAction(
-			_menu.get(),
-			_show,
-			_toPeer,
-			_sendMenuDetails(),
-			_sendType,
-			_list,
-			_replyTo,
-			crl::guard(this, [=] { closeBox(); }));
-		Oblivion::AddSendFilesVideoEditorAction(
-			_menu.get(),
-			_show,
-			_toPeer,
-			_sendMenuDetails(),
-			_sendType,
-			_list,
-			crl::guard(this, [=] { closeBox(); }));
+		// Oblivion: these two take the only file away and close the box,
+		// as the same tools of the row do (see oblivionCloseTakenAway()).
+		if (Oblivion::AttachTools::HoldsOnlyFile(_list, _preparing)) {
+			const auto takeAway = Fn<void()>(crl::guard(this, [=] {
+				oblivionCloseTakenAway();
+			}));
+			Oblivion::AddSendAsRoundAction(
+				_menu.get(),
+				_show,
+				_toPeer,
+				_sendMenuDetails(),
+				_sendType,
+				_list,
+				_replyTo,
+				takeAway);
+			Oblivion::AddSendFilesVideoEditorAction(
+				_menu.get(),
+				_show,
+				_toPeer,
+				_sendMenuDetails(),
+				_sendType,
+				_list,
+				takeAway);
+		}
 		_menu->popup(position);
 		return true;
 	});
@@ -2235,6 +2300,10 @@ void SendFilesBox::addPreparedAsyncFile(Ui::PreparedFile &&file) {
 	enqueueNextPrepare();
 	if (_list.files.size() > count) {
 		refreshAllAfterChanges(count);
+	} else if (_oblivionTools) {
+		// Oblivion: a file that was not taken is not waited for anymore.
+		_oblivionListChanges.fire({});
+		captionResized();
 	}
 	if (!_preparing && _whenReadySend) {
 		_whenReadySend();
@@ -2305,6 +2374,9 @@ void SendFilesBox::updateBoxSize() {
 		if (pointer && !pointer->isHidden()) {
 			footerHeight += pair.second + pointer->heightNoMargins();
 		}
+	}
+	if (_oblivionTools && !_oblivionTools->isHidden()) { // Oblivion
+		footerHeight += _oblivionTools->height();
 	}
 	_footerHeight = footerHeight;
 }
@@ -2380,6 +2452,10 @@ void SendFilesBox::updateControlsGeometry() {
 				bottom - pointer->heightNoMargins());
 			bottom -= pair.second + pointer->heightNoMargins();
 		}
+	}
+	if (_oblivionTools && !_oblivionTools->isHidden()) { // Oblivion
+		bottom -= _oblivionTools->height();
+		_oblivionTools->moveToLeft(st::boxPhotoPadding.left(), bottom);
 	}
 	const auto replyH = _replyHeaderHeight.current();
 	const auto replyTopOverlap = std::min(st::boxPhotoCaptionSkip, replyH);

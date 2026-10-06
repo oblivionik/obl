@@ -386,6 +386,40 @@ public:
 		apply(_voiceNoiseSuppression, value);
 	}
 
+	// Round 4: the row of tool buttons in the send files box
+	// (oblivion_attach_tools.h).
+	[[nodiscard]] bool attachTools() const {
+		return _attachTools;
+	}
+	void setAttachTools(bool value) {
+		apply(_attachTools, value);
+	}
+
+	// Round 4: the Oblivion badge (oblivion_badge.h). badgeEnabled means
+	// the invisible marker is kept in the bio of the user, it is switched
+	// only by Oblivion::Badge::SetEnabled(), after the consent. badgeAsked
+	// means the consent question was already answered once.
+	[[nodiscard]] bool badgeEnabled() const {
+		return _badgeEnabled;
+	}
+	void setBadgeEnabled(bool value) {
+		apply(_badgeEnabled, value);
+	}
+	[[nodiscard]] bool badgeAsked() const {
+		return _badgeAsked;
+	}
+	void setBadgeAsked(bool value) {
+		apply(_badgeAsked, value);
+	}
+
+	// Round 4: listening to music together (oblivion_listen.h).
+	[[nodiscard]] bool listenTogether() const {
+		return _listenTogether;
+	}
+	void setListenTogether(bool value) {
+		apply(_listenTogether, value);
+	}
+
 	[[nodiscard]] rpl::producer<> changes() const;
 
 private:
@@ -443,6 +477,10 @@ private:
 	bool _unifiedChats = false;
 	bool _voiceNoiseSuppression = false;
 	GhostPreset _ghostButtonOwned = { false, false, false, false, false };
+	bool _attachTools = true;
+	bool _badgeEnabled = false;
+	bool _badgeAsked = false;
+	bool _listenTogether = true;
 
 	rpl::event_stream<> _changes;
 

@@ -235,6 +235,8 @@ private:
 	void refreshButtons();
 	void refreshControls(bool initial = false);
 	void setupSendWayControls();
+	void setupOblivionTools(); // Oblivion
+	void oblivionCloseTakenAway(); // Oblivion
 	void setupCaption();
 	void setupCaptionAutocomplete();
 
@@ -331,6 +333,11 @@ private:
 	object_ptr<Ui::Checkbox> _wayRemember = { nullptr };
 	object_ptr<Ui::FlatLabel> _hintLabel = { nullptr };
 	rpl::variable<Ui::SendFilesWay> _sendWay = Ui::SendFilesWay();
+
+	// Oblivion: the row of tools for the attached file, right under the
+	// previews (oblivion_attach_tools.h).
+	rpl::event_stream<> _oblivionListChanges;
+	object_ptr<Ui::RpWidget> _oblivionTools = { nullptr };
 
 	rpl::variable<int> _footerHeight = 0;
 	rpl::lifetime _dimensionsLifetime;

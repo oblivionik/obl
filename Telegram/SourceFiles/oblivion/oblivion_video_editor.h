@@ -9,6 +9,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "data/data_msg_id.h"
 
+#include <QtCore/QStringList>
+
 class DocumentData;
 class HistoryItem;
 class PeerData;
@@ -52,9 +54,21 @@ class SessionController;
 // (oblivion_sticker_packs.h) or a custom emoji, and is saved to a file or
 // sent to a chat through the usual send files box.
 //
+// "Effects" opens a box over the editor with the stack of video effects of
+// the project (oblivion_video_fx.h, the list itself is oblivion_video_fx_ui.h):
+// a smaller preview with a line to seek by stays at the top, the effects
+// with their parameters scroll under it. The effects are a part of the
+// edited state: every change is applied at once and kept by the undo, by
+// a kept project and by all the exports. The preview shows them on the
+// part of the frame that goes to the result, in a reduced size: a paused
+// frame is made off the main thread (with the frames before it for the
+// effects that need them), a playing video gets them from the thread that
+// reads its frames.
+//
 // The preview plays without sound. Shortcuts (the timeline has the focus):
 // Space plays, Left / Right step by a frame (with Shift by a second),
 // Home / End, S splits, Delete removes the clip, Cmd+Z / Cmd+Shift+Z.
+// Space and the undo work in the box of the effects too.
 //
 // Cancel and Escape ask before the changes that were not exported are
 // lost. When the editor is closed by something else (the passcode lock,
@@ -119,5 +133,11 @@ void AddSendFilesVideoEditorAction(
 	Api::SendType sendType,
 	const Ui::PreparedList &list,
 	Fn<void()> closeBox);
+
+// A part of the self-checks for OBLIVION_SELFTEST=video_editor, called by
+// VideoEdit::RunSelfTest() (oblivion_video_project.h): what the editor and
+// the list of the effects decide without their widgets. Runs before
+// Core::Application exists (no Core::App(), no session).
+[[nodiscard]] bool VideoEditorSelfTest(QStringList &log);
 
 } // namespace Oblivion

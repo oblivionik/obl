@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "apiwrap.h"
 
+#include "oblivion/oblivion_badge.h"
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_forward_copy.h"
 #include "oblivion/oblivion_ghost.h"
@@ -5660,14 +5661,19 @@ void ApiWrap::saveSelfBio(const QString &text) {
 		MTP_flags(MTPaccount_UpdateProfile::Flag::f_about),
 		MTPstring(),
 		MTPstring(),
-		MTP_string(text)
+		// Oblivion: with the badge on its invisible marker stays in the bio.
+		MTP_string(Oblivion::Badge::BioForSaving(_session, text))
 	)).done([=](const MTPUser &result) {
 		_bio.requestId = 0;
 
 		_session->data().processUser(result);
-		_session->user()->setAbout(_bio.requestedText);
+		// Oblivion: the marker never gets into the bio the app keeps.
+		_session->user()->setAbout(
+			Oblivion::Badge::StripAbout(_bio.requestedText));
+		Oblivion::Badge::BioSaveFinished(_session);
 	}).fail([=] {
 		_bio.requestId = 0;
+		Oblivion::Badge::BioSaveFinished(_session);
 	}).send();
 }
 

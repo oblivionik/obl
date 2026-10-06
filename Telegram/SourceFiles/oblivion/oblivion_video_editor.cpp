@@ -41,6 +41,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_round_video_convert.h"
 #include "oblivion/oblivion_sticker_packs.h"
 #include "oblivion/oblivion_ui_snapshots.h"
+#include "oblivion/oblivion_video_fx_ui.h"
 #include "oblivion/oblivion_video_project.h"
 #include "platform/platform_file_utilities.h"
 #include "settings.h"
@@ -82,6 +83,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QLocale>
+#include <QtCore/QPointer>
 #include <QtCore/QtMath>
 #include <QtGui/QCursor>
 #include <QtGui/QLinearGradient>
@@ -91,6 +93,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace Oblivion {
@@ -158,6 +161,28 @@ constexpr auto kSentFileKeep = crl::time(6 * 3600 * 1000);
 constexpr auto kStashedContentLimit = int64(256) * 1024 * 1024;
 constexpr auto kNoticeDuration = crl::time(8000);
 constexpr auto kTooltipDelay = 600;
+
+// The effects (oblivion_video_fx.h) are previewed on the part of the frame
+// that goes to the result, scaled down: the longer side of it is not more
+// than that. A paused frame is sharper than a playing one, but not with
+// the effects that need the frames before it: all of those are read and
+// kept at that size.
+constexpr auto kFxStillSide = 1280;
+constexpr auto kFxTemporalSide = 960;
+constexpr auto kFxLongTemporalSide = 640; // More than a second is kept.
+constexpr auto kFxLongPreroll = crl::time(1000);
+constexpr auto kFxPlaySide = 640; // While playing or tuning a parameter.
+constexpr auto kFxRoughSide = 480; // While something is being dragged.
+constexpr auto kFxPrerollSide = 960; // How the frames before are read.
+constexpr auto kFxPrerollStep = crl::time(66); // In the result.
+constexpr auto kFxPrerollLimit = 48; // Frames.
+constexpr auto kFxPrerollFps = 15;
+constexpr auto kFxSettleDelay = crl::time(220);
+constexpr auto kFxPreviewMinHeight = 130; // In the box of the effects.
+constexpr auto kFxPreviewHeight = 230;
+constexpr auto kFxPreviewMaxHeight = 300; // In a tall window.
+constexpr auto kFxBoxMinHeight = 480;
+constexpr auto kFxBoxRest = 520; // Everything but the preview, at least.
 
 [[nodiscard]] int Px(int value) {
 	return style::ConvertScale(value);
@@ -647,12 +672,26 @@ public:
 		int count,
 		int side) = 0;
 
+	// The frames from one position to another (not including it), one
+	// after another, about every step ms, the same way frame() gives them.
+	// For the effects that need to see what was before a paused frame.
+	// The callback gets the position of a frame and stops it all by false.
+	virtual void sequence(
+		crl::time from,
+		crl::time till,
+		crl::time step,
+		int maxSide,
+		Fn<bool(crl::time position, QImage &&frame)> callback) = 0;
+
 };
 
 class ReaderMedia final : public Media {
 public:
 	explicit ReaderMedia(const Source &source)
-	: _reader(RoundVideo::Source{
+	: _path(source.path)
+	, _content(source.content)
+	, _size(source.info.size)
+	, _reader(RoundVideo::Source{
 		.path = source.path,
 		.content = source.content,
 	}) {
@@ -664,14 +703,90 @@ public:
 	std::vector<QImage> thumbnails(int count, int side) override {
 		return _reader.thumbnails(count, side);
 	}
+	void sequence(
+			crl::time from,
+			crl::time till,
+			crl::time step,
+			int maxSide,
+			Fn<bool(crl::time position, QImage &&frame)> callback) override {
+		if (_size.isEmpty() || till <= from || maxSide <= 0) {
+			return;
+		}
+		// Read in a row, which is much faster than seeking to every frame.
+		const auto fits = (std::max(_size.width(), _size.height()) <= maxSide);
+		const auto read = VideoCore::ReadFrames({
+			.path = _path,
+			.content = _content,
+			.from = from,
+			.till = till,
+			.size = (fits
+				? _size
+				: _size.scaled(maxSide, maxSide, Qt::KeepAspectRatio)),
+			.maxFps = std::max(int(1000 / std::max(step, crl::time(1))), 1),
+		}, [&](VideoCore::Frame &&frame) {
+			return callback(from + frame.position, std::move(frame.image));
+		});
+		(void)read;
+	}
 
 private:
+	const QString _path;
+	const QByteArray _content;
+	const QSize _size;
 	RoundVideo::Reader _reader;
 
 };
 
 using OpenMedia = Fn<std::unique_ptr<Media>(const Source &source)>;
 using ProbeMedia = Fn<VideoCore::ClipInfo(const Source &source)>;
+
+// What a paused frame is asked with.
+struct StillRequest {
+	crl::time position = 0; // In the source.
+	int side = 0; // The frame, as the source shows it, fits into it.
+
+	// The part of the frame that goes to the result and the effects for
+	// it, nothing of this is made when the output is empty.
+	QSize canvas;
+	QRect crop; // In the pixels of the canvas.
+	QSize output;
+	int rotation = 0;
+	VideoFx::Stack stack;
+	crl::time resultPosition = 0; // The time of the frame in the result.
+	int speed = 100;
+
+	// From where the video is shown to the effects before the frame, in
+	// the source. The position itself: from nowhere.
+	crl::time prerollFrom = 0;
+
+	friend inline bool operator==(
+		const StillRequest &,
+		const StillRequest &) = default;
+};
+
+// How a paused frame that is asked for differs from the one asked before.
+enum class StillChange : uchar {
+	None, // The same frame: it is shown already or is on its way.
+	Effects, // What is read and kept for the previous one is used again.
+	Frame, // Another moment or another part of the picture.
+};
+
+[[nodiscard]] StillChange CompareStills(
+		const StillRequest &asked,
+		const StillRequest &request) {
+	if (asked == request) {
+		return StillChange::None;
+	}
+	auto same = asked;
+	same.stack = request.stack;
+	return (same == request) ? StillChange::Effects : StillChange::Frame;
+}
+
+struct StillResult {
+	QImage raw; // As the source shows the frame.
+	QImage fx; // The part for the result, with the effects that are on.
+	bool cancelled = false;
+};
 
 // Lives on the queue of a source, object_on_queue needs rvalue arguments.
 class QueuedMedia final {
@@ -686,10 +801,199 @@ public:
 		return *_media;
 	}
 
+	// A paused frame. What it is made of is kept: when only the effects
+	// change (a slider of a parameter is dragged) nothing is read again.
+	// cancelled: neither the frame nor what is read for it is needed.
+	[[nodiscard]] StillResult still(
+		const StillRequest &request,
+		const Fn<bool()> &cancelled);
+
+	// The paused frame is in another video now.
+	void forget() {
+		_raw = QImage();
+		_composed = QImage();
+		forgetBefore();
+	}
+
 private:
+	struct Geometry {
+		QSize canvas;
+		QRect crop;
+		QSize output;
+		int rotation = 0;
+
+		friend inline bool operator==(
+			const Geometry &,
+			const Geometry &) = default;
+	};
+	struct Timing {
+		crl::time from = 0;
+		crl::time resultPosition = 0;
+		int speed = 0;
+
+		friend inline bool operator==(
+			const Timing &,
+			const Timing &) = default;
+	};
+	struct Before {
+		crl::time time = 0; // In the result.
+		QImage image;
+	};
+
+	void forgetBefore() {
+		_before.clear();
+		_beforeValid = false;
+	}
+
 	const std::unique_ptr<Media> _media;
 
+	QImage _raw;
+	crl::time _rawPosition = 0;
+	int _rawSide = 0;
+	QImage _composed; // The part of _raw for the result.
+	Geometry _geometry;
+	std::vector<Before> _before; // The same parts of the frames before.
+	Timing _timing;
+	bool _beforeValid = false;
+
 };
+
+StillResult QueuedMedia::still(
+		const StillRequest &request,
+		const Fn<bool()> &cancelled) {
+	auto result = StillResult();
+	if (_raw.isNull()
+		|| _rawPosition != request.position
+		|| _rawSide != request.side) {
+		_raw = _media->frame(request.position, request.side);
+		_rawPosition = request.position;
+		_rawSide = request.side;
+		_composed = QImage();
+		forgetBefore();
+	}
+	result.raw = _raw;
+	if (_raw.isNull() || request.output.isEmpty()) {
+		_composed = QImage();
+		forgetBefore();
+		return result;
+	}
+	const auto geometry = Geometry{
+		.canvas = request.canvas,
+		.crop = request.crop,
+		.output = request.output,
+		.rotation = request.rotation,
+	};
+	const auto compose = [&](const QImage &frame) {
+		return VideoEdit::ComposePreview(
+			frame,
+			request.canvas,
+			request.crop,
+			request.output,
+			request.rotation);
+	};
+	if (_composed.isNull() || _geometry != geometry) {
+		_composed = compose(_raw);
+		_geometry = geometry;
+		forgetBefore();
+	}
+	const auto speed = std::max(request.speed, 1);
+	const auto timing = Timing{
+		.from = request.prerollFrom,
+		.resultPosition = request.resultPosition,
+		.speed = speed,
+	};
+	if (request.prerollFrom >= request.position) {
+		forgetBefore();
+	} else if (!_beforeValid || _timing != timing) {
+		forgetBefore();
+		_media->sequence(
+			request.prerollFrom,
+			request.position,
+			std::max(kFxPrerollStep * speed / 100, crl::time(1)),
+			std::min(request.side, kFxPrerollSide),
+			[&](crl::time position, QImage &&frame) {
+				if (cancelled()) {
+					return false;
+				} else if (position >= request.position || frame.isNull()) {
+					return true;
+				}
+				const auto back = (request.position - position) * 100 / speed;
+				_before.push_back(Before{
+					.time = request.resultPosition - back,
+					.image = compose(frame),
+				});
+				return (int(_before.size()) < kFxPrerollLimit);
+			});
+		if (cancelled()) {
+			forgetBefore();
+			result.cancelled = true;
+			return result;
+		}
+		_timing = timing;
+		_beforeValid = true;
+	}
+	if (!VideoFx::HasEnabled(request.stack)) {
+		result.fx = _composed;
+		return result;
+	}
+
+	// The effects see what was before the frame, then the frame itself:
+	// it looks the way it does while the video plays.
+	VideoFx::Processor processor(request.stack);
+	for (const auto &before : _before) {
+		if (cancelled()) {
+			result.cancelled = true;
+			return result;
+		}
+		processor.feed(before.image, before.time);
+	}
+	result.fx = processor.process(_composed, request.resultPosition);
+	return result;
+}
+
+// The effects of a playback: the stack comes from the main thread, the
+// processor is used only by the thread that reads the frames (one at
+// a time: the next clip is read after the previous one).
+struct FxPlayback {
+	std::mutex mutex;
+	VideoFx::Stack stack; // Under the mutex.
+	bool always = false; // Under the mutex, see FxPlayback::wanted.
+	int version = 0; // Under the mutex.
+
+	VideoFx::Processor processor;
+	int applied = -1;
+
+	// The part for the result is made of every frame even without any
+	// effects: the box of the effects shows it.
+	bool wanted = false;
+
+	// Takes what the main thread has set since the last frame.
+	void apply() {
+		const auto lock = std::unique_lock(mutex);
+		if (applied != version) {
+			applied = version;
+			wanted = always;
+			processor.setStack(stack);
+		}
+	}
+};
+
+// How good a paused frame with effects has to be.
+enum class FxQuality : uchar {
+	Full,
+	Tuning, // A parameter of an effect is being dragged.
+	Rough, // The playhead, a clip edge or the crop is being dragged.
+};
+
+// Whether a picture of one size is shown in a place of another one without
+// being visibly stretched. The sizes of a small crop in the pixels of the
+// video and on the screen differ by the rounding, that is not a difference.
+[[nodiscard]] bool SameProportions(QSizeF first, QSizeF second) {
+	constexpr auto kTolerance = 0.15;
+	const auto one = first.width() * second.height();
+	const auto two = second.width() * first.height();
+	return std::abs(one - two) <= kTolerance * std::max(one, two);
+}
 
 // Thumbnails of the sources by their time, shared with the timeline.
 struct ThumbStore {
@@ -729,6 +1033,11 @@ public:
 
 	void setCanvas(QSize canvas, int rotation);
 	void setFrame(QImage frame); // As the source shows it, not rotated.
+
+	// What the effects make of the part of the frame inside of the crop
+	// (rotated already), shown over that part. Null: nothing.
+	void setFx(QImage fx);
+	void setHeightLimits(int min, int max);
 	void setCrop(QRectF crop, Aspect aspect);
 	void setStatus(const QString &status);
 	void setProgress(std::optional<float64> progress);
@@ -777,12 +1086,15 @@ private:
 	[[nodiscard]] QPointF normalized(QPointF point) const;
 	void dragTo(QPointF point);
 	void updateCursor(QPointF point);
-	void refreshRotated();
+	void validateRotated();
 
 	QImage _frame;
-	QImage _rotated;
+	QImage _rotated; // Null until it is painted.
+	QImage _fx;
 	QSize _canvas;
 	int _rotation = 0;
+	int _minHeight = 0;
+	int _maxHeight = 0;
 	QRectF _crop = QRectF(0., 0., 1., 1.);
 	Aspect _aspect = Aspect::Original;
 	QString _status;
@@ -801,7 +1113,9 @@ private:
 };
 
 Preview::Preview(QWidget *parent)
-: RpWidget(parent) {
+: RpWidget(parent)
+, _minHeight(Px(kPreviewMinHeight))
+, _maxHeight(Px(kPreviewMaxHeight)) {
 	setMouseTracking(true);
 	resize(width(), Px(kPreviewHeight));
 }
@@ -814,7 +1128,10 @@ void Preview::setCanvas(QSize canvas, int rotation) {
 	_canvas = canvas;
 	_rotation = rotation;
 	if (rotate) {
-		refreshRotated();
+		_rotated = QImage();
+
+		// It was made for the frame turned the other way.
+		_fx = QImage();
 	}
 	if (width() > 0) {
 		resizeToWidth(width());
@@ -824,14 +1141,35 @@ void Preview::setCanvas(QSize canvas, int rotation) {
 
 void Preview::setFrame(QImage frame) {
 	_frame = std::move(frame);
-	refreshRotated();
+	_rotated = QImage();
 	update();
 }
 
-void Preview::refreshRotated() {
-	_rotated = (_rotation && !_frame.isNull())
-		? _frame.transformed(QTransform().rotate(_rotation))
-		: _frame;
+void Preview::setFx(QImage fx) {
+	if (_fx.isNull() && fx.isNull()) {
+		return;
+	}
+	_fx = std::move(fx);
+	update();
+}
+
+void Preview::setHeightLimits(int min, int max) {
+	_minHeight = min;
+	_maxHeight = std::max(max, min);
+	if (width() > 0) {
+		resizeToWidth(width());
+	}
+}
+
+// The frame is turned when it is painted: a preview that is not seen (the
+// one of the editor under the box of the effects while the video plays
+// there) gets the frames too.
+void Preview::validateRotated() {
+	if (_rotated.isNull() && !_frame.isNull()) {
+		_rotated = _rotation
+			? _frame.transformed(QTransform().rotate(_rotation))
+			: _frame;
+	}
 }
 
 void Preview::setCrop(QRectF crop, Aspect aspect) {
@@ -869,12 +1207,12 @@ void Preview::setInteractive(bool interactive) {
 
 int Preview::resizeGetHeight(int newWidth) {
 	if (_canvas.isEmpty() || newWidth <= 0) {
-		return Px(kPreviewHeight);
+		return std::clamp(Px(kPreviewHeight), _minHeight, _maxHeight);
 	}
 	// As tall as the frame at the full width, within the limits.
 	const auto fitted = int(std::round(
 		newWidth * float64(_canvas.height()) / _canvas.width()));
-	return std::clamp(fitted, Px(kPreviewMinHeight), Px(kPreviewMaxHeight));
+	return std::clamp(fitted, _minHeight, _maxHeight);
 }
 
 QRectF Preview::canvasRect() const {
@@ -1092,6 +1430,8 @@ void Preview::dragTo(QPointF point) {
 }
 
 void Preview::paintEvent(QPaintEvent *e) {
+	validateRotated();
+
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
 
@@ -1110,6 +1450,19 @@ void Preview::paintEvent(QPaintEvent *e) {
 			canvas.size()
 		).translated(canvas.topLeft());
 		p.drawImage(fitted, _rotated);
+		if (!_fx.isNull()) {
+			// Only what goes to the result gets the effects, the rest of
+			// the frame around the crop stays as it is. The picture made
+			// for a crop of other proportions (they were just chosen,
+			// the new one is on its way) is not squeezed into this one.
+			// While the crop is dragged the pictures follow it closely
+			// and one that is a bit late is better than a blink.
+			const auto target = cropShown() ? cropRect() : canvas;
+			if (_dragging != Handle::None
+				|| SameProportions(QSizeF(_fx.size()), target.size())) {
+				p.drawImage(target, _fx);
+			}
+		}
 		if (cropShown()) {
 			const auto crop = cropRect();
 			auto dim = QPainterPath();
@@ -1921,6 +2274,8 @@ enum class Glyph : uchar {
 	Undo,
 	Redo,
 	Add,
+	Effects,
+	Presets,
 };
 
 // Drawn in a 20x20 square.
@@ -2015,6 +2370,43 @@ void PaintGlyph(QPainter &p, Glyph glyph, QRectF rect, QColor color) {
 	case Glyph::Add:
 		p.drawLine(QPointF(10., 4.5), QPointF(10., 15.5));
 		p.drawLine(QPointF(4.5, 10.), QPointF(15.5, 10.));
+		break;
+	case Glyph::Effects: {
+		// A big sparkle and a small filled one. The sides bend towards
+		// the centre, but not all the way to it: rays, not hairs, and the
+		// small one is a star, not a plus.
+		const auto sparkle = [&](QPointF center, float64 radius) {
+			const auto bend = radius * 0.16;
+			auto path = QPainterPath();
+			path.moveTo(center.x(), center.y() - radius);
+			path.quadTo(
+				center + QPointF(bend, -bend),
+				QPointF(center.x() + radius, center.y()));
+			path.quadTo(
+				center + QPointF(bend, bend),
+				QPointF(center.x(), center.y() + radius));
+			path.quadTo(
+				center + QPointF(-bend, bend),
+				QPointF(center.x() - radius, center.y()));
+			path.quadTo(
+				center + QPointF(-bend, -bend),
+				QPointF(center.x(), center.y() - radius));
+			path.closeSubpath();
+			p.drawPath(path);
+		};
+		sparkle(QPointF(8.5, 11.5), 6.);
+		pen.setWidthF(0.8);
+		p.setPen(pen);
+		p.setBrush(color);
+		sparkle(QPointF(15.4, 5.), 3.2);
+	} break;
+	case Glyph::Presets:
+		// Four tiles.
+		for (const auto x : { 3.5, 11.5 }) {
+			for (const auto y : { 3.5, 11.5 }) {
+				p.drawRoundedRect(QRectF(x, y, 5., 5.), 1.3, 1.3);
+			}
+		}
 		break;
 	}
 	p.restore();
@@ -2118,8 +2510,8 @@ void ToolButton::paintEvent(QPaintEvent *e) {
 	const auto radius = Px(kCornerRadius);
 	p.setPen(Qt::NoPen);
 	p.setBrush((isOver() && !isDisabled())
-		? st::windowBgRipple
-		: st::windowBgOver);
+		? VideoFx::OverBg()
+		: st::windowBgOver->c);
 	p.drawRoundedRect(rect(), radius, radius);
 
 	const auto icon = Px(kToolIcon);
@@ -2261,6 +2653,104 @@ int ToolBar::resizeGetHeight(int newWidth) {
 	return height;
 }
 
+// A button as wide as the box that opens something bigger: an icon with
+// a title on the left, what is chosen there now on the right.
+class SummaryButton final : public Ui::AbstractButton {
+public:
+	SummaryButton(QWidget *parent, Glyph glyph, QString title);
+
+	void setSummary(const QString &summary);
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+	void paintEvent(QPaintEvent *e) override;
+	void onStateChanged(State was, StateChangeSource source) override;
+
+private:
+	const Glyph _glyph;
+	const QString _title;
+	QString _summary;
+
+};
+
+SummaryButton::SummaryButton(QWidget *parent, Glyph glyph, QString title)
+: AbstractButton(parent)
+, _glyph(glyph)
+, _title(std::move(title)) {
+	resize(width(), Px(kToolHeight));
+}
+
+void SummaryButton::setSummary(const QString &summary) {
+	if (_summary != summary) {
+		_summary = summary;
+		update();
+	}
+}
+
+int SummaryButton::resizeGetHeight(int newWidth) {
+	return Px(kToolHeight);
+}
+
+void SummaryButton::onStateChanged(State was, StateChangeSource source) {
+	update();
+}
+
+void SummaryButton::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+	if (isDisabled()) {
+		p.setOpacity(kDimmedOpacity);
+	}
+	const auto radius = Px(kCornerRadius);
+	p.setPen(Qt::NoPen);
+	p.setBrush((isOver() && !isDisabled())
+		? VideoFx::OverBg()
+		: st::windowBgOver->c);
+	p.drawRoundedRect(rect(), radius, radius);
+
+	const auto &font = st::normalFont;
+	const auto padding = Px(kToolPadding);
+	const auto icon = Px(kToolIcon);
+	PaintGlyph(
+		p,
+		_glyph,
+		QRectF(padding, (height() - icon) / 2., icon, icon),
+		st::windowFg->c);
+	const auto left = padding + icon + Px(kToolTextSkip);
+	const auto titleWidth = font->width(_title);
+	p.setFont(font);
+	p.setPen(st::windowFg);
+	p.drawText(
+		QRect(left, 0, std::max(width() - left - padding, 0), height()),
+		Qt::AlignLeft | Qt::AlignVCenter,
+		_title);
+
+	// An arrow at the right edge, the summary before it.
+	const auto arrow = Px(4);
+	const auto arrowRight = width() - padding - Px(2);
+	auto pen = QPen(st::windowSubTextFg->c);
+	pen.setWidthF(Px(16) / 10.);
+	pen.setCapStyle(Qt::RoundCap);
+	pen.setJoinStyle(Qt::RoundJoin);
+	p.setPen(pen);
+	auto path = QPainterPath();
+	path.moveTo(arrowRight - arrow, height() / 2. - arrow);
+	path.lineTo(arrowRight, height() / 2.);
+	path.lineTo(arrowRight - arrow, height() / 2. + arrow);
+	p.setBrush(Qt::NoBrush);
+	p.drawPath(path);
+
+	const auto summaryRight = arrowRight - arrow - Px(8);
+	const auto available = summaryRight - left - titleWidth - Px(16);
+	if (!_summary.isEmpty() && available > Px(40)) {
+		p.setPen(st::windowSubTextFg);
+		p.drawText(
+			QRect(summaryRight - available, 0, available, height()),
+			Qt::AlignRight | Qt::AlignVCenter,
+			font->elided(_summary, available));
+	}
+}
+
 // Choices filling the whole width, in as few rows as their texts need.
 class Chips final : public Ui::RpWidget {
 public:
@@ -2397,10 +2887,10 @@ void Chips::paintEvent(QPaintEvent *e) {
 		const auto radius = rect.height() / 2.;
 		p.setPen(Qt::NoPen);
 		p.setBrush(selected
-			? st::activeButtonBg
+			? st::activeButtonBg->c
 			: (i == _over && !_dimmed)
-			? st::windowBgRipple
-			: st::windowBgOver);
+			? VideoFx::OverBg()
+			: st::windowBgOver->c);
 		p.drawRoundedRect(rect, radius, radius);
 
 		// A dimmed chosen chip is nearly of the colour of the box, the
@@ -2606,6 +3096,189 @@ void Transport::paintEvent(QPaintEvent *e) {
 			QRect(width() - available, 0, available, height()),
 			Qt::AlignRight | Qt::AlignVCenter,
 			font->elided(_info, available));
+	}
+}
+
+// The play button, a line to seek by and the time: what the box of the
+// effects has in place of the timeline.
+class SeekBar final : public Ui::RpWidget {
+public:
+	explicit SeekBar(QWidget *parent);
+
+	void setPlaying(bool playing);
+	void setPlayEnabled(bool enabled);
+	void setProgress(float64 progress);
+	void setTime(const QString &time);
+
+	[[nodiscard]] rpl::producer<> playClicks() const;
+
+	// The place in the whole video, 0..1.
+	[[nodiscard]] rpl::producer<float64> seeks() const {
+		return _seeks.events();
+	}
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+	void paintEvent(QPaintEvent *e) override;
+	void mousePressEvent(QMouseEvent *e) override;
+	void mouseMoveEvent(QMouseEvent *e) override;
+	void mouseReleaseEvent(QMouseEvent *e) override;
+
+private:
+	[[nodiscard]] QRect track() const;
+	[[nodiscard]] bool overTrack(QPoint point) const;
+	void seekTo(int x);
+
+	const not_null<PlayButton*> _play;
+	QString _time;
+	int _timeWidth = 0;
+	float64 _progress = 0.;
+	bool _enabled = false;
+	bool _seeking = false;
+	rpl::event_stream<float64> _seeks;
+
+};
+
+SeekBar::SeekBar(QWidget *parent)
+: RpWidget(parent)
+, _play(Ui::CreateChild<PlayButton>(this)) {
+	setMouseTracking(true);
+	resize(width(), Px(kPlaySize));
+	_play->move(0, 0);
+}
+
+void SeekBar::setPlaying(bool playing) {
+	_play->setPlaying(playing);
+}
+
+void SeekBar::setPlayEnabled(bool enabled) {
+	_enabled = enabled;
+	_play->setDisabled(!enabled);
+	if (!enabled) {
+		_seeking = false;
+	}
+}
+
+void SeekBar::setProgress(float64 progress) {
+	progress = std::clamp(progress, 0., 1.);
+	if (_progress != progress) {
+		_progress = progress;
+		update();
+	}
+}
+
+void SeekBar::setTime(const QString &time) {
+	if (_time != time) {
+		_time = time;
+
+		// The line doesn't get longer and shorter with the digits.
+		_timeWidth = std::max(_timeWidth, st::normalFont->width(time));
+		update();
+	}
+}
+
+rpl::producer<> SeekBar::playClicks() const {
+	return _play->clicks() | rpl::to_empty;
+}
+
+int SeekBar::resizeGetHeight(int newWidth) {
+	return Px(kPlaySize);
+}
+
+QRect SeekBar::track() const {
+	const auto left = _play->width() + Px(14);
+	const auto right = width() - _timeWidth - Px(14);
+	const auto line = Px(kProgressHeight);
+	return QRect(
+		left,
+		(height() - line) / 2,
+		std::max(right - left, 0),
+		line);
+}
+
+bool SeekBar::overTrack(QPoint point) const {
+	const auto area = track();
+	const auto slop = Px(6);
+	return _enabled
+		&& (area.width() > 0)
+		&& (point.x() >= area.x() - slop)
+		&& (point.x() <= area.x() + area.width() + slop);
+}
+
+void SeekBar::seekTo(int x) {
+	const auto area = track();
+	if (area.width() <= 0) {
+		return;
+	}
+	const auto progress = std::clamp(
+		(x - area.x()) / float64(area.width()),
+		0.,
+		1.);
+	_seeks.fire_copy(progress);
+}
+
+void SeekBar::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+
+	const auto &font = st::normalFont;
+	p.setFont(font);
+	p.setPen(st::windowFg);
+	p.drawText(
+		QRect(0, 0, width(), height()),
+		Qt::AlignRight | Qt::AlignVCenter,
+		_time);
+
+	const auto area = QRectF(track());
+	if (area.width() <= 0.) {
+		return;
+	}
+	const auto radius = area.height() / 2.;
+	p.setPen(Qt::NoPen);
+
+	// As the sliders of the effects under it: windowBgOver is hardly seen
+	// on the box in the dark themes.
+	p.setBrush(st::mediaPlayerInactiveFg);
+	p.drawRoundedRect(area, radius, radius);
+	const auto x = area.x() + area.width() * _progress;
+	if (x > area.x()) {
+		p.setBrush(st::activeButtonBg);
+		p.drawRoundedRect(
+			QRectF(
+				area.x(),
+				area.y(),
+				std::max(x - area.x(), area.height()),
+				area.height()),
+			radius,
+			radius);
+	}
+	if (_enabled) {
+		const auto knob = float64(Px(6));
+		p.setBrush(st::activeButtonBg);
+		p.drawEllipse(QPointF(x, area.center().y()), knob, knob);
+	}
+}
+
+void SeekBar::mousePressEvent(QMouseEvent *e) {
+	if (e->button() == Qt::LeftButton && overTrack(e->pos())) {
+		_seeking = true;
+		seekTo(e->pos().x());
+	}
+}
+
+void SeekBar::mouseMoveEvent(QMouseEvent *e) {
+	if (_seeking) {
+		seekTo(e->pos().x());
+	} else {
+		setCursor(overTrack(e->pos())
+			? style::cur_pointer
+			: style::cur_default);
+	}
+}
+
+void SeekBar::mouseReleaseEvent(QMouseEvent *e) {
+	if (e->button() == Qt::LeftButton) {
+		_seeking = false;
 	}
 }
 
@@ -3662,6 +4335,11 @@ struct EditorArgs {
 	std::optional<State> state;
 	crl::time position = 0;
 	Fn<void(not_null<Editor*>)> created;
+
+	// Opens the box of the effects as soon as the video is opened, with
+	// the parameters of that effect shown, -1 for none of them (used by
+	// the UI snapshots).
+	std::optional<int> effects;
 };
 
 class Editor final : public base::has_weak_ptr {
@@ -3705,8 +4383,29 @@ private:
 
 	void setupPreview(not_null<Ui::VerticalLayout*> container);
 	void setupTimeline(not_null<Ui::VerticalLayout*> container);
+	void setupEffects(not_null<Ui::VerticalLayout*> container);
 	void setupFrame(not_null<Ui::VerticalLayout*> container);
 	void setupSound(not_null<Ui::VerticalLayout*> container);
+
+	// The effects: their box over the editor and the preview of them.
+	void showEffects(int expanded, anim::type animated);
+	void setupEffectsBox(not_null<Ui::GenericBox*> box, int expanded);
+	void effectsBoxClosed();
+	void effectsStarted();
+	void effectsChanged(const VideoFx::Stack &stack, bool tuning);
+	void refreshEffects();
+	[[nodiscard]] bool handleEffectsKey(not_null<QKeyEvent*> e);
+	[[nodiscard]] bool fxShown() const; // Some effect is switched on.
+	[[nodiscard]] bool fxWanted() const; // Or the box of them is open.
+	[[nodiscard]] bool fxStale() const;
+	void fillFx(
+		StillRequest &request,
+		FxQuality quality,
+		const Clip &clip,
+		crl::time clipStart) const;
+	void showFrames(QImage frame, QImage fx);
+	void syncFxPlayback();
+	[[nodiscard]] QString timeText() const;
 
 	void setPhase(Phase phase);
 	void fail(const QString &text);
@@ -3719,7 +4418,7 @@ private:
 	void requestThumbnails(int index);
 	void storeThumbnail(int source, crl::time position, QImage image);
 	void refineThumbnails();
-	void requestFrame();
+	void requestFrame(FxQuality quality = FxQuality::Full);
 
 	[[nodiscard]] const std::vector<Clip> &clips() const {
 		return _project.state.clips;
@@ -3748,7 +4447,7 @@ private:
 	void refreshAll();
 	void refreshTransport();
 
-	void seek(crl::time position);
+	void seek(crl::time position, FxQuality quality = FxQuality::Full);
 	void step(crl::time delta);
 	void split();
 	void removeClip();
@@ -3760,8 +4459,13 @@ private:
 	[[nodiscard]] bool handleKey(not_null<QKeyEvent*> e);
 
 	void togglePlay();
-	void playClip(int index, crl::time from);
-	void playbackFrame(int generation, int index, crl::time at, QImage frame);
+	void playClip(int index, crl::time from, bool first);
+	void playbackFrame(
+		int generation,
+		int index,
+		crl::time at,
+		QImage frame,
+		QImage fx);
 	void playbackFinished(int generation, int index, bool ok);
 	void stopPlayback();
 
@@ -3777,6 +4481,7 @@ private:
 	std::optional<State> _initialState;
 	crl::time _initialPosition = 0;
 	std::optional<Stashed> _initialStashed;
+	std::optional<int> _initialEffects;
 
 	Project _project;
 	std::vector<std::unique_ptr<Runtime>> _runtime;
@@ -3799,6 +4504,16 @@ private:
 
 	const std::shared_ptr<std::atomic<int>> _frameRequest;
 	int _frameShown = 0;
+	int _stillSerial = 0; // Of the video the last paused frame is from.
+
+	// What the last paused frame was asked with. The same one is not asked
+	// again, and a frame with only other effects does not stop the one
+	// that is being made: its picture is shown too (a slider of an effect
+	// is dragged and the preview follows it), what was read for it is
+	// used by the next one. The epoch changes when all of that is of no
+	// use: another frame is asked for, the video plays, the editor is gone.
+	std::optional<StillRequest> _stillAsked;
+	const std::shared_ptr<std::atomic<int>> _stillEpoch;
 	const std::shared_ptr<std::atomic<int>> _thumbnailRequest;
 	int _thumbnailsPending = 0;
 	base::Timer _refineTimer;
@@ -3806,6 +4521,31 @@ private:
 	VideoCore::Cancel _playCancel;
 	int _playGeneration = 0;
 	bool _playing = false;
+
+	// The effects of the playback that goes on, see FxPlayback.
+	std::shared_ptr<FxPlayback> _fxPlayback;
+
+	// What the last paused frame was asked for: when something the
+	// effects depend on is different, the frame is asked again.
+	State _fxAskedState;
+	crl::time _fxAskedPosition = -1;
+	bool _fxAskedBox = false;
+	base::Timer _fxRefresh;
+
+	// A rough frame was asked for, a good one follows it after a while.
+	base::Timer _fxSettle;
+
+	// The box of the effects, while it is shown over the editor. All of
+	// it may be destroyed before the editor and after it.
+	QPointer<Ui::GenericBox> _fxBox;
+	QPointer<Preview> _fxPreview;
+	QPointer<SeekBar> _fxSeek;
+	QPointer<VideoFx::Panel> _fxPanel;
+	QPointer<ToolButton> _fxUndoButton;
+	QPointer<ToolButton> _fxRedoButton;
+	QPointer<QWidget> _fxClearButton;
+	QPointer<Ui::SlideWrap<Ui::FlatLabel>> _fxHint;
+	QImage _fxLast; // For the preview of the box when it is opened.
 
 	Preview *_preview = nullptr;
 	Transport *_transport = nullptr;
@@ -3819,6 +4559,7 @@ private:
 	ToolButton *_undoButton = nullptr;
 	ToolButton *_redoButton = nullptr;
 	ToolButton *_addButton = nullptr;
+	SummaryButton *_effectsButton = nullptr;
 	Chips *_aspects = nullptr;
 	Fn<void(int)> _setSpeed;
 	Fn<void(bool)> _dimSpeed;
@@ -3842,10 +4583,22 @@ Editor::Editor(not_null<Ui::GenericBox*> box, EditorArgs &&args)
 , _initialState(std::move(args.state))
 , _initialPosition(args.position)
 , _initialStashed(std::move(args.stashed))
+, _initialEffects(args.effects)
 , _thumbs(std::make_shared<ThumbStore>())
 , _frameRequest(std::make_shared<std::atomic<int>>(0))
+, _stillEpoch(std::make_shared<std::atomic<int>>(0))
 , _thumbnailRequest(std::make_shared<std::atomic<int>>(0))
-, _refineTimer([=] { refineThumbnails(); }) {
+, _refineTimer([=] { refineThumbnails(); })
+, _fxRefresh([=] {
+	if (ready() && !_playing && !_closed && fxStale()) {
+		requestFrame();
+	}
+})
+, _fxSettle([=] {
+	if (ready() && !_playing && !_closed) {
+		requestFrame();
+	}
+}) {
 	Editors().push_back(this);
 }
 
@@ -3859,6 +4612,7 @@ Editor::~Editor() {
 
 	// Whatever still waits in the queues of the sources is skipped.
 	++*_frameRequest;
+	++*_stillEpoch;
 	++*_thumbnailRequest;
 }
 
@@ -3907,6 +4661,8 @@ void Editor::closing() {
 	}
 	stopPlayback();
 	_refineTimer.cancel();
+	_fxRefresh.cancel();
+	_fxSettle.cancel();
 	if (_discard || !hasChanges() || !_session.stash || Core::Quitting()) {
 		return;
 	}
@@ -3926,6 +4682,7 @@ void Editor::setup() {
 	setupPreview(content);
 	_controls = content->add(object_ptr<Ui::VerticalLayout>(content));
 	setupTimeline(_controls);
+	setupEffects(_controls);
 	setupFrame(_controls);
 	setupSound(_controls);
 	Ui::AddSkip(content, st::boxLittleSkip);
@@ -4018,6 +4775,10 @@ void Editor::setupPreview(not_null<Ui::VerticalLayout*> container) {
 			pushUndo();
 		}
 		_project.state.crop = crop;
+		if (fxWanted()) {
+			// The effects get another part of the frame.
+			requestFrame(FxQuality::Rough);
+		}
 		refreshAll();
 	}, _preview->lifetime());
 
@@ -4042,7 +4803,7 @@ void Editor::setupTimeline(not_null<Ui::VerticalLayout*> container) {
 	});
 	_timeline->seeks() | rpl::on_next([=](crl::time position) {
 		stopPlayback();
-		seek(position);
+		seek(position, FxQuality::Rough);
 	}, _timeline->lifetime());
 	_timeline->trimStarts() | rpl::on_next([=] {
 		stopPlayback();
@@ -4065,8 +4826,8 @@ void Editor::setupTimeline(not_null<Ui::VerticalLayout*> container) {
 			+ ((trim.edge == Timeline::Edge::End)
 				? std::max(clip.length() - 1, crl::time(0))
 				: crl::time(0));
+		requestFrame(FxQuality::Rough);
 		refreshAll();
-		requestFrame();
 	}, _timeline->lifetime());
 	_timeline->trimFinishes() | rpl::on_next([=] {
 		_dragUndoPending = false;
@@ -4130,6 +4891,388 @@ void Editor::setupTimeline(not_null<Ui::VerticalLayout*> container) {
 		st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
 }
 
+void Editor::setupEffects(not_null<Ui::VerticalLayout*> container) {
+	_effectsButton = container->add(
+		object_ptr<SummaryButton>(
+			container,
+			Glyph::Effects,
+			tr::lng_oblivion_vfx_title(tr::now)),
+		st::boxRowPadding + QMargins(0, st::boxMediumSkip, 0, 0));
+	_effectsButton->setClickedCallback([=] {
+		_timeline->setFocus();
+		showEffects(-1, anim::type::normal);
+	});
+}
+
+bool Editor::fxShown() const {
+	return VideoFx::HasEnabled(_project.state.fx);
+}
+
+bool Editor::fxWanted() const {
+	return fxShown() || !_fxPreview.isNull();
+}
+
+// Whether the paused frame that was asked for the last time is not what
+// the effects would show now.
+bool Editor::fxStale() const {
+	return fxWanted()
+		&& ((_fxAskedPosition != _position)
+			|| (_fxAskedBox != !_fxPreview.isNull())
+			|| (_fxAskedState != _project.state));
+}
+
+QString Editor::timeText() const {
+	const auto &state = _project.state;
+	const auto speed = std::max(state.speed, 1);
+	return FormatTime(_position * 100 / speed)
+		+ u" / "_q
+		+ FormatTime(VideoEdit::OutputDuration(state));
+}
+
+// The box of the effects is shown over the editor, as the export box is:
+// a smaller preview that stays in place, with a line to seek by, and the
+// list of the effects that scrolls under it. Every change goes to the
+// project at once, so nothing is lost however the box is closed.
+void Editor::showEffects(int expanded, anim::type animated) {
+	if (!ready() || _closed || _fxBox) {
+		return;
+	}
+	const auto weak = base::make_weak(this);
+	auto box = Box([=](not_null<Ui::GenericBox*> box) {
+		if (const auto strong = weak.get()) {
+			strong->setupEffectsBox(box, expanded);
+		}
+	});
+	_fxBox = box.data();
+	_show->showBox(std::move(box), Ui::LayerOption::KeepOther, animated);
+}
+
+void Editor::setupEffectsBox(not_null<Ui::GenericBox*> box, int expanded) {
+	const auto weak = base::make_weak(this);
+	const auto width = BoxWidth(_show, kBoxWidth);
+	box->setTitle(tr::lng_oblivion_vfx_title());
+	box->setWidth(width);
+	box->setMinHeight(Px(kFxBoxMinHeight));
+
+	// A click outside closes all the boxes: the editor under this one too.
+	box->setCloseByOutsideClick(false);
+
+	const auto top = box->setPinnedToTopContent(
+		object_ptr<Ui::VerticalLayout>(box));
+	Ui::AddSkip(top, st::boxLittleSkip);
+	const auto preview = top->add(
+		object_ptr<Preview>(top),
+		st::boxRowPadding);
+
+	// In a low window the preview leaves some place for the list, in
+	// a tall one they share what is there above the usual height: the
+	// small things an effect draws (the labels of the tracking) are
+	// easier to see in a bigger picture.
+	const auto window = _show ? _show->toastParent()->height() : 0;
+	const auto usual = Px(kFxPreviewHeight);
+	const auto spare = window - Px(kFxBoxRest);
+	preview->setHeightLimits(
+		Px(kFxPreviewMinHeight),
+		((window > 0)
+			? std::clamp(
+				(spare > usual) ? (usual + (spare - usual) / 2) : spare,
+				Px(kFxPreviewMinHeight),
+				Px(kFxPreviewMaxHeight))
+			: usual));
+	preview->setInteractive(true);
+	if (!_fxLast.isNull()) {
+		preview->setFrame(_fxLast);
+	} else if (_frameShown == _frameRequest->load()) {
+		// The picture of the box that was here before is not kept without
+		// the effects, and no frame is on its way: the one that was asked
+		// for the last time doesn't count as shown, it is asked again.
+		_fxAskedBox = false;
+		_stillAsked = std::nullopt;
+	}
+	const auto seekBar = top->add(
+		object_ptr<SeekBar>(top),
+		st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
+	const auto tools = top->add(
+		object_ptr<ToolBar>(top),
+		st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
+	Ui::AddSkip(top, st::boxLittleSkip);
+
+	const auto content = box->verticalLayout();
+	Ui::AddSkip(content, st::boxLittleSkip);
+	const auto holder = box->lifetime().make_state<
+		QPointer<VideoFx::Panel>>();
+	const auto panel = content->add(
+		object_ptr<VideoFx::Panel>(content, VideoFx::PanelArgs{
+			.show = _show,
+			.stack = _project.state.fx,
+			.expanded = expanded,
+			.started = [=] {
+				if (const auto strong = weak.get()) {
+					strong->effectsStarted();
+				}
+			},
+			.changed = [=](const VideoFx::Stack &stack, bool tuning) {
+				if (const auto strong = weak.get()) {
+					strong->effectsChanged(stack, tuning);
+				}
+			},
+			.revealed = [=](int from, int till) {
+				if (const auto shown = holder->data()) {
+					box->scrollToY(shown->y() + from, shown->y() + till);
+				}
+			},
+		}),
+		st::boxRowPadding);
+	*holder = panel;
+
+	// Not under the text of an empty list: two grey paragraphs in a row.
+	const auto hint = content->add(
+		object_ptr<Ui::SlideWrap<Ui::FlatLabel>>(
+			content,
+			object_ptr<Ui::FlatLabel>(
+				content,
+				tr::lng_oblivion_vfx_hint(),
+				st::boxDividerLabel),
+			(st::boxRowPadding
+				+ QMargins(0, st::boxMediumSkip, 0, st::boxLittleSkip))));
+	hint->toggle(!_project.state.fx.empty(), anim::type::instant);
+
+	const auto tool = [&](
+			Glyph glyph,
+			const QString &text,
+			int keep,
+			bool right) {
+		return tools->add(glyph, text, keep, right).get();
+	};
+	const auto addButton = tool(
+		Glyph::Add,
+		tr::lng_oblivion_vfx_add(tr::now),
+		2,
+		false);
+	const auto presetsButton = tool(
+		Glyph::Presets,
+		tr::lng_oblivion_vfx_presets(tr::now),
+		1,
+		false);
+	const auto undoButton = tool(Glyph::Undo, QString(), 0, true);
+	undoButton->setTooltip(tr::lng_oblivion_video_undo(tr::now));
+	const auto redoButton = tool(Glyph::Redo, QString(), 0, true);
+	redoButton->setTooltip(tr::lng_oblivion_video_redo(tr::now));
+	const auto under = [](not_null<ToolButton*> button) {
+		return button->mapToGlobal(QPoint(0, button->height()));
+	};
+	addButton->setClickedCallback([=] {
+		panel->showAddMenu(under(addButton));
+	});
+	presetsButton->setClickedCallback([=] {
+		panel->showPresetsMenu(under(presetsButton));
+	});
+	undoButton->setClickedCallback([=] {
+		if (const auto strong = weak.get()) {
+			strong->undo();
+		}
+	});
+	redoButton->setClickedCallback([=] {
+		if (const auto strong = weak.get()) {
+			strong->redo();
+		}
+	});
+	top->resizeToWidth(width);
+
+	preview->clicks() | rpl::on_next([=] {
+		if (const auto strong = weak.get()) {
+			strong->togglePlay();
+		}
+	}, preview->lifetime());
+	seekBar->playClicks() | rpl::on_next([=] {
+		if (const auto strong = weak.get()) {
+			strong->togglePlay();
+		}
+	}, seekBar->lifetime());
+	seekBar->seeks() | rpl::on_next([=](float64 progress) {
+		if (const auto strong = weak.get()) {
+			strong->stopPlayback();
+			strong->seek(
+				crl::time(std::round(progress * strong->total())),
+				FxQuality::Rough);
+		}
+	}, seekBar->lifetime());
+
+	// Space and the undo work here as in the editor, Escape closes the box.
+	box->events(
+	) | rpl::filter([](not_null<QEvent*> e) {
+		return (e->type() == QEvent::KeyPress);
+	}) | rpl::on_next([=](not_null<QEvent*> e) {
+		const auto strong = weak.get();
+		if (strong
+			&& strong->handleEffectsKey(static_cast<QKeyEvent*>(e.get()))) {
+			e->accept();
+		}
+	}, box->lifetime());
+
+	box->addButton(tr::lng_oblivion_vfx_done(), [=] {
+		box->closeBox();
+	});
+	_fxClearButton = box->addLeftButton(
+		tr::lng_oblivion_vfx_remove_all(),
+		[=] { panel->removeAll(); }).data();
+	box->boxClosing() | rpl::on_next([=] {
+		if (const auto strong = weak.get()) {
+			strong->effectsBoxClosed();
+		}
+	}, box->lifetime());
+
+	_fxPreview = preview;
+	_fxSeek = seekBar;
+	_fxPanel = panel;
+	_fxUndoButton = undoButton;
+	_fxRedoButton = redoButton;
+	_fxHint = hint;
+	syncFxPlayback();
+	refreshAll();
+}
+
+// The user has closed the box. When it is destroyed with the other layers
+// (see Stashed) nothing has to be done, the pointers to it reset themselves.
+void Editor::effectsBoxClosed() {
+	_fxBox = nullptr;
+	_fxPreview = nullptr;
+	_fxSeek = nullptr;
+	_fxPanel = nullptr;
+	_fxUndoButton = nullptr;
+	_fxRedoButton = nullptr;
+	_fxClearButton = nullptr;
+	_fxHint = nullptr;
+	if (_closed) {
+		return;
+	}
+	syncFxPlayback();
+	refreshAll();
+}
+
+void Editor::effectsStarted() {
+	if (ready()) {
+		pushUndo();
+	}
+}
+
+void Editor::effectsChanged(const VideoFx::Stack &stack, bool tuning) {
+	if (!ready()) {
+		return;
+	}
+	_project.state.fx = stack;
+	if (_playing) {
+		// The frames that are read next get the new effects.
+		syncFxPlayback();
+	} else {
+		requestFrame(tuning ? FxQuality::Tuning : FxQuality::Full);
+	}
+	refreshAll();
+}
+
+bool Editor::handleEffectsKey(not_null<QKeyEvent*> e) {
+	if (!ready()) {
+		return false;
+	}
+	const auto key = e->key();
+	const auto modifiers = e->modifiers();
+	if (modifiers & Qt::ControlModifier) {
+		if (key == Qt::Key_Z) {
+			if (modifiers & Qt::ShiftModifier) {
+				redo();
+			} else {
+				undo();
+			}
+			return true;
+		} else if (key == Qt::Key_Y) {
+			redo();
+			return true;
+		}
+		return false;
+	} else if (modifiers & (Qt::AltModifier | Qt::MetaModifier)) {
+		return false;
+	} else if (key == Qt::Key_Space) {
+		if (!e->isAutoRepeat()) {
+			togglePlay();
+		}
+		return true;
+	}
+	return false;
+}
+
+// What a playback that goes on shows: the effects as they are now, and
+// the part for the result even without them while the box needs it.
+void Editor::syncFxPlayback() {
+	if (const auto playback = _fxPlayback) {
+		const auto lock = std::unique_lock(playback->mutex);
+		playback->stack = _project.state.fx;
+		playback->always = !_fxPreview.isNull();
+		++playback->version;
+	}
+}
+
+void Editor::showFrames(QImage frame, QImage fx) {
+	if (!frame.isNull()) {
+		_preview->setFrame(std::move(frame));
+	}
+	_preview->setFx(fxShown() ? fx : QImage());
+	if (fx.isNull()) {
+		return;
+	}
+	_fxLast = fx;
+	if (const auto preview = _fxPreview.data()) {
+		preview->setFrame(std::move(fx));
+	}
+}
+
+// Everything about the effects on the screen from the state.
+void Editor::refreshEffects() {
+	const auto &state = _project.state;
+	const auto editable = ready();
+	const auto summary = VideoFx::Summary(state.fx);
+	_effectsButton->setDisabled(!editable);
+	_effectsButton->setSummary(!summary.isEmpty()
+		? summary
+		: state.fx.empty()
+		? tr::lng_oblivion_vfx_none(tr::now)
+		: tr::lng_oblivion_vfx_all_off(tr::now));
+	if (!fxShown()) {
+		_preview->setFx(QImage());
+	}
+	if (!fxWanted()) {
+		_fxLast = QImage();
+	}
+	if (const auto preview = _fxPreview.data()) {
+		// It shows the result: what is inside of the crop, turned.
+		preview->setCanvas(
+			VideoEdit::CropRect(_canvas, state.crop).size(),
+			0);
+	}
+	if (const auto button = _fxUndoButton.data()) {
+		button->setDisabled(!editable || _undo.empty());
+	}
+	if (const auto button = _fxRedoButton.data()) {
+		button->setDisabled(!editable || _redo.empty());
+	}
+	if (const auto button = _fxClearButton.data()) {
+		// Nothing to remove: the button is not there.
+		button->setVisible(!state.fx.empty());
+	}
+	if (const auto hint = _fxHint.data()) {
+		if (hint->toggled() == state.fx.empty()) {
+			hint->toggle(!state.fx.empty(), anim::type::instant);
+		}
+	}
+	if (const auto panel = _fxPanel.data()) {
+		panel->setStack(state.fx);
+	}
+	if (editable && !_playing && !_closed && fxStale()) {
+		// Not at once: the one who has changed the state may be asking
+		// for the frame right after this.
+		_fxRefresh.callOnce(0);
+	}
+}
+
 void Editor::setupFrame(not_null<Ui::VerticalLayout*> container) {
 	container->add(
 		object_ptr<Ui::FlatLabel>(
@@ -4175,6 +5318,10 @@ void Editor::setupSound(not_null<Ui::VerticalLayout*> container) {
 		[=](int speed) {
 			_project.state.speed = speed;
 			_shownSpeed = speed;
+			if (fxWanted()) {
+				// The effects that depend on the time look different.
+				requestFrame(FxQuality::Rough);
+			}
 			refreshAll();
 		});
 	_setSpeed = std::move(slider.set);
@@ -4345,6 +5492,14 @@ void Editor::sourceProbed(Source source) {
 	if (added) {
 		requestThumbnails(index);
 	}
+	if (first && _initialEffects) {
+		// After everything that is going on now.
+		crl::on_main(this, [=] {
+			if (const auto expanded = base::take(_initialEffects)) {
+				showEffects(*expanded, anim::type::instant);
+			}
+		});
+	}
 }
 
 // A project kept when the editor was closed: all its videos were opened
@@ -4473,7 +5628,51 @@ void Editor::refineThumbnails() {
 	}
 }
 
-void Editor::requestFrame() {
+// The part of the frame that goes to the result, for the effects.
+void Editor::fillFx(
+		StillRequest &request,
+		FxQuality quality,
+		const Clip &clip,
+		crl::time clipStart) const {
+	if (!fxWanted() || _canvas.isEmpty()) {
+		return;
+	}
+	const auto &state = _project.state;
+
+	// With the effects that need the frames before, the size stays the
+	// same while a parameter is tuned: those frames are kept.
+	const auto before = VideoFx::Preroll(state.fx);
+	const auto side = (quality == FxQuality::Rough)
+		? kFxRoughSide
+		: (before > kFxLongPreroll)
+		? kFxLongTemporalSide
+		: (before > 0)
+		? kFxTemporalSide
+		: (quality == FxQuality::Tuning)
+		? kFxPlaySide
+		: kFxStillSide;
+	const auto speed = std::max(state.speed, 1);
+	request.canvas = _canvas;
+	request.crop = VideoEdit::CropRect(_canvas, state.crop);
+	request.output = VideoEdit::PreviewSize(
+		request.crop.size(),
+		std::min(side, request.side)); // Not more than the screen shows.
+	request.rotation = state.rotation;
+	request.stack = state.fx;
+	request.speed = speed;
+	request.resultPosition = (clipStart + (request.position - clip.from))
+		* 100
+		/ speed;
+
+	// The frames before are read only inside of the clip, and not while
+	// something is being dragged: it takes time.
+	const auto preroll = (quality == FxQuality::Rough)
+		? crl::time(0)
+		: (before * speed / 100);
+	request.prerollFrom = std::max(clip.from, request.position - preroll);
+}
+
+void Editor::requestFrame(FxQuality quality) {
 	if (clips().empty()) {
 		return;
 	}
@@ -4483,29 +5682,84 @@ void Editor::requestFrame() {
 		located.position,
 		clip.from,
 		std::max(clip.till - 1, clip.from));
+	auto request = StillRequest{ .position = position, .side = frameSide() };
+	fillFx(request, quality, clip, located.start);
+	_fxAskedState = _project.state;
+	_fxAskedPosition = _position;
+	_fxAskedBox = !_fxPreview.isNull();
+	_fxRefresh.cancel();
+
+	const auto serial = _runtime[clip.source]->serial;
+	const auto change = (_stillAsked && _stillSerial == serial)
+		? CompareStills(*_stillAsked, request)
+		: StillChange::Frame;
+	if (change == StillChange::None) {
+		// A good frame that is the same as the rough one before it.
+		if (quality == FxQuality::Full) {
+			_fxSettle.cancel();
+		}
+		return;
+	}
 	if (_thumbnailsPending) {
 		// The frame is more important than the thumbnails that wait in
 		// the same queue: they are skipped and asked again later.
 		++*_thumbnailRequest;
 		_refineTimer.callOnce(kRefineDelay);
 	}
+	if (quality != FxQuality::Full && !request.output.isEmpty()) {
+		_fxSettle.callOnce(kFxSettleDelay);
+	} else {
+		_fxSettle.cancel();
+	}
+
+	// Only one video keeps what its paused frame was made of.
+	if (_stillSerial && _stillSerial != serial) {
+		for (const auto &other : _runtime) {
+			if (other->serial == _stillSerial) {
+				other->media.with([](QueuedMedia &media) {
+					media.forget();
+				});
+				break;
+			}
+		}
+	}
+	_stillSerial = serial;
+	_stillAsked = request;
+
+	const auto epoch = _stillEpoch;
+	const auto era = (change == StillChange::Frame)
+		? ++*epoch
+		: epoch->load();
 	const auto latest = _frameRequest;
 	const auto id = ++*latest;
-	const auto side = frameSide();
 	const auto weak = base::make_weak(this);
-	_runtime[clip.source]->media.with([=](QueuedMedia &media) {
+	_runtime[clip.source]->media.with([
+		=,
+		request = std::move(request)
+	](QueuedMedia &media) {
 		if (*latest != id) {
 			return;
 		}
-		auto frame = media.get().frame(position, side);
-		crl::on_main(weak, [=, frame = std::move(frame)]() mutable {
-			if (*latest != id) {
+		auto result = media.still(request, [&] {
+			return (*epoch != era);
+		});
+		if (result.cancelled) {
+			return;
+		}
+		crl::on_main(weak, [=, result = std::move(result)]() mutable {
+			// A frame that was asked for later is shown already, or the
+			// video plays. Otherwise a frame is shown even when a newer
+			// one is asked for: while a slider of an effect is dragged
+			// there always is one.
+			if (id <= _frameShown) {
 				return;
 			}
 			_frameShown = id;
-			if (!frame.isNull()) {
-				_preview->setFrame(std::move(frame));
+			if (result.raw.isNull() && id == _frameRequest->load()) {
+				// It could not be read: asking again is not a repeat.
+				_stillAsked = std::nullopt;
 			}
+			showFrames(std::move(result.raw), std::move(result.fx));
 		});
 	});
 }
@@ -4517,6 +5771,11 @@ bool Editor::idle() const {
 		|| _opening
 		|| _thumbnailsPending
 		|| _refineTimer.isActive()
+		|| _fxRefresh.isActive()
+		|| _fxSettle.isActive()
+		|| _initialEffects
+		|| (_fxPreview && !_fxPreview->hasFrame())
+		|| (_fxPanel && _fxPanel->rebuilding())
 		|| !_preview->hasFrame()
 		|| _frameShown != _frameRequest->load()) {
 		return false;
@@ -4667,16 +5926,18 @@ void Editor::canvasChanged() {
 }
 
 void Editor::refreshTransport() {
-	const auto &state = _project.state;
-	const auto speed = std::max(state.speed, 1);
 	if (clips().empty()) {
 		_transport->setTime(QString());
 		_transport->setInfo(QString());
 		return;
 	}
-	_transport->setTime(FormatTime(_position * 100 / speed)
-		+ u" / "_q
-		+ FormatTime(VideoEdit::OutputDuration(state)));
+	const auto time = timeText();
+	_transport->setTime(time);
+	if (const auto seekBar = _fxSeek.data()) {
+		const auto whole = total();
+		seekBar->setTime(time);
+		seekBar->setProgress(whole ? (_position / float64(whole)) : 0.);
+	}
 
 	// What an MP4 of the best quality is, as the export box says it: not
 	// the crop in the pixels of the source.
@@ -4720,7 +5981,12 @@ void Editor::refreshAll() {
 
 	_transport->setPlayEnabled(editable);
 	_transport->setPlaying(_playing);
+	if (const auto seekBar = _fxSeek.data()) {
+		seekBar->setPlayEnabled(editable);
+		seekBar->setPlaying(_playing);
+	}
 	refreshTransport();
+	refreshEffects();
 
 	const auto count = int(clips().size());
 	_splitButton->setDisabled(!canSplit());
@@ -4751,7 +6017,7 @@ void Editor::refreshAll() {
 		Ui::Checkbox::NotifyAboutChange::DontNotify);
 }
 
-void Editor::seek(crl::time position) {
+void Editor::seek(crl::time position, FxQuality quality) {
 	if (!ready()) {
 		return;
 	}
@@ -4762,13 +6028,17 @@ void Editor::seek(crl::time position) {
 	}
 	_position = position;
 	_selected = index;
+	requestFrame(quality);
 	refreshAll();
-	requestFrame();
 }
 
 void Editor::step(crl::time delta) {
 	stopPlayback();
-	seek(_position + delta * std::max(_project.state.speed, 1) / 100);
+
+	// A key that is held makes a lot of steps.
+	seek(
+		_position + delta * std::max(_project.state.speed, 1) / 100,
+		FxQuality::Rough);
 }
 
 void Editor::split() {
@@ -4950,21 +6220,44 @@ void Editor::togglePlay() {
 	_selected = located.index;
 	_playing = true;
 
-	// Frames asked before don't replace the ones played.
+	// Frames asked before don't replace the ones played, and the paused
+	// frame is asked again after them, whatever it was.
 	_frameShown = ++*_frameRequest;
+	++*_stillEpoch;
+	_stillAsked = std::nullopt;
+	_fxRefresh.cancel();
+	_fxSettle.cancel();
+	_fxPlayback = std::make_shared<FxPlayback>();
+	syncFxPlayback();
 	refreshAll();
-	playClip(located.index, located.position);
+	playClip(located.index, located.position, true);
 }
 
 // The frames are read one after another and shown when their time comes.
 // Without sound: the preview is for the picture and the cuts.
-void Editor::playClip(int index, crl::time from) {
+//
+// The effects are applied by the thread that reads the frames, to the
+// part of every frame that goes to the result, scaled down. first: the
+// playback starts here, so the effects that remember the frames are shown
+// what was before (inside of this clip) and look the way the paused frame
+// did; in the next clips they just go on.
+void Editor::playClip(int index, crl::time from, bool first) {
 	const auto &clip = clips()[index];
 	const auto &source = _project.sources[clip.source];
 	const auto cancel = std::make_shared<std::atomic<bool>>(false);
 	_playCancel = cancel;
 	const auto generation = ++_playGeneration;
-	const auto speed = std::max(_project.state.speed, 1) / 100.;
+	const auto percent = std::max(_project.state.speed, 1);
+	const auto fx = _fxPlayback;
+	const auto canvas = _canvas;
+	const auto crop = VideoEdit::CropRect(canvas, _project.state.crop);
+	const auto output = VideoEdit::PreviewSize(crop.size(), kFxPlaySide);
+	const auto rotation = _project.state.rotation;
+	const auto clipFrom = clip.from;
+
+	// Of the frame at `from`, in the timeline of the clips.
+	const auto timelineStart = clipStart(index) + (from - clip.from);
+	const auto speed = percent / 100.;
 	const auto limit = std::min(
 		Px(kPlaybackSide) * style::DevicePixelRatio(),
 		2 * kPlaybackSide);
@@ -4984,6 +6277,39 @@ void Editor::playClip(int index, crl::time from) {
 	const auto length = clip.till - from;
 	const auto weak = base::make_weak(this);
 	crl::async([=] {
+		// The time in the result of a frame that is `position` after the
+		// first one read here.
+		const auto resultTime = [&](crl::time position) {
+			return (timelineStart + position) * 100 / percent;
+		};
+		const auto compose = [&](const QImage &frame) {
+			return VideoEdit::ComposePreview(
+				frame,
+				canvas,
+				crop,
+				output,
+				rotation);
+		};
+		if (fx && first) {
+			fx->apply();
+			const auto before = fx->processor.preroll() * percent / 100;
+			const auto start = std::max(clipFrom, from - before);
+			if (start < from) {
+				auto preroll = options;
+				preroll.from = start;
+				preroll.till = from;
+				preroll.maxFps = std::max(kFxPrerollFps * 100 / percent, 1);
+				const auto read = VideoCore::ReadFrames(preroll, [&](
+						VideoCore::Frame &&frame) {
+					fx->processor.feed(
+						compose(frame.image),
+						resultTime(start - from + frame.position));
+					return !cancel->load();
+				}, cancel, nullptr);
+				(void)read;
+			}
+		}
+
 		const auto started = crl::now();
 		auto late = crl::time(0);
 		const auto wait = [&](crl::time position) {
@@ -5006,12 +6332,31 @@ void Editor::playClip(int index, crl::time from) {
 		};
 		const auto ok = VideoCore::ReadFrames(options, [&](
 				VideoCore::Frame &&frame) {
+			// Made before the time of the frame comes.
+			auto processed = QImage();
+			if (fx) {
+				fx->apply();
+				if (fx->wanted || !fx->processor.empty()) {
+					processed = fx->processor.process(
+						compose(frame.image),
+						resultTime(frame.position));
+				}
+			}
 			if (!wait(frame.position)) {
 				return false;
 			}
 			const auto at = from + frame.position;
-			crl::on_main(weak, [=, image = std::move(frame.image)]() mutable {
-				playbackFrame(generation, index, at, std::move(image));
+			crl::on_main(weak, [
+				=,
+				image = std::move(frame.image),
+				processed = std::move(processed)
+			]() mutable {
+				playbackFrame(
+					generation,
+					index,
+					at,
+					std::move(image),
+					std::move(processed));
 			});
 			return true;
 		}, cancel, nullptr);
@@ -5026,7 +6371,8 @@ void Editor::playbackFrame(
 		int generation,
 		int index,
 		crl::time at,
-		QImage frame) {
+		QImage frame,
+		QImage fx) {
 	if (!_playing
 		|| generation != _playGeneration
 		|| index >= int(clips().size())) {
@@ -5036,7 +6382,7 @@ void Editor::playbackFrame(
 	_selected = index;
 	_position = clipStart(index)
 		+ std::clamp(at - clip.from, crl::time(0), clip.length());
-	_preview->setFrame(std::move(frame));
+	showFrames(std::move(frame), std::move(fx));
 	_timeline->setSelected(_selected);
 	_timeline->setPosition(_position);
 	refreshTransport();
@@ -5046,7 +6392,7 @@ void Editor::playbackFinished(int generation, int index, bool ok) {
 	if (!_playing || generation != _playGeneration) {
 		return;
 	} else if (ok && index + 1 < int(clips().size())) {
-		playClip(index + 1, clips()[index + 1].from);
+		playClip(index + 1, clips()[index + 1].from, false);
 		return;
 	}
 	const auto finished = ok;
@@ -5064,10 +6410,15 @@ void Editor::stopPlayback() {
 		cancel->store(true);
 	}
 	++_playGeneration;
+	_fxPlayback = nullptr;
 	if (std::exchange(_playing, false) && _transport) {
 		_transport->setPlaying(false);
+		if (const auto seekBar = _fxSeek.data()) {
+			seekBar->setPlaying(false);
+		}
 		if (!_closed && ready()) {
 			// The frames were played in a lower resolution.
+			_stillAsked = std::nullopt;
 			requestFrame();
 		}
 	}
@@ -5803,6 +7154,19 @@ public:
 		}
 		return result;
 	}
+	void sequence(
+			crl::time from,
+			crl::time till,
+			crl::time step,
+			int maxSide,
+			Fn<bool(crl::time position, QImage &&frame)> callback) override {
+		step = std::max(step, crl::time(1));
+		for (auto position = from; position < till; position += step) {
+			if (!callback(position, frame(position, maxSide))) {
+				return;
+			}
+		}
+	}
 
 };
 
@@ -5825,7 +7189,8 @@ public:
 		std::shared_ptr<Ui::Show> show,
 		std::shared_ptr<base::weak_ptr<Editor>> handle,
 		State state,
-		crl::time position) {
+		crl::time position,
+		std::optional<int> effects = std::nullopt) {
 	return {
 		.show = std::move(show),
 		.content = QByteArray("sample"),
@@ -5841,7 +7206,35 @@ public:
 		.created = [=](not_null<Editor*> editor) {
 			*handle = base::make_weak(editor.get());
 		},
+		.effects = effects,
 	};
+}
+
+// An effect with some of its parameters set, by their ids.
+[[nodiscard]] VideoFx::Entry SampleEffect(
+		VideoFx::Type type,
+		std::initializer_list<std::pair<const char*, float64>> values = {},
+		bool enabled = true) {
+	auto result = VideoFx::MakeEntry(type);
+	result.enabled = enabled;
+	for (const auto &[id, value] : values) {
+		const auto index = VideoFx::FindParam(type, QString::fromLatin1(id));
+		if (index >= 0 && index < int(result.values.size())) {
+			result.values[index] = value;
+		}
+	}
+	return VideoFx::Sanitized(std::move(result));
+}
+
+// What stands out in the painted video: the sun, the clouds, the boat.
+[[nodiscard]] VideoFx::Entry SampleTracking() {
+	return SampleEffect(VideoFx::Type::Tracking, {
+		{ "source", 3. },
+		{ "sensitivity", 13. },
+		{ "limit", 8. },
+		{ "color", float64(0x35E0FFU) },
+		{ "dim", 25. },
+	});
 }
 
 [[nodiscard]] ExportArgs SampleExportArgs(std::shared_ptr<Ui::Show> show) {
@@ -5890,14 +7283,15 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	const auto editorScene = [=](
 			QString name,
 			State state,
-			crl::time position) {
+			crl::time position,
+			std::optional<int> effects = std::nullopt) {
 		RegisterScene({
 			.name = std::move(name),
 			.size = QSize(Px(kSceneWidth), 0),
 			.box = [=](std::shared_ptr<Ui::Show> show) {
 				return Box(
 					VideoEditorBox,
-					SampleEditorArgs(show, handle, state, position));
+					SampleEditorArgs(show, handle, state, position, effects));
 			},
 			.ready = [=](not_null<QWidget*>) { return idle(); },
 			.wait = kSceneWait,
@@ -5931,6 +7325,116 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	editorScene(u"video_editor_opened"_q, {
 		.clips = { { 0, 0, kSampleDuration } },
 	}, 0);
+
+	// The effects: the tracking overlay over the frame, the names of the
+	// effects on their button.
+	editorScene(u"video_fx_tracking"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = { SampleTracking() },
+	}, 16'200);
+
+	// Only what is inside of the crop gets the effects.
+	editorScene(u"video_fx_crop"_q, {
+		.clips = { { 0, 4'000, 34'000 } },
+		.crop = VideoEdit::AspectCrop(
+			kSampleSize,
+			Aspect::Square,
+			QRectF(0.3, 0., 0.5, 1.)),
+		.aspect = Aspect::Square,
+		.fx = {
+			SampleEffect(VideoFx::Type::FalseColor),
+			SampleEffect(VideoFx::Type::Crt, {}, false),
+		},
+	}, 11'000);
+
+	// The box of the effects: nothing is added yet.
+	editorScene(u"video_fx_panel_empty"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+	}, 16'200, -1);
+
+	// Three effects, the parameters of the second one are shown: sliders
+	// and a seed with its "randomize" button. The third one is off.
+	editorScene(u"video_fx_panel"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleEffect(VideoFx::Type::Edges, {
+				{ "glow", 70. },
+				{ "colors", 2. },
+				{ "original", 35. },
+			}),
+			SampleEffect(VideoFx::Type::Glitch, {
+				{ "amount", 55. },
+				{ "seed", 2048. },
+			}),
+			SampleEffect(VideoFx::Type::Crt, {}, false),
+		},
+	}, 16'200, 1);
+
+	// The tracking with its lists of options and its colour.
+	editorScene(u"video_fx_panel_tracking"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleTracking(),
+			SampleEffect(VideoFx::Type::Halftone, {}, false),
+		},
+	}, 16'200, 0);
+
+	// The tracking as it looks when it is just added, white and with
+	// nothing dimmed, over the bright sky: corners in place of the boxes,
+	// a web of lines, the labels under the objects.
+	editorScene(u"video_fx_tracking_corners"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleEffect(VideoFx::Type::Tracking, {
+				{ "source", 3. },
+				{ "sensitivity", 13. },
+				{ "limit", 8. },
+				{ "style", 1. },
+				{ "links", 3. },
+			}),
+		},
+	}, 16'200);
+
+	// Five effects at once: their names don't fit on the button.
+	editorScene(u"video_fx_stack"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleEffect(VideoFx::Type::Edges, {
+				{ "glow", 70. },
+				{ "colors", 2. },
+				{ "original", 35. },
+			}),
+			SampleEffect(VideoFx::Type::RgbSplit),
+			SampleEffect(VideoFx::Type::Glitch, {
+				{ "amount", 55. },
+				{ "seed", 2048. },
+			}),
+			SampleEffect(VideoFx::Type::Crt),
+			SampleEffect(VideoFx::Type::Grain),
+		},
+	}, 16'200);
+
+	// A switch among the parameters and a colour that is not one of the
+	// ready ones: it is shown inside of the colour wheel.
+	editorScene(u"video_fx_panel_ascii"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleEffect(VideoFx::Type::Ascii, {
+				{ "colors", 1. },
+			}),
+			SampleEffect(VideoFx::Type::Grain, {}, false),
+		},
+	}, 16'200, 0);
+
+	// The only effect with a warning under its parameters.
+	editorScene(u"video_fx_panel_strobe"_q, {
+		.clips = { { 0, 0, kSampleDuration } },
+		.fx = {
+			SampleEffect(VideoFx::Type::Strobe, {
+				{ "mode", 2. },
+			}),
+		},
+	}, 16'200, 0);
 
 	// A file that is not a video: nothing to edit, only "Close".
 	RegisterScene({
@@ -6031,6 +7535,45 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			});
 		});
 });
+
+// For the self-test: plain frames, and how many times they were read in
+// a row for the effects is counted.
+class CountingMedia final : public Media {
+public:
+	explicit CountingMedia(std::shared_ptr<int> reads)
+	: _reads(std::move(reads)) {
+	}
+
+	QImage frame(crl::time position, int maxSide) override {
+		auto result = QImage(
+			QSize(160, 120).scaled(maxSide, maxSide, Qt::KeepAspectRatio),
+			QImage::Format_ARGB32_Premultiplied);
+		const auto level = int(position / 8) % 256;
+		result.fill(QColor(level, 255 - level, 128));
+		return result;
+	}
+	std::vector<QImage> thumbnails(int, int) override {
+		return {};
+	}
+	void sequence(
+			crl::time from,
+			crl::time till,
+			crl::time step,
+			int maxSide,
+			Fn<bool(crl::time position, QImage &&frame)> callback) override {
+		++*_reads;
+		step = std::max(step, crl::time(1));
+		for (auto position = from; position < till; position += step) {
+			if (!callback(position, frame(position, maxSide))) {
+				return;
+			}
+		}
+	}
+
+private:
+	const std::shared_ptr<int> _reads;
+
+};
 
 } // namespace
 
@@ -6246,6 +7789,172 @@ void AddSendFilesVideoEditorAction(
 			thread,
 			closeBox);
 	}, &st::menuIconEdit);
+}
+
+bool VideoEditorSelfTest(QStringList &log) {
+	auto passed = true;
+	const auto check = [&](bool ok, const QString &name, const QString &info) {
+		log.push_back((ok ? u"ok   "_q : u"FAIL "_q)
+			+ name
+			+ (info.isEmpty() ? QString() : (u": "_q + info)));
+		passed = passed && ok;
+	};
+
+	// The card that is opened in the list of the effects after an undo.
+	{
+		using VideoFx::FollowEffect;
+		const auto a = VideoFx::MakeEntry(VideoFx::Type::Edges);
+		const auto b = VideoFx::MakeEntry(VideoFx::Type::Glitch);
+		const auto c = VideoFx::MakeEntry(VideoFx::Type::Crt);
+		auto tuned = a;
+		tuned.mix = 0.5;
+		const auto got = std::vector<int>{
+			FollowEffect({ a, b, c }, 1, { a, b, c }),
+			FollowEffect({ a, b }, 0, { tuned, b }),
+			FollowEffect({ a, b, c }, 1, { b, a, c }),
+			FollowEffect({ a, b, c }, 0, { b, a, c }),
+			FollowEffect({ a, c }, 1, { a, b, c }),
+			FollowEffect({ a, b, c }, 2, { a, c }),
+			FollowEffect({ a, b, c }, 1, { a, c }),
+			FollowEffect({ a, b, b }, 2, { a, b }),
+			FollowEffect({ a, a }, 0, { tuned, a }),
+			FollowEffect({ a, tuned }, 0, { tuned, a }),
+			FollowEffect({ a, b }, 0, { c }),
+			FollowEffect({ a }, -1, { a }),
+			FollowEffect({ a }, 3, { a }),
+		};
+		const auto expected = std::vector<int>{
+			1, // Nothing has changed.
+			0, // Other parameters.
+			0, // Moved up.
+			1, // Moved down.
+			2, // One more before it.
+			1, // One less before it.
+			-1, // Removed.
+			-1, // Removed, the same effect is there once more.
+			0, // One of two equal effects was changed.
+			1, // Two effects of a kind have changed places.
+			-1, // All the effects are other ones.
+			-1,
+			-1,
+		};
+		auto text = QStringList();
+		for (const auto index : got) {
+			text.push_back(QString::number(index));
+		}
+		check(
+			got == expected,
+			u"the opened effect after an undo"_q,
+			text.join(' '));
+	}
+
+	const auto request = StillRequest{
+		.position = 1000,
+		.side = 160,
+		.canvas = QSize(160, 120),
+		.crop = QRect(0, 0, 160, 120),
+		.output = QSize(160, 120),
+		.stack = { VideoFx::MakeEntry(VideoFx::Type::Feedback) },
+		.resultPosition = 1000,
+		.speed = 100,
+		.prerollFrom = 400,
+	};
+	auto effects = request;
+	effects.stack.front().mix = 0.5;
+	auto moved = request;
+	moved.position += 200;
+	moved.resultPosition += 200;
+	moved.prerollFrom += 200;
+
+	// A slider of an effect that is dragged must not stop the frame that
+	// is being made for its previous value, anything else has to.
+	{
+		auto bare = request;
+		bare.stack.clear();
+		auto longer = effects;
+		longer.prerollFrom = 0;
+		auto cropped = request;
+		cropped.crop = QRect(0, 0, 80, 120);
+		auto smaller = request;
+		smaller.output = QSize(80, 60);
+		auto turned = request;
+		turned.rotation = 90;
+		auto faster = request;
+		faster.speed = 200;
+		check(
+			CompareStills(request, request) == StillChange::None
+				&& CompareStills(request, effects) == StillChange::Effects
+				&& CompareStills(request, bare) == StillChange::Effects
+				&& CompareStills(request, moved) == StillChange::Frame
+				&& CompareStills(request, longer) == StillChange::Frame
+				&& CompareStills(request, cropped) == StillChange::Frame
+				&& CompareStills(request, smaller) == StillChange::Frame
+				&& CompareStills(request, turned) == StillChange::Frame
+				&& CompareStills(request, faster) == StillChange::Frame,
+			u"a paused frame asked once more"_q,
+			QString());
+	}
+
+	// The effects made for the crop that was there before another aspect
+	// was chosen are not squeezed into the new one, but the rounding of
+	// a narrow crop to the pixels of the video is not another aspect.
+	check(
+		SameProportions(QSizeF(640, 360), QSizeF(1280, 720))
+			&& SameProportions(QSizeF(17, 200), QSizeF(16.4, 200))
+			&& SameProportions(QSizeF(2, 480), QSizeF(1.8, 480))
+			&& !SameProportions(QSizeF(640, 360), QSizeF(360, 360))
+			&& !SameProportions(QSizeF(360, 360), QSizeF(288, 360))
+			&& !SameProportions(QSizeF(360, 640), QSizeF(640, 360)),
+		u"effects made for another crop"_q,
+		QString());
+
+	// What that relies on: the frames before a paused one are read once
+	// while only the effects change, and are kept when the effects are
+	// stopped half way, but not when the reading itself is.
+	{
+		const auto reads = std::make_shared<int>(0);
+		QueuedMedia media([=](const Source &) -> std::unique_ptr<Media> {
+			return std::make_unique<CountingMedia>(reads);
+		}, Source());
+		const auto never = [] { return false; };
+		const auto first = media.still(request, never);
+		const auto second = media.still(effects, never);
+		const auto forEffects = *reads;
+		auto asked = 0;
+		const auto stopped = media.still(request, [&] {
+			return (++asked > 2);
+		});
+		const auto again = media.still(request, never);
+		const auto afterStopped = *reads;
+		const auto another = media.still(moved, never);
+		const auto forAnother = *reads;
+		const auto dropped = media.still(request, [] { return true; });
+		const auto restored = media.still(request, never);
+		const auto afterDropped = *reads;
+		check(
+			!first.cancelled
+				&& (first.fx.size() == request.output)
+				&& !second.cancelled
+				&& (second.fx.size() == request.output)
+				&& (forEffects == 1)
+				&& stopped.cancelled
+				&& !again.cancelled
+				&& (again.fx.size() == request.output)
+				&& (afterStopped == 1)
+				&& !another.cancelled
+				&& (forAnother == 2)
+				&& dropped.cancelled
+				&& !restored.cancelled
+				&& (restored.fx.size() == request.output)
+				&& (afterDropped == 4),
+			u"frames before a paused one are kept"_q,
+			u"read %1, %2, %3, %4 times"_q
+				.arg(forEffects)
+				.arg(afterStopped)
+				.arg(forAnother)
+				.arg(afterDropped));
+	}
+	return passed;
 }
 
 } // namespace Oblivion

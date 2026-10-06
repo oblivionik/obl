@@ -31,8 +31,20 @@ class PalettePanel;
 //  - shape items: their values (fill / stroke color with a hex field and
 //    the color picker, opacity, stroke width, line caps / corners / miter
 //    limit, dashes, fill rule, gradient type and stops, trim start / end /
-//    offset and mode, rectangle / ellipse / star geometry...), masks and
-//    effects: their values;
+//    offset and mode, rectangle / ellipse / star geometry...), effects:
+//    their values;
+//  - After Effects features (round 4). Layers: the parent (a layer
+//    picker, the layer keeps its place), the track matte (mode and the
+//    layer that cuts), the list of masks with their modes and "Add mask".
+//    Masks: mode, path, "Edit points" (the pen tool of the canvas),
+//    "Invert", opacity / expansion / feather. Gradients: a stops editor
+//    (click adds, drag moves, drag away removes, the selected stop has
+//    a color / an opacity and a position), "Make it a solid color" and
+//    back. Strokes: the dash pattern. Repeaters, trim paths, rounded
+//    corners ("Turn into real corners"), paths ("Edit points", close /
+//    open, reverse), rectangles and ellipses ("Convert to path"). Red
+//    hints tell what Telegram does not accept in stickers or does not
+//    draw;
 //  - nothing selected: the composition (canvas size, frame rate,
 //    duration).
 // Every animatable value has keyframe controls on the left: the diamond
@@ -55,6 +67,11 @@ public:
 
 	void setTab(Tab tab);
 	[[nodiscard]] Tab tab() const;
+
+	// Selects a stop of the gradient of the selected gradient fill /
+	// stroke, as a click on it in the stops bar does (opacity: one of the
+	// opacity stops above the bar).
+	void selectGradientStop(int index, bool opacity = false);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
