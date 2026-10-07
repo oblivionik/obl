@@ -1,0 +1,305 @@
+/*
+This file is part of Telegram Desktop,
+the official desktop application for the Telegram messaging service.
+
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+*/
+#pragma once
+
+#include "base/object_ptr.h"
+
+#include <QtGui/QColor>
+
+class UserData;
+
+namespace Main {
+class Session;
+} // namespace Main
+
+namespace Ui {
+class RpWidget;
+class VerticalLayout;
+} // namespace Ui
+
+namespace Window {
+class SessionController;
+} // namespace Window
+
+namespace Oblivion::Cloud {
+struct Error;
+struct Me;
+} // namespace Oblivion::Cloud
+
+// Round 5: social. The badge list, the directory, Oblivion profiles, the
+// activity chips and «Друзья в Oblivion». The model lives in
+// oblivion_cloud_social.cpp, the UI in oblivion_cloud_social_ui.cpp.
+//
+// What is kept and where it comes from:
+//
+//  - the badge list (GET /v1/badges, ETag): the ids of the users who have
+//    switched «Значок Oblivion» on. Oblivion::Badge::Has() looks into it;
+//  - the directory (GET /v1/directory, ETag): the people whose profile
+//    audience includes this account. Both lists are downloaded as a whole,
+//    kept in tdata/oblivion/<id>/cloud_social.json and compared with the
+//    chats and the contacts of the account on this device: no id of a
+//    contact or of a chat is ever sent to the server;
+//  - the activity (GET /v1/activity and the "activity" events): kept in
+//    memory only, forgotten when the connection is lost;
+//  - GET /v1/users/{id} is sent only after a click (the list of public
+//    playlists and presets) and only for an id from the cached directory.
+//
+// What is public about the own account (the badge, the audiences, the
+// chips, the chosen people) belongs to one Telegram account: it is read
+// from Cloud::Account::me() and changed by PATCH /v1/me from a click in
+// the window of that account. A switch flipped in one account publishes
+// nothing about the others.
+namespace Oblivion::Social {
+
+// Called by Cloud::SessionStarted() / Cloud::SessionLoggedOut().
+void Start(not_null<Main::Session*> session);
+void Forget(not_null<Main::Session*> session);
+
+// ---- What the server lets this account see.
+
+// An entry of the directory: somebody who has opened the profile to this
+// account. Everything in it has come through the server from another
+// person: clamped and validated when parsed.
+struct Profile {
+	uint64 id = 0;
+	QString name; // The name in Oblivion, not the one in Telegram.
+	int avatarRev = 0;
+	bool verified = false;
+	bool badge = false;
+	QString statusText;
+	QString statusEmoji; // One emoji or empty.
+	QString statusEmojiId;
+	std::optional<QColor> accent;
+	int publicPlaylists = 0;
+	int publicPresets = 0;
+
+	[[nodiscard]] bool valid() const {
+		return (id != 0);
+	}
+	// Whether the «Oblivion» block has anything to show.
+	[[nodiscard]] bool hasContent() const {
+		return !statusText.isEmpty()
+			|| !statusEmoji.isEmpty()
+			|| (publicPlaylists > 0)
+			|| (publicPresets > 0);
+	}
+	friend inline bool operator==(const Profile&, const Profile&) = default;
+};
+
+struct Activity {
+	uint64 userId = 0;
+	bool online = false; // «в Oblivion».
+	bool listening = false; // «слушает».
+	QString title;
+	QString performer;
+	int64 durationMs = 0;
+	int64 since = 0; // Server time.
+	bool inRoom = false; // «в комнате».
+	QString roomTitle;
+	int roomMembers = 0;
+	QString roomCode; // Not empty: the room lets people in, «Войти».
+
+	[[nodiscard]] bool empty() const {
+		return !online && !listening && !inRoom;
+	}
+	friend inline bool operator==(const Activity&, const Activity&) = default;
+};
+
+// A playlist or a preset of an owner: what is public in a profile, or the
+// own ones in the editor of the profile.
+struct SharedItem {
+	QString id;
+	bool playlist = false; // false: a preset of effects.
+	QString title;
+	QString kind; // A preset: "photo" or "video".
+	int count = 0; // A playlist: the number of tracks.
+	bool shown = false; // "public": listed in the profile of the owner.
+
+	friend inline bool operator==(
+		const SharedItem&,
+		const SharedItem&) = default;
+};
+
+enum class Status {
+	Off, // No consent, switched off, no key: nothing is asked or shown.
+	Loading, // The first answer of this launch is on its way.
+	Ready,
+	Offline, // The server can't be reached, what was saved is shown.
+};
+
+// Cheap lookups in what is kept in memory, main thread, nothing is sent.
+// All of them answer "nothing" while the account is not connected.
+[[nodiscard]] bool BadgeListed(
+	not_null<Main::Session*> session,
+	uint64 userId);
+// For the own id: what the server has about this account.
+[[nodiscard]] std::optional<Profile> ProfileOf(
+	not_null<Main::Session*> session,
+	uint64 userId);
+// For the own id: what the audience sees of this account, put together
+// here from what was really published («слушает», «в Oblivion»; the room
+// chip is made by the server and is not known on this side).
+[[nodiscard]] Activity ActivityOf(
+	not_null<Main::Session*> session,
+	uint64 userId);
+[[nodiscard]] std::vector<Profile> Directory(
+	not_null<Main::Session*> session);
+[[nodiscard]] Status CurrentStatus(not_null<Main::Session*> session);
+
+// Fires from the event loop after the directory, somebody's activity or
+// the status could have changed. Ends with the session.
+[[nodiscard]] rpl::producer<> Changes(not_null<Main::Session*> session);
+
+// From a click («Друзья в Oblivion» was opened): the directory and the
+// activity are asked now, not more often than once in several seconds.
+void Refresh(not_null<Main::Session*> session);
+
+// The public playlists and presets of a person from the directory, asked
+// after a click. The callbacks may outlive the widget: guard them.
+void LoadShared(
+	not_null<Main::Session*> session,
+	uint64 userId,
+	Fn<void(std::vector<SharedItem>)> done,
+	Fn<void(const Cloud::Error&)> fail);
+// The own playlists and presets that are on the server.
+void LoadOwnShared(
+	not_null<Main::Session*> session,
+	Fn<void(std::vector<SharedItem>)> done,
+	Fn<void(const Cloud::Error&)> fail);
+void SetSharedShown(
+	not_null<Main::Session*> session,
+	const SharedItem &item,
+	bool shown,
+	Fn<void()> done,
+	Fn<void(const Cloud::Error&)> fail);
+
+// ---- What is public about the own account.
+
+enum class Flag {
+	Badge, // «Значок Oblivion»: the id is in the public badge list.
+	ChipListening,
+	ChipRoom,
+	ChipOnline,
+};
+// What the server has, as this device knows it (false while the account
+// is not connected to Oblivion Cloud).
+[[nodiscard]] bool FlagNow(not_null<Main::Session*> session, Flag flag);
+[[nodiscard]] rpl::producer<bool> FlagValue(
+	not_null<Main::Session*> session,
+	Flag flag);
+// Switching on asks the consent to Oblivion Cloud first (and, for the
+// badge, says in a box what becomes public), switching off needs nothing.
+void ToggleFlag(not_null<Window::SessionController*> controller, Flag flag);
+
+enum class Audience {
+	Nobody = 0,
+	Chosen = 1,
+	Everyone = 2,
+};
+enum class AudienceKind {
+	Profile,
+	Activity,
+};
+[[nodiscard]] Audience AudienceNow(
+	not_null<Main::Session*> session,
+	AudienceKind kind);
+[[nodiscard]] rpl::producer<Audience> AudienceValue(
+	not_null<Main::Session*> session,
+	AudienceKind kind);
+[[nodiscard]] rpl::producer<int> ChosenCountValue(
+	not_null<Main::Session*> session);
+
+// ---- Pure helpers (OBLIVION_SELFTEST=cloud_social checks them).
+
+[[nodiscard]] Audience AudienceFromWire(const QString &value);
+[[nodiscard]] QString AudienceToWire(Audience value);
+// Whether somebody with this id is in the audience, the way the server
+// decides it. The owner is always in.
+[[nodiscard]] bool AudienceIncludes(
+	Audience audience,
+	const std::vector<uint64> &chosen,
+	uint64 ownerId,
+	uint64 viewerId);
+
+enum class ChipType {
+	Listening,
+	Room,
+	Online,
+};
+struct Chip {
+	ChipType type = ChipType::Online;
+	QString text;
+	QString joinCode; // Not empty: the chip has «Войти».
+
+	friend inline bool operator==(const Chip&, const Chip&) = default;
+};
+// The phrases with their placeholders left in: "слушает: {text}",
+// "в комнате: {title}".
+struct ChipPhrases {
+	QString listening;
+	QString room;
+	QString roomUntitled;
+	QString online;
+};
+// "Кино — Группа крови", or only the title.
+[[nodiscard]] QString TrackText(
+	const QString &performer,
+	const QString &title);
+// «слушает», «в комнате», and «в Oblivion» only when there is nothing
+// more to tell.
+[[nodiscard]] std::vector<Chip> BuildChips(
+	const Activity &activity,
+	const ChipPhrases &phrases,
+	bool allowJoin);
+// The order of «Друзья в Oblivion»: who listens goes first, then who is
+// in a room, who is in Oblivion, and the rest. Smaller is earlier.
+[[nodiscard]] int ActivityRank(const Activity &activity);
+
+// ---- The UI (oblivion_cloud_social_ui.cpp).
+
+// Settings > Oblivion and the main menu.
+void ShowFriends(not_null<Window::SessionController*> controller);
+void ShowMyProfile(not_null<Window::SessionController*> controller);
+void ShowChosenList(not_null<Window::SessionController*> controller);
+void ShowAudienceBox(
+	not_null<Window::SessionController*> controller,
+	AudienceKind kind);
+[[nodiscard]] QString AudienceName(Audience audience);
+// «Убрать старую метку из «О себе»»: says what the old marker is and,
+// after a confirmation, calls Oblivion::Badge::RemoveOldMarker().
+void ShowRemoveMarker(not_null<Window::SessionController*> controller);
+
+// The hook of Info::Profile::InnerWidget: the activity chips and the
+// «Oblivion» block of a user, the first thing under the cover. The
+// widget is of zero height while there is nothing to show: no profile
+// and no activity is known for the user, the account is not connected to
+// Oblivion Cloud, or «Показывать профили и активность Oblivion у других»
+// is off. Then "shown" is false, the separator after the block is hidden
+// too and the page looks exactly as it does without Oblivion. widget is
+// null for a peer that can't have a profile (a bot, a service account).
+struct ProfileBlock {
+	object_ptr<Ui::RpWidget> widget = { nullptr };
+	rpl::producer<bool> shown;
+};
+[[nodiscard]] ProfileBlock CreateProfileBlock(
+	not_null<QWidget*> parent,
+	not_null<Window::SessionController*> controller,
+	not_null<UserData*> user);
+
+// The hook of Window::MainMenu: «Друзья в Oblivion», shown while it is
+// switched on in Settings > Oblivion.
+void AddMainMenuEntry(
+	not_null<Ui::VerticalLayout*> menu,
+	not_null<Window::SessionController*> controller);
+
+// OBLIVION_SELFTEST=cloud_social, pure logic, no network: the parsers,
+// the cache of the lists, the audience rules, the throttle of the own
+// activity, the texts of the chips, the order of the friends.
+[[nodiscard]] bool RunSelfTest(QStringList &log);
+
+} // namespace Oblivion::Social

@@ -17,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "media/audio/media_audio.h"
 #include "oblivion/oblivion_listen.h"
+#include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/boxes/confirm_box.h"
@@ -477,6 +478,8 @@ struct StatusParts {
 			.button = tr::lng_oblivion_listen_end(tr::now),
 			.action = (view.canSend
 				? tr::lng_oblivion_listen_send(tr::now)
+				: Get().cloudRooms() // Oblivion rooms.
+				? tr::lng_oblivion_room_open_as_room(tr::now)
 				: QString()),
 		};
 	case Kind::Starting:
@@ -752,6 +755,10 @@ object_ptr<Ui::RpWidget> CreateBar(
 	) | rpl::on_next([=] {
 		if (state->view.kind == Kind::Hosting && state->view.canSend) {
 			SendTrack(state->view.sendId);
+		} else if (state->view.kind == Kind::Hosting) {
+			// Oblivion rooms: «Открыть как комнату». The title is asked
+			// (the name of the chat is not sent to the cloud).
+			Rooms::OpenAsRoom(controller, QString());
 		}
 	}, raw->lifetime());
 

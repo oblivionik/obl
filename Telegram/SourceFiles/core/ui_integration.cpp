@@ -34,6 +34,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/window_session_controller.h"
 #include "mainwindow.h"
 #include "base/unixtime.h"
+#include "oblivion/oblivion_cloud.h" // Oblivion
 #include "styles/style_chat_helpers.h"
 
 #include <QtCore/QDateTime>
@@ -406,6 +407,10 @@ std::shared_ptr<ClickHandler> UiIntegration::createLinkHandler(
 bool UiIntegration::handleUrlClick(
 		const QString &url,
 		const QVariant &context) {
+	// Oblivion: room / playlist / preset links of Oblivion Cloud.
+	if (Oblivion::Cloud::HandleLinkClick(url, context)) {
+		return true;
+	}
 	const auto local = Core::TryConvertUrlToLocal(url);
 	if (Core::InternalPassportOrOAuthLink(local)) {
 		return true;

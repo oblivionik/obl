@@ -66,6 +66,7 @@ namespace Oblivion {
 namespace {
 
 constexpr auto kTelegramChoice = "telegram";
+constexpr auto kPreviousChoice = "previous";
 constexpr auto kCustomChoice = "custom";
 
 constexpr auto kIconSize = 1024;
@@ -104,6 +105,11 @@ struct Current {
 	return QImage(u":/gui/art/oblivion/telegram_icon.png"_q);
 }
 
+// The Oblivion icon used before the "eclipse" one became the bundle icon.
+[[nodiscard]] QImage PreviousIcon() {
+	return QImage(u":/gui/art/oblivion/previous_icon.png"_q);
+}
+
 [[nodiscard]] QImage CustomIcon() {
 	return QImage(CustomIconPath());
 }
@@ -111,6 +117,8 @@ struct Current {
 [[nodiscard]] QImage ChoiceImage(const QString &choice) {
 	if (choice == kTelegramChoice) {
 		return TelegramIcon();
+	} else if (choice == kPreviousChoice) {
+		return PreviousIcon();
 	} else if (choice == kCustomChoice) {
 		return CustomIcon();
 	}
@@ -473,9 +481,11 @@ void IconTile::paintEvent(QPaintEvent *e) {
 // be created without a window (see oblivion_ui_snapshots.h).
 struct AppIconBoxArgs {
 	QImage oblivion; // The bundle icon.
+	QImage previous; // The former Oblivion icon, null: no such tile.
 	QImage telegram;
 	QImage custom; // Null: the '+' placeholder that opens the picker.
-	rpl::producer<QString> choice; // Empty, kTelegramChoice, kCustomChoice.
+	// Empty, kPreviousChoice, kTelegramChoice, kCustomChoice.
+	rpl::producer<QString> choice;
 	bool finder = false;
 
 	// Applies a different choice.
@@ -527,19 +537,29 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 	const auto oblivion = Ui::CreateChild<IconTile>(
 		row,
 		tr::lng_oblivion_app_icon_default());
+	// Only where the picture is bundled (mac_icons.qrc).
+	const auto previous = args.previous.isNull()
+		? nullptr
+		: Ui::CreateChild<IconTile>(
+			row,
+			tr::lng_oblivion_app_icon_previous());
 	const auto telegram = Ui::CreateChild<IconTile>(
 		row,
 		tr::lng_oblivion_app_icon_telegram());
 	const auto custom = Ui::CreateChild<IconTile>(
 		row,
 		tr::lng_oblivion_app_icon_custom_short());
-	const auto tiles = std::vector<not_null<IconTile*>>{
-		oblivion,
-		telegram,
-		custom,
-	};
+	auto tiles = std::vector<not_null<IconTile*>>{ oblivion };
+	if (previous) {
+		tiles.push_back(previous);
+	}
+	tiles.push_back(telegram);
+	tiles.push_back(custom);
 
 	oblivion->setImage(std::move(args.oblivion));
+	if (previous) {
+		previous->setImage(std::move(args.previous));
+	}
 	telegram->setImage(std::move(args.telegram));
 	custom->setImage(std::move(args.custom));
 
@@ -563,6 +583,9 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 		state->initialized = true;
 		state->choice = choice;
 		oblivion->setSelected(choice.isEmpty(), animated);
+		if (previous) {
+			previous->setSelected(choice == kPreviousChoice, animated);
+		}
 		telegram->setSelected(choice == kTelegramChoice, animated);
 		custom->setSelected(choice == kCustomChoice, animated);
 	}, box->lifetime());
@@ -625,6 +648,9 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 	};
 
 	oblivion->setClickedCallback([=] { choose(QString()); });
+	if (previous) {
+		previous->setClickedCallback([=] { choose(kPreviousChoice); });
+	}
 	telegram->setClickedCallback([=] { choose(kTelegramChoice); });
 	custom->setClickedCallback([=] {
 		// The '+' placeholder (no readable custom icon) opens the picker.
@@ -694,6 +720,7 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 	const auto current = std::make_shared<rpl::variable<QString>>(choice);
 	return Box(AppIconBox, AppIconBoxArgs{
 		.oblivion = internal::BundleIconImage(kIconSize / 2),
+		.previous = PreviousIcon(),
 		.telegram = TelegramIcon(),
 		.custom = std::move(custom),
 		.choice = current->value(),
@@ -774,6 +801,7 @@ void ShowAppIconBox(not_null<Window::SessionController*> controller) {
 	const auto weak = base::make_weak(controller);
 	controller->show(Box(AppIconBox, AppIconBoxArgs{
 		.oblivion = internal::BundleIconImage(kIconSize / 2),
+		.previous = PreviousIcon(),
 		.telegram = TelegramIcon(),
 		.custom = CustomIcon(),
 		.choice = rpl::single(

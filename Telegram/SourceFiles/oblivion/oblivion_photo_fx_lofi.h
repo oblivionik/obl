@@ -23,7 +23,9 @@ class QDateTime;
 //                   parameter sets of this effect;
 //   lofi.sensor     sensor resolution (downscale + upscale method);
 //   lofi.jpeg       real JPEG re-compression (quality, re-saves, blocks);
-//   lofi.noise      CCD noise, color noise, hot pixels, banding;
+//   lofi.noise      CCD noise, color noise, hot pixels, banding (added to
+//                   the picture or laid over it, optionally kept in the
+//                   shadows);
 //   lofi.aberration chromatic aberration and purple fringing;
 //   lofi.bloom      bloom and red halation;
 //   lofi.flash      on-camera flash;
@@ -40,6 +42,10 @@ class QDateTime;
 // The presets (FxPreset, they only set parameters): lofi.preset_phone,
 // lofi.preset_ccd, lofi.preset_webcam, lofi.preset_mms, lofi.preset_flash,
 // lofi.preset_pocket, lofi.preset_cctv, lofi.preset_vhs.
+//
+// The same group has one more pack, the looks of digicamfx.com (the
+// digicam.* effects of oblivion_photo_fx_digicam.h): its snapshot scenes
+// are registered here, next to the galleries they extend.
 //
 // Lengths are in source pixels and follow FxContext::scale, the effects
 // that have their own pixel grid (the camera, the sensor, JPEG) work at

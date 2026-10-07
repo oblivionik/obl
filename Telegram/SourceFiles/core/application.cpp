@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_app_icon.h"
 #include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_lottie_editor.h"
+#include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_video_editor.h"
 #include "oblivion/oblivion_voice_changer.h"
 #include "data/data_abstract_structure.h"
@@ -223,6 +224,7 @@ void Application::closeAdditionalWindows() {
 	_iv->closeAll();
 	Iv::Editor::CloseAllWindows();
 	Oblivion::LottieEdit::HideWindowsForLock();
+	Oblivion::Rooms::HideWindowsForLock(); // Oblivion rooms.
 }
 
 Application::~Application() {
@@ -245,6 +247,7 @@ Application::~Application() {
 	// For example Domain::removeRedundantAccounts() is called from
 	// Domain::finish() and there is a violation on Ensures(started()).
 	Oblivion::LottieEdit::CloseAllWindows();
+	Oblivion::Rooms::CloseAllWindows(); // Oblivion rooms.
 	closeAdditionalWindows();
 
 	_private->proxyRotation = nullptr;
@@ -1298,6 +1301,7 @@ void Application::unlockPasscode() {
 	});
 	if (!_setupEmailLock.current()) {
 		Oblivion::LottieEdit::RestoreWindowsAfterLock();
+		Oblivion::Rooms::RestoreWindowsAfterLock(); // Oblivion rooms.
 	}
 }
 
@@ -1350,6 +1354,7 @@ void Application::unlockSetupEmail() {
 	});
 	if (!passcodeLocked()) {
 		Oblivion::LottieEdit::RestoreWindowsAfterLock();
+		Oblivion::Rooms::RestoreWindowsAfterLock(); // Oblivion rooms.
 	}
 	checkStartUrls();
 }

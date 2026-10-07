@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/flat_map.h"
 #include "base/unique_qptr.h"
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_cloud_share.h"
 #include "oblivion/oblivion_photo_editor_controls.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/effects/animation_value.h"
@@ -1503,6 +1504,46 @@ FxStack::FxStack(
 						strong->_layerId,
 						std::move(stack));
 				}
+			});
+	});
+
+	// Oblivion round 5: sharing. «Наборы»: the effects of the layer are
+	// saved as a preset or shared, a saved or a shared preset is added
+	// to the layer the way a built-in one is (oblivion_cloud_share.h).
+	const auto presets = VerticalLayout::add(
+		object_ptr<PanelButton>(
+			this,
+			tr::lng_oblivion_share_presets_button(),
+			false),
+		RowMargins(Px(kCardSkip)));
+	presets->setClickedCallback([=] {
+		const auto weak = base::make_weak(this);
+		Share::ShowPresetsMenu(
+			this,
+			presets->mapToGlobal(QPoint(0, presets->height())),
+			{
+				.kind = u"photo"_q,
+				.show = _controller->uiShow(),
+				.current = [=] {
+					const auto strong = weak.get();
+					const auto layer = (strong
+						&& strong->_controller->hasDocument())
+						? strong->_controller->document().find(
+							strong->_layerId)
+						: nullptr;
+					return layer
+						? SerializeFxStack(layer->effects)
+						: QByteArray();
+				},
+				.apply = [=](const QByteArray &stack) {
+					if (const auto strong = weak.get()) {
+						AppendLayerFx(
+							strong->_controller,
+							strong->_layerId,
+							DeserializeFxStack(stack));
+					}
+				},
+				.dark = true,
 			});
 	});
 

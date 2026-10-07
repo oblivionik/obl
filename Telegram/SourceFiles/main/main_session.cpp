@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "oblivion/oblivion_badge.h"
 #include "oblivion/oblivion_chat_stats.h"
+#include "oblivion/oblivion_cloud.h"
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_online.h"
 #include "oblivion/oblivion_playlists.h"
@@ -280,6 +281,8 @@ Session::Session(
 		Oblivion::StartProfileHistory(this);
 		Oblivion::Badge::Start(this);
 		Oblivion::CleanupVideoEditorTemp(this);
+		// Oblivion round 5: the cloud and every module of the round.
+		Oblivion::Cloud::SessionStarted(this);
 	});
 }
 
@@ -328,6 +331,7 @@ void Session::finishLogout() {
 	Oblivion::ForgetProfileHistory(this);
 	Oblivion::ForgetChatStats(this);
 	Oblivion::Badge::Forget(this);
+	Oblivion::Cloud::SessionLoggedOut(this); // Oblivion round 5.
 }
 
 Session::~Session() {

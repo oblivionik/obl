@@ -84,6 +84,18 @@ void AddOnlineActions(
 
 namespace Online {
 
+// Oblivion round 5, «Отправить, когда будет в сети» (see
+// oblivion_send_online.h): the users a message of this account waits
+// for. While onlinePolling() is on their statuses are requested together
+// with the notify list, in the same requests and within the same limits,
+// always by this account. The answers come as usual status updates of
+// the session. An empty set changes nothing. Returns nothing and does
+// nothing while the tracker of the session is not started yet: the
+// caller repeats the call once in a while.
+void SetWaitedUsers(
+	not_null<Main::Session*> session,
+	base::flat_set<uint64> ids);
+
 // Self-checks for OBLIVION_SELFTEST=online, see oblivion_selftest.h.
 // No Core::App(), no session: pure logic only (intervals, storage).
 [[nodiscard]] bool RunSelfTest(QStringList &log);

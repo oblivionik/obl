@@ -56,6 +56,14 @@ struct DeletedChange {
 	bool removed = false; // Records were removed, not only appended.
 };
 
+// Oblivion round 5 (oblivion_deleted_search.h): a message with all of
+// its saved versions, the oldest first.
+struct EditedMessage {
+	uint64 peerId = 0;
+	int64 messageId = 0;
+	std::vector<EditVersion> versions;
+};
+
 class DeletedStore final {
 public:
 	explicit DeletedStore(QString folder);
@@ -75,6 +83,9 @@ public:
 	[[nodiscard]] std::vector<EditVersion> edits(
 		uint64 peerId,
 		int64 messageId);
+
+	// Oblivion round 5: every message that has saved versions, a copy.
+	[[nodiscard]] std::vector<EditedMessage> edited();
 
 	// Drops everything saved for the account, both in memory and on disk.
 	void forget();

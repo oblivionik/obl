@@ -1594,8 +1594,26 @@ PRIVATE
     oblivion/oblivion_chat_stats.h
     oblivion/oblivion_chat_stats_ui.cpp
     oblivion/oblivion_chat_stats_ui.h
+    oblivion/oblivion_cloud.cpp
+    oblivion/oblivion_cloud.h
+    oblivion/oblivion_cloud_share.cpp
+    oblivion/oblivion_cloud_share.h
+    oblivion/oblivion_cloud_share_ui.cpp
+    oblivion/oblivion_cloud_share_ui.h
+    oblivion/oblivion_cloud_social.cpp
+    oblivion/oblivion_cloud_social.h
+    oblivion/oblivion_cloud_social_ui.cpp
+    oblivion/oblivion_cloud_social_ui.h
+    oblivion/oblivion_cloud_sync.cpp
+    oblivion/oblivion_cloud_sync.h
+    oblivion/oblivion_cloud_ui.cpp
+    oblivion/oblivion_cloud_ui.h
+    oblivion/oblivion_cloud_update.cpp
+    oblivion/oblivion_cloud_update.h
     oblivion/oblivion_deleted.cpp
     oblivion/oblivion_deleted.h
+    oblivion/oblivion_deleted_search.cpp
+    oblivion/oblivion_deleted_search.h
     oblivion/oblivion_deleted_store.cpp
     oblivion/oblivion_deleted_store.h
     oblivion/oblivion_forward_copy.cpp
@@ -1668,6 +1686,8 @@ PRIVATE
     oblivion/oblivion_photo_fx_adjust_ui.cpp
     oblivion/oblivion_photo_fx_blur.cpp
     oblivion/oblivion_photo_fx_blur.h
+    oblivion/oblivion_photo_fx_digicam.cpp
+    oblivion/oblivion_photo_fx_digicam.h
     oblivion/oblivion_photo_fx_distort.cpp
     oblivion/oblivion_photo_fx_distort.h
     oblivion/oblivion_photo_fx_glitch.cpp
@@ -1686,6 +1706,18 @@ PRIVATE
     oblivion/oblivion_playlists.h
     oblivion/oblivion_profile_history.cpp
     oblivion/oblivion_profile_history.h
+    oblivion/oblivion_room.cpp
+    oblivion/oblivion_room.h
+    oblivion/oblivion_room_canvas.cpp
+    oblivion/oblivion_room_canvas.h
+    oblivion/oblivion_room_extras.cpp
+    oblivion/oblivion_room_extras.h
+    oblivion/oblivion_room_music.cpp
+    oblivion/oblivion_room_music.h
+    oblivion/oblivion_room_video.cpp
+    oblivion/oblivion_room_video.h
+    oblivion/oblivion_room_window.cpp
+    oblivion/oblivion_room_window.h
     oblivion/oblivion_round_video.cpp
     oblivion/oblivion_round_video.h
     oblivion/oblivion_round_video_convert.cpp
@@ -1694,10 +1726,14 @@ PRIVATE
     oblivion/oblivion_self_destruct.h
     oblivion/oblivion_selftest.cpp
     oblivion/oblivion_selftest.h
+    oblivion/oblivion_send_online.cpp
+    oblivion/oblivion_send_online.h
     oblivion/oblivion_sending.cpp
     oblivion/oblivion_sending.h
     oblivion/oblivion_settings.cpp
     oblivion/oblivion_settings.h
+    oblivion/oblivion_stats_export.cpp
+    oblivion/oblivion_stats_export.h
     oblivion/oblivion_sticker_batch.cpp
     oblivion/oblivion_sticker_batch.h
     oblivion/oblivion_sticker_export.cpp

@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "data/data_msg_id.h"
+
 class AudioMsgId;
 class HistoryItem;
 
@@ -48,5 +50,32 @@ void ForgetPlaylists(not_null<Main::Session*> session);
 [[nodiscard]] bool PlaylistPlayerCanMove(int delta);
 bool PlaylistPlayerMove(int delta, bool autonext);
 [[nodiscard]] rpl::producer<> PlaylistPlayerChanges();
+
+// Oblivion rooms («Добавить из плейлиста»): the playlists of the account
+// as plain data. RoomPlaylistTracks() asks the server for the messages of
+// that playlist that are not loaded yet (the same lookups the playlist
+// box makes when it is opened), RoomPlaylistsChanges() fires when one has
+// come or a playlist has changed.
+struct RoomPlaylistBrief {
+	uint64 id = 0;
+	QString name;
+	int count = 0;
+};
+struct RoomPlaylistTrack {
+	FullMsgId id;
+	QString title;
+	QString performer;
+	QString fileName;
+	int duration = 0; // Seconds.
+	bool ready = false; // The message with the file is loaded.
+	bool failed = false; // It is gone or can't be asked for.
+};
+[[nodiscard]] std::vector<RoomPlaylistBrief> RoomPlaylists(
+	not_null<Main::Session*> session);
+[[nodiscard]] std::vector<RoomPlaylistTrack> RoomPlaylistTracks(
+	not_null<Main::Session*> session,
+	uint64 playlistId);
+[[nodiscard]] rpl::producer<> RoomPlaylistsChanges(
+	not_null<Main::Session*> session);
 
 } // namespace Oblivion

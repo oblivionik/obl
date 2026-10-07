@@ -19,6 +19,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "oblivion/oblivion_app_icon.h"
 #include "oblivion/oblivion_badge.h"
+#include "oblivion/oblivion_cloud_share.h"
+#include "oblivion/oblivion_cloud_social.h"
+#include "oblivion/oblivion_cloud_sync.h"
+#include "oblivion/oblivion_cloud_ui.h"
+#include "oblivion/oblivion_cloud_update.h"
 #include "oblivion/oblivion_deleted.h"
 #include "oblivion/oblivion_gift_catalog.h"
 #include "oblivion/oblivion_lottie_editor.h"
@@ -26,6 +31,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_online.h"
 #include "oblivion/oblivion_photo_integration.h"
 #include "oblivion/oblivion_playlists.h"
+#include "oblivion/oblivion_room.h"
+#include "oblivion/oblivion_send_online.h"
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_sticker_batch.h"
 #include "oblivion/oblivion_sticker_packs.h"
@@ -894,39 +901,8 @@ void BuildToolsSection(SectionBuilder &builder) {
 }
 
 // Round 4: badge.
-void AddBadgeToggle(SectionBuilder &builder) {
-	const auto controller = builder.controller();
-
-	// The toggle only shows the state of the badge for the account of
-	// this window: a click asks the badge module, which switches it after
-	// the consent and with the marker really written to the bio of that
-	// account (or removed from it), and never right away.
-	const auto button = builder.addButton({
-		.id = u"oblivion/badge"_q,
-		.title = tr::lng_oblivion_badge_settings(),
-		.icon = { &st::menuIconSigned },
-		.onClick = [=] {
-			Oblivion::Badge::SetEnabled(
-				controller,
-				!Oblivion::Badge::Enabled(&controller->session()));
-		},
-		.keywords = {
-			u"badge"_q,
-			u"mark"_q,
-			u"bio"_q,
-			u"oblivion"_q,
-			u"значок"_q,
-			u"галочка"_q,
-			u"метка"_q,
-			u"о себе"_q,
-		},
-	});
-	if (button && controller) {
-		button->toggleOn(
-			Oblivion::Badge::EnabledValue(&controller->session()),
-			true);
-	}
-}
+// The badge is published through Oblivion Cloud since round 5: its rows
+// are in BuildSocialSection() («Профиль и видимость»).
 // Round 4: badge end.
 
 void BuildInterfaceSection(SectionBuilder &builder) {
@@ -1118,8 +1094,7 @@ void BuildInterfaceSection(SectionBuilder &builder) {
 	AddSectionEnd(builder, tr::lng_oblivion_listen_settings_about());
 	// Round 4: listen together end.
 	// Round 4: badge.
-	AddBadgeToggle(builder);
-	AddSectionEnd(builder, tr::lng_oblivion_badge_settings_about());
+	// Moved to BuildSocialSection() in round 5.
 	// Round 4: badge end.
 }
 
@@ -1197,7 +1172,572 @@ void BuildVisualSection(SectionBuilder &builder) {
 	builder.addDividerText(tr::lng_oblivion_visual_about());
 }
 
+// Round 5. Every feature keeps its rows inside its own block; the blocks
+// of the scaffold only open the entry points of the modules.
+// Round 5: cloud.
+// A switch that needs the cloud (it shows the user to other people or
+// talks to the server by itself): turning it on first asks the consent
+// to Oblivion Cloud for the account of this window, turning it off needs
+// nothing. The switch itself is app-wide; the module behind it follows
+// Oblivion::Get().changes() and tells the server.
+void AddCloudToggle(SectionBuilder &builder, ToggleArgs &&args) {
+	const auto controller = builder.controller();
+	const auto getter = args.getter;
+	const auto setter = args.setter;
+	const auto button = builder.addButton({
+		.id = std::move(args.id),
+		.title = std::move(args.title),
+		.icon = { args.icon },
+		.onClick = [=] {
+			if ((Oblivion::Get().*getter)()) {
+				(Oblivion::Get().*setter)(false);
+			} else if (controller) {
+				Oblivion::Cloud::RequireConsent(controller, [=] {
+					(Oblivion::Get().*setter)(true);
+				});
+			}
+		},
+		.keywords = std::move(args.keywords),
+	});
+	if (button) {
+		button->toggleOn(SettingsChanges() | rpl::map([=] {
+			return (Oblivion::Get().*getter)();
+		}), true);
+	}
+}
+
+void BuildCloudSection(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+	const auto session = builder.session();
+	const auto account = &Oblivion::Cloud::For(session);
+
+	builder.addSubsectionTitle({
+		.id = u"oblivion/cloud"_q,
+		.title = tr::lng_oblivion_cloud_section(),
+		.keywords = {
+			u"cloud"_q,
+			u"server"_q,
+			u"oblivion"_q,
+			u"облако"_q,
+			u"сервер"_q,
+		},
+	});
+	builder.add([=](const WidgetContext &ctx) {
+		return SectionBuilder::WidgetToAdd{
+			.widget = Oblivion::Cloud::CreateStatusRow(
+				ctx.container.get(),
+				Oblivion::Cloud::StatusValue(account)),
+		};
+	});
+	const auto toggle = builder.addButton({
+		.id = u"oblivion/cloud_toggle"_q,
+		.title = tr::lng_oblivion_cloud_toggle(),
+		.icon = { &st::menuIconIpAddress },
+		.onClick = [=] { Oblivion::Cloud::ToggleFromSettings(controller); },
+		.keywords = {
+			u"cloud"_q,
+			u"connect"_q,
+			u"disconnect"_q,
+			u"облако"_q,
+			u"подключить"_q,
+			u"отключить"_q,
+		},
+	});
+	if (toggle) {
+		toggle->toggleOn(Oblivion::Cloud::EnabledValue(session), true);
+	}
+	builder.addButton({
+		.id = u"oblivion/cloud_link_device"_q,
+		.title = tr::lng_oblivion_cloud_link_device(),
+		.icon = { &st::menuIconDevices },
+		.onClick = [=] { Oblivion::Cloud::ShowLinkDevice(controller); },
+		.keywords = {
+			u"link"_q,
+			u"device"_q,
+			u"code"_q,
+			u"привязать"_q,
+			u"устройство"_q,
+			u"код"_q,
+		},
+		.shown = account->readyValue(),
+	});
+	builder.addButton({
+		.id = u"oblivion/cloud_enter_code"_q,
+		.title = tr::lng_oblivion_cloud_enter_code(),
+		.icon = { &st::menuIconQrCode },
+		.onClick = [=] { Oblivion::Cloud::ShowEnterCode(controller); },
+		.keywords = { u"code"_q, u"link"_q, u"код"_q, u"привязать"_q },
+		.shown = account->stateValue(
+		) | rpl::map([](Oblivion::Cloud::State state) {
+			return (state == Oblivion::Cloud::State::NeedsLink);
+		}),
+	});
+	builder.addButton({
+		.id = u"oblivion/cloud_delete"_q,
+		.title = tr::lng_oblivion_cloud_delete(),
+		.icon = { &st::menuIconDelete },
+		.onClick = [=] { Oblivion::Cloud::ShowDeleteData(controller); },
+		.keywords = {
+			u"delete"_q,
+			u"data"_q,
+			u"server"_q,
+			u"удалить"_q,
+			u"данные"_q,
+		},
+		.shown = Oblivion::Cloud::EnabledValue(session),
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/cloud_links"_q,
+		.title = tr::lng_oblivion_cloud_links(),
+		.icon = &st::menuIconLink,
+		.getter = &Oblivion::Settings::cloudLinks,
+		.setter = &Oblivion::Settings::setCloudLinks,
+		.keywords = { u"links"_q, u"rooms"_q, u"ссылки"_q, u"комнаты"_q },
+	});
+	AddSectionEnd(builder, tr::lng_oblivion_cloud_section_about());
+}
+// Round 5: cloud end.
+
+// Round 5: rooms.
+void BuildRoomsSection(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	builder.addSubsectionTitle({
+		.id = u"oblivion/together"_q,
+		.title = tr::lng_oblivion_room_section(),
+		.keywords = { u"rooms"_q, u"together"_q, u"комнаты"_q, u"вместе"_q },
+	});
+	builder.addButton({
+		.id = u"oblivion/rooms"_q,
+		.title = tr::lng_oblivion_room_settings(),
+		.icon = { &st::menuIconGroups },
+		.onClick = [=] { Oblivion::Rooms::ShowRoomsBox(controller); },
+		.keywords = {
+			u"rooms"_q,
+			u"listen"_q,
+			u"watch"_q,
+			u"draw"_q,
+			u"комнаты"_q,
+			u"музыка"_q,
+			u"видео"_q,
+			u"холст"_q,
+		},
+		.shown = SettingsChanges() | rpl::map([] {
+			return Oblivion::Get().cloudRooms();
+		}),
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/rooms_enabled"_q,
+		.title = tr::lng_oblivion_room_settings_enabled(),
+		.icon = &st::menuIconInvite,
+		.getter = &Oblivion::Settings::cloudRooms,
+		.setter = &Oblivion::Settings::setCloudRooms,
+		.keywords = { u"rooms"_q, u"links"_q, u"комнаты"_q, u"ссылки"_q },
+	});
+	// Round 5: room extras.
+	AddToggle(builder, {
+		.id = u"oblivion/room_reactions"_q,
+		.title = tr::lng_oblivion_rextra_settings_reactions(),
+		.icon = &st::menuIconReactions,
+		.getter = &Oblivion::Settings::roomReactions,
+		.setter = &Oblivion::Settings::setRoomReactions,
+		.keywords = {
+			u"reactions"_q,
+			u"stickers"_q,
+			u"rooms"_q,
+			u"реакции"_q,
+			u"стикеры"_q,
+		},
+	});
+	// Round 5: room extras end.
+	AddSectionEnd(builder, tr::lng_oblivion_room_settings_about());
+}
+// Round 5: rooms end.
+
+// Round 5: social.
+// What is public about the account (the badge, the chips, who sees the
+// profile and the activity, the chosen people) is kept by the server for
+// one Telegram account: the rows show what the server has for the account
+// of this window and change it by a click through Oblivion::Social, which
+// asks the consent to Oblivion Cloud first. Nothing here is app-wide, so
+// a switch flipped in one account publishes nothing about the others.
+void AddSocialFlag(
+		SectionBuilder &builder,
+		const QString &id,
+		rpl::producer<QString> title,
+		const style::icon *icon,
+		Oblivion::Social::Flag flag,
+		QStringList keywords) {
+	const auto controller = builder.controller();
+	const auto session = builder.session();
+	const auto button = builder.addButton({
+		.id = id,
+		.title = std::move(title),
+		.icon = { icon },
+		.onClick = [=] { Oblivion::Social::ToggleFlag(controller, flag); },
+		.keywords = std::move(keywords),
+	});
+	if (button) {
+		button->toggleOn(Oblivion::Social::FlagValue(session, flag), true);
+	}
+}
+
+void AddAudienceRow(
+		SectionBuilder &builder,
+		const QString &id,
+		tr::phrase<> title,
+		const style::icon *icon,
+		Oblivion::Social::AudienceKind kind) {
+	const auto controller = builder.controller();
+	const auto session = builder.session();
+	builder.addButton({
+		.id = id,
+		.title = title(),
+		.icon = { icon },
+		.label = rpl::combine(
+			Oblivion::Social::AudienceValue(session, kind),
+			tr::lng_oblivion_social_audience_nobody()
+		) | rpl::map([](
+				Oblivion::Social::Audience audience,
+				const QString &) {
+			return Oblivion::Social::AudienceName(audience);
+		}),
+		.onClick = [=] {
+			Oblivion::Social::ShowAudienceBox(controller, kind);
+		},
+		.keywords = {
+			u"audience"_q,
+			u"privacy"_q,
+			u"кто видит"_q,
+			u"видимость"_q,
+		},
+	});
+}
+
+void BuildSocialSection(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	builder.addSubsectionTitle({
+		.id = u"oblivion/social"_q,
+		.title = tr::lng_oblivion_social_section(),
+		.keywords = {
+			u"profile"_q,
+			u"friends"_q,
+			u"activity"_q,
+			u"профиль"_q,
+			u"друзья"_q,
+			u"активность"_q,
+		},
+	});
+	builder.addButton({
+		.id = u"oblivion/social_friends"_q,
+		.title = tr::lng_oblivion_social_friends(),
+		.icon = { &st::menuIconRatingUsers },
+		.onClick = [=] { Oblivion::Social::ShowFriends(controller); },
+		.keywords = { u"friends"_q, u"друзья"_q, u"слушает"_q },
+	});
+	builder.addButton({
+		.id = u"oblivion/social_my_profile"_q,
+		.title = tr::lng_oblivion_social_my_profile(),
+		.icon = { &st::menuIconProfile },
+		.onClick = [=] { Oblivion::Social::ShowMyProfile(controller); },
+		.keywords = {
+			u"profile"_q,
+			u"status"_q,
+			u"профиль"_q,
+			u"статус"_q,
+		},
+	});
+	const auto session = builder.session();
+	using SocialFlag = Oblivion::Social::Flag;
+	using SocialAudience = Oblivion::Social::AudienceKind;
+	AddSocialFlag(
+		builder,
+		u"oblivion/social_badge"_q,
+		tr::lng_oblivion_social_badge(),
+		&st::menuIconSigned,
+		SocialFlag::Badge,
+		{
+			u"badge"_q,
+			u"mark"_q,
+			u"cloud"_q,
+			u"значок"_q,
+			u"галочка"_q,
+			u"облако"_q,
+		});
+
+	// Only while the bio of this account still has the invisible marker
+	// of the round 4 badge: it is removed by this click and no other way.
+	builder.addButton({
+		.id = u"oblivion/social_marker_remove"_q,
+		.title = tr::lng_oblivion_social_marker_remove(),
+		.icon = { &st::menuIconDelete },
+		.onClick = [=] { Oblivion::Social::ShowRemoveMarker(controller); },
+		.keywords = { u"bio"_q, u"mark"_q, u"о себе"_q, u"метка"_q },
+		.shown = Oblivion::Badge::OldMarkerValue(session),
+	});
+	AddAudienceRow(
+		builder,
+		u"oblivion/social_profile_audience"_q,
+		tr::lng_oblivion_social_profile_audience,
+		&st::menuIconPermissions,
+		SocialAudience::Profile);
+	AddAudienceRow(
+		builder,
+		u"oblivion/social_activity_audience"_q,
+		tr::lng_oblivion_social_activity_audience,
+		&st::menuIconLock,
+		SocialAudience::Activity);
+	builder.addButton({
+		.id = u"oblivion/social_chosen"_q,
+		.title = tr::lng_oblivion_social_chosen(),
+		.icon = { &st::menuIconInvite },
+		.label = Oblivion::Social::ChosenCountValue(
+			session
+		) | rpl::map([](int count) {
+			return count ? QString::number(count) : QString();
+		}),
+		.onClick = [=] { Oblivion::Social::ShowChosenList(controller); },
+		.keywords = { u"chosen"_q, u"people"_q, u"выбранные"_q, u"люди"_q },
+	});
+	AddSocialFlag(
+		builder,
+		u"oblivion/social_chip_listening"_q,
+		tr::lng_oblivion_social_chip_listening(),
+		&st::menuIconSoundOn,
+		SocialFlag::ChipListening,
+		{ u"listening"_q, u"music"_q, u"слушаю"_q, u"музыка"_q });
+	AddSocialFlag(
+		builder,
+		u"oblivion/social_chip_room"_q,
+		tr::lng_oblivion_social_chip_room(),
+		&st::menuIconChatBubble,
+		SocialFlag::ChipRoom,
+		{ u"room"_q, u"activity"_q, u"комната"_q });
+	AddSocialFlag(
+		builder,
+		u"oblivion/social_chip_online"_q,
+		tr::lng_oblivion_social_chip_online(),
+		&st::menuIconWhenOnline,
+		SocialFlag::ChipOnline,
+		{ u"online"_q, u"activity"_q, u"в сети"_q });
+	AddToggle(builder, {
+		.id = u"oblivion/social_badge_show"_q,
+		.title = tr::lng_oblivion_social_badge_show(),
+		.icon = &st::menuIconUserShow,
+		.getter = &Oblivion::Settings::cloudBadgeShow,
+		.setter = &Oblivion::Settings::setCloudBadgeShow,
+		.keywords = { u"badge"_q, u"show"_q, u"значки"_q },
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/social_profile_show"_q,
+		.title = tr::lng_oblivion_social_profile_show(),
+		.icon = &st::menuIconShowInChat,
+		.getter = &Oblivion::Settings::cloudProfileShow,
+		.setter = &Oblivion::Settings::setCloudProfileShow,
+		.keywords = {
+			u"profiles"_q,
+			u"activity"_q,
+			u"профили"_q,
+			u"активность"_q,
+		},
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/social_friends_menu"_q,
+		.title = tr::lng_oblivion_social_friends_menu(),
+		.icon = &st::menuIconManage,
+		.getter = &Oblivion::Settings::cloudFriends,
+		.setter = &Oblivion::Settings::setCloudFriends,
+		.keywords = { u"friends"_q, u"menu"_q, u"друзья"_q, u"меню"_q },
+	});
+	AddSectionEnd(builder, tr::lng_oblivion_social_settings_about());
+}
+// Round 5: social end.
+
+void BuildSyncSection(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	builder.addSubsectionTitle({
+		.id = u"oblivion/sync"_q,
+		.title = tr::lng_oblivion_sync_section(),
+		.keywords = {
+			u"sync"_q,
+			u"update"_q,
+			u"синхронизация"_q,
+			u"обновления"_q,
+		},
+	});
+	// Round 5: sync.
+	// Sharing has no rows of its own in the scaffold: they open the two
+	// lists of oblivion_cloud_share.h (the consent is asked on the click).
+	builder.addButton({
+		.id = u"oblivion/share_playlists"_q,
+		.title = tr::lng_oblivion_share_library(),
+		.icon = { &st::menuIconSoundOn },
+		.onClick = [=] { Oblivion::Share::ShowLibrary(controller); },
+		.keywords = {
+			u"share"_q,
+			u"playlists"_q,
+			u"плейлисты"_q,
+			u"поделиться"_q,
+		},
+	});
+	builder.addButton({
+		.id = u"oblivion/share_presets"_q,
+		.title = tr::lng_oblivion_share_gallery_title(),
+		.icon = { &st::menuIconPalette },
+		.onClick = [=] { Oblivion::Share::ShowGallery(controller); },
+		.keywords = {
+			u"share"_q,
+			u"presets"_q,
+			u"gallery"_q,
+			u"наборы"_q,
+			u"эффекты"_q,
+		},
+	});
+	builder.addButton({
+		.id = u"oblivion/sync_settings"_q,
+		.title = tr::lng_oblivion_sync_settings(),
+		.icon = { &st::menuIconRestore },
+		.onClick = [=] { Oblivion::Sync::ShowBox(controller); },
+		.keywords = {
+			u"sync"_q,
+			u"settings"_q,
+			u"devices"_q,
+			u"синхронизация"_q,
+			u"настройки"_q,
+		},
+	});
+	AddCloudToggle(builder, {
+		.id = u"oblivion/sync_auto"_q,
+		.title = tr::lng_oblivion_sync_settings_auto(),
+		.icon = &st::menuIconReschedule,
+		.getter = &Oblivion::Settings::cloudSettingsAutoSync,
+		.setter = &Oblivion::Settings::setCloudSettingsAutoSync,
+		.keywords = { u"sync"_q, u"auto"_q, u"автоматически"_q },
+	});
+	// Round 5: sync end.
+	// Round 5: update.
+	builder.addButton({
+		.id = u"oblivion/update_check"_q,
+		.title = tr::lng_oblivion_update_settings_check(),
+		.icon = { &st::menuIconDownload },
+		.onClick = [=] { Oblivion::Update::CheckNow(controller); },
+		.keywords = {
+			u"update"_q,
+			u"version"_q,
+			u"обновления"_q,
+			u"версия"_q,
+		},
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/update_auto"_q,
+		.title = tr::lng_oblivion_update_settings_auto(),
+		.icon = &st::menuIconSchedule,
+		.getter = &Oblivion::Settings::cloudUpdateCheck,
+		.setter = &Oblivion::Settings::setCloudUpdateCheck,
+		.keywords = { u"update"_q, u"auto"_q, u"обновления"_q },
+	});
+	// Round 5: update end.
+	AddSectionEnd(builder, tr::lng_oblivion_update_settings_about());
+}
+
+// Round 5: send online.
+[[nodiscard]] QString SendOnlineLimitName(int hours) {
+	return (hours >= 48 && !(hours % 24))
+		? tr::lng_oblivion_sendonline_days(tr::now, lt_count, hours / 24)
+		: tr::lng_oblivion_sendonline_hours(tr::now, lt_count, hours);
+}
+
+void SendOnlineLimitBox(not_null<Ui::GenericBox*> box) {
+	const auto values = std::vector<int>{ 1, 6, 24, 72, 168 };
+	const auto current = Oblivion::Get().sendWhenOnlineHours();
+	auto options = std::vector<QString>();
+	auto selected = 2;
+	for (const auto hours : values) {
+		if (hours == current) {
+			selected = int(options.size());
+		}
+		options.push_back(SendOnlineLimitName(hours));
+	}
+	SingleChoiceBox(box, {
+		.title = tr::lng_oblivion_sendonline_settings_limit(),
+		.options = options,
+		.initialSelection = selected,
+		.callback = [=](int index) {
+			if (index >= 0 && index < int(values.size())) {
+				Oblivion::Get().setSendWhenOnlineHours(values[index]);
+			}
+		},
+	});
+}
+
+void BuildSendOnlineSection(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	builder.addSubsectionTitle({
+		.id = u"oblivion/send_online"_q,
+		.title = tr::lng_oblivion_sendonline_section(),
+		.keywords = {
+			u"send"_q,
+			u"online"_q,
+			u"отправить"_q,
+			u"в сети"_q,
+		},
+	});
+	AddToggle(builder, {
+		.id = u"oblivion/send_online_enabled"_q,
+		.title = tr::lng_oblivion_sendonline_settings(),
+		.icon = &st::menuIconSend,
+		.getter = &Oblivion::Settings::sendWhenOnline,
+		.setter = &Oblivion::Settings::setSendWhenOnline,
+		.keywords = {
+			u"send"_q,
+			u"online"_q,
+			u"later"_q,
+			u"отправить"_q,
+			u"в сети"_q,
+			u"позже"_q,
+		},
+	});
+	builder.addButton({
+		.id = u"oblivion/send_online_limit"_q,
+		.title = tr::lng_oblivion_sendonline_settings_limit(),
+		.icon = { &st::menuIconSchedule },
+		.label = rpl::merge(
+			SettingsChanges(),
+			tr::lng_oblivion_sendonline_settings_limit() | rpl::to_empty
+		) | rpl::map([] {
+			return SendOnlineLimitName(
+				Oblivion::Get().sendWhenOnlineHours());
+		}),
+		.onClick = [=] { controller->show(Box(SendOnlineLimitBox)); },
+		.keywords = { u"limit"_q, u"wait"_q, u"срок"_q, u"ждать"_q },
+	});
+	builder.addButton({
+		.id = u"oblivion/send_online_list"_q,
+		.title = tr::lng_oblivion_sendonline_settings_list(),
+		.icon = { &st::menuIconWhenOnline },
+		.onClick = [=] { Oblivion::SendOnline::ShowList(controller); },
+		.keywords = {
+			u"waiting"_q,
+			u"queue"_q,
+			u"ожидают"_q,
+			u"очередь"_q,
+		},
+	});
+	AddSectionEnd(builder, tr::lng_oblivion_sendonline_settings_about());
+}
+// Round 5: send online end.
+
 void BuildOblivionSectionContent(SectionBuilder &builder) {
+	// Round 5.
+	BuildCloudSection(builder);
+	BuildRoomsSection(builder);
+	BuildSocialSection(builder);
+	BuildSyncSection(builder);
+	BuildSendOnlineSection(builder);
+	// Round 5 end.
 	BuildGhostSection(builder);
 	BuildTrackingSection(builder);
 	BuildSavingSection(builder);

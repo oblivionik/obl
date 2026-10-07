@@ -1719,6 +1719,9 @@ public:
 		return _changes.events();
 	}
 
+	// Oblivion round 5: see SetWaitedUsers() in the header.
+	void setWaited(base::flat_set<uint64> ids);
+
 private:
 	void load();
 	void firstUpdateCheck();
@@ -1755,6 +1758,7 @@ private:
 	base::Timer _pollTimer;
 	std::vector<not_null<UserData*>> _arrived;
 	base::flat_set<uint64> _pollList;
+	base::flat_set<uint64> _waited; // Oblivion round 5.
 	base::flat_map<uint64, TimeId> _polledAt;
 	rpl::event_stream<uint64> _changes;
 	crl::time _lastSaved = 0;
@@ -2208,10 +2212,27 @@ void Tracker::pollEveryoneNext() {
 // The choice doesn't look at whether the owner can ask right now: while
 // it has no connection or the server asked it to wait, nobody asks in
 // its place.
+// Oblivion round 5: the users a message of this account waits for (see
+// oblivion_send_online.h) are asked about with the notify list: the same
+// request, the same limits, and always by this account, the message is
+// its own. With nobody waited for everything is as it was.
+void Tracker::setWaited(base::flat_set<uint64> ids) {
+	if (_forgotten || _waited == ids) {
+		return;
+	}
+	const auto added = ranges::any_of(ids, [&](uint64 id) {
+		return !_waited.contains(id);
+	});
+	_waited = std::move(ids);
+	if (added && _polling) {
+		pollSoon();
+	}
+}
+
 std::vector<uint64> Tracker::pollIds() const {
 	auto result = std::vector<uint64>();
 	const auto &list = Get().onlineNotifyList();
-	if (list.empty()) {
+	if (list.empty() && _waited.empty()) { // Oblivion round 5: _waited.
 		return result;
 	}
 	const auto sessions = PollSessions();
@@ -2239,6 +2260,17 @@ std::vector<uint64> Tracker::pollIds() const {
 		if (PollOwner(candidates) == self) {
 			result.push_back(id);
 		}
+	}
+	// Oblivion round 5: those a message waits for, the list stays sorted.
+	if (!_waited.empty()) {
+		for (const auto id : _waited) {
+			const auto user = _session->data().userLoaded(
+				peerToUser(PeerId(id)));
+			if (user && Trackable(user) && !ranges::contains(result, id)) {
+				result.push_back(id);
+			}
+		}
+		ranges::sort(result);
 	}
 	return result;
 }
@@ -2279,7 +2311,9 @@ void Tracker::poll() {
 		return;
 	} else if (!connected()) {
 		return;
-	} else if (!Get().onlineJournal() && !NotifyFromAccount(_session)) {
+	} else if (!Get().onlineJournal()
+		&& !NotifyFromAccount(_session)
+		&& _waited.empty()) { // Oblivion round 5: a message waits.
 		// Nothing to write the answer to and nobody to tell about it.
 		_polledAt.clear();
 		return;
@@ -4825,6 +4859,15 @@ void StartOnlineTracker(not_null<Main::Session*> session) {
 	session->lifetime().add([=] {
 		Online::Trackers().remove(session);
 	});
+}
+
+// Oblivion round 5.
+void Online::SetWaitedUsers(
+		not_null<Main::Session*> session,
+		base::flat_set<uint64> ids) {
+	if (const auto tracker = TrackerFor(session)) {
+		tracker->setWaited(std::move(ids));
+	}
 }
 
 void ForgetOnlineJournal(not_null<Main::Session*> session) {

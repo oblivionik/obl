@@ -12,6 +12,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_audio.h"
 #include "oblivion/oblivion_badge.h"
 #include "oblivion/oblivion_chat_stats.h"
+#include "oblivion/oblivion_cloud.h"
+#include "oblivion/oblivion_cloud_share.h"
+#include "oblivion/oblivion_cloud_social.h"
+#include "oblivion/oblivion_cloud_sync.h"
+#include "oblivion/oblivion_deleted_search.h"
 #include "oblivion/oblivion_ghost_button.h"
 #include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_lottie.h"
@@ -23,7 +28,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_photo_doc.h"
 #include "oblivion/oblivion_photo_fx.h"
 #include "oblivion/oblivion_profile_history.h"
+#include "oblivion/oblivion_room.h"
+#include "oblivion/oblivion_room_canvas.h"
+#include "oblivion/oblivion_room_extras.h"
+#include "oblivion/oblivion_room_video.h"
 #include "oblivion/oblivion_round_video_convert.h"
+#include "oblivion/oblivion_send_online.h"
+#include "oblivion/oblivion_stats_export.h"
 #include "oblivion/oblivion_sticker_batch.h"
 #include "oblivion/oblivion_sticker_export.h"
 #include "oblivion/oblivion_sticker_packs_core.h"
@@ -84,6 +95,20 @@ struct Test {
 		{ u"badge"_q, &Badge::RunSelfTest },
 		{ u"listen"_q, &Listen::RunSelfTest },
 		{ u"lottie_editor"_q, &LottieEdit::RunEditorSelfTest },
+		// Round 5. "cloud" talks to the real server only when
+		// OBLIVION_SELFTEST_CLOUD_LIVE=1 is set, see oblivion_cloud.h.
+		{ u"cloud"_q, &Cloud::RunSelfTest },
+		{ u"room"_q, &Rooms::RunSelfTest },
+		{ u"room_sync"_q, &Rooms::RunSyncSelfTest },
+		{ u"room_canvas"_q, &Rooms::RunCanvasSelfTest },
+		{ u"room_extras"_q, &Rooms::RunExtrasSelfTest },
+		{ u"room_video"_q, &Rooms::RunVideoSelfTest },
+		{ u"cloud_social"_q, &Social::RunSelfTest },
+		{ u"cloud_share"_q, &Share::RunSelfTest },
+		{ u"cloud_sync"_q, &Sync::RunSelfTest },
+		{ u"deleted_search"_q, &DeletedSearch::RunSelfTest },
+		{ u"send_online"_q, &SendOnline::RunSelfTest },
+		{ u"stats_export"_q, &StatsExport::RunSelfTest },
 		{ u"ui"_q, &SelfTest::RunUiSnapshots, true },
 	};
 }

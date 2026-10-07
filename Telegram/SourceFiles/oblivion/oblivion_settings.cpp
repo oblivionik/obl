@@ -67,6 +67,41 @@ constexpr auto kAttachTools = "attach_tools";
 constexpr auto kBadgeEnabled = "badge_enabled";
 constexpr auto kBadgeAsked = "badge_asked";
 constexpr auto kListenTogether = "listen_together";
+// Round 5: cloud.
+constexpr auto kCloudLinks = "cloud_links";
+// Round 5: cloud end.
+// Round 5: rooms.
+constexpr auto kCloudRooms = "cloud_rooms";
+constexpr auto kRoomMusicVolume = "room_music_volume";
+constexpr auto kRoomVideoVolume = "room_video_volume";
+// Round 5: rooms end.
+// Round 5: room extras.
+constexpr auto kRoomReactions = "room_reactions";
+// Round 5: room extras end.
+// Round 5: social.
+constexpr auto kCloudBadge = "cloud_badge";
+constexpr auto kCloudBadgeShow = "cloud_badge_show";
+constexpr auto kCloudProfileShow = "cloud_profile_show";
+constexpr auto kCloudFriends = "cloud_friends";
+constexpr auto kCloudProfileAudience = "cloud_profile_audience";
+constexpr auto kCloudActivityAudience = "cloud_activity_audience";
+constexpr auto kCloudChipListening = "cloud_chip_listening";
+constexpr auto kCloudChipRoom = "cloud_chip_room";
+constexpr auto kCloudChipOnline = "cloud_chip_online";
+constexpr auto kCloudChosen = "cloud_chosen";
+// Round 5: social end.
+// Round 5: sync.
+constexpr auto kCloudSettingsAutoSync = "cloud_settings_auto_sync";
+// Round 5: sync end.
+// Round 5: update.
+constexpr auto kCloudUpdateCheck = "cloud_update_check";
+constexpr auto kCloudUpdateLastCheck = "cloud_update_last_check";
+constexpr auto kCloudUpdateSeenBuild = "cloud_update_seen_build";
+// Round 5: update end.
+// Round 5: send online.
+constexpr auto kSendWhenOnline = "send_when_online";
+constexpr auto kSendWhenOnlineHours = "send_when_online_hours";
+// Round 5: send online end.
 
 [[nodiscard]] QString FilePath() {
 	return cWorkingDir() + u"tdata/oblivion.json"_q;
@@ -185,9 +220,55 @@ void Settings::setGhostButtonOwned(GhostPreset value) {
 	changed();
 }
 
+// Round 5: social.
+void Settings::setCloudChosen(uint64 userId, bool chosen) {
+	if (!userId || (isCloudChosen(userId) == chosen)) {
+		return;
+	} else if (chosen) {
+		_cloudChosen.emplace(userId);
+	} else {
+		_cloudChosen.remove(userId);
+	}
+	changed();
+}
+// Round 5: social end.
+
 rpl::producer<> Settings::changes() const {
 	return _changes.events();
 }
+
+// Round 5: sync.
+QByteArray Settings::syncSnapshot() {
+	const auto read = [] {
+		auto file = QFile(FilePath());
+		return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+	};
+	auto result = read();
+	if (!QJsonDocument::fromJson(result).isObject()) {
+		// Nothing was changed since the installation: the defaults.
+		save();
+		result = read();
+	}
+	return result;
+}
+
+bool Settings::syncApply(const QByteArray &json) {
+	if (!QJsonDocument::fromJson(json).isObject()) {
+		return false;
+	}
+	auto file = QSaveFile(FilePath());
+	if (!file.open(QIODevice::WriteOnly)) {
+		return false;
+	}
+	file.write(json);
+	if (!file.commit()) {
+		return false;
+	}
+	load();
+	_changes.fire({});
+	return true;
+}
+// Round 5: sync end.
 
 void Settings::load() {
 	auto file = QFile(FilePath());
@@ -355,6 +436,59 @@ void Settings::load() {
 	read(kBadgeEnabled, _badgeEnabled);
 	read(kBadgeAsked, _badgeAsked);
 	read(kListenTogether, _listenTogether);
+
+	// Round 5: a number that must stay inside [low, high].
+	const auto readRange = [&](
+			const char *key,
+			int64 &field,
+			int64 low,
+			int64 high) {
+		const auto value = object.value(QString::fromUtf8(key));
+		if (value.isDouble()) {
+			field = std::clamp(int64(value.toDouble()), low, high);
+		}
+	};
+	// Round 5: cloud.
+	read(kCloudLinks, _cloudLinks);
+	// Round 5: cloud end.
+	// Round 5: rooms.
+	read(kCloudRooms, _cloudRooms);
+	readRange(kRoomMusicVolume, _roomMusicVolume, 0, 100);
+	readRange(kRoomVideoVolume, _roomVideoVolume, 0, 100);
+	// Round 5: rooms end.
+	// Round 5: room extras.
+	read(kRoomReactions, _roomReactions);
+	// Round 5: room extras end.
+	// Round 5: social.
+	read(kCloudBadge, _cloudBadge);
+	read(kCloudBadgeShow, _cloudBadgeShow);
+	read(kCloudProfileShow, _cloudProfileShow);
+	read(kCloudFriends, _cloudFriends);
+	readRange(kCloudProfileAudience, _cloudProfileAudience, 0, 2);
+	readRange(kCloudActivityAudience, _cloudActivityAudience, 0, 2);
+	read(kCloudChipListening, _cloudChipListening);
+	read(kCloudChipRoom, _cloudChipRoom);
+	read(kCloudChipOnline, _cloudChipOnline);
+	_cloudChosen.clear();
+	const auto chosen = object.value(QString::fromUtf8(kCloudChosen)).toArray();
+	for (const auto &value : chosen) {
+		if (const auto userId = value.toString().toULongLong()) {
+			_cloudChosen.emplace(userId);
+		}
+	}
+	// Round 5: social end.
+	// Round 5: sync.
+	read(kCloudSettingsAutoSync, _cloudSettingsAutoSync);
+	// Round 5: sync end.
+	// Round 5: update.
+	read(kCloudUpdateCheck, _cloudUpdateCheck);
+	readNumber(kCloudUpdateLastCheck, _cloudUpdateLastCheck);
+	readNumber(kCloudUpdateSeenBuild, _cloudUpdateSeenBuild);
+	// Round 5: update end.
+	// Round 5: send online.
+	read(kSendWhenOnline, _sendWhenOnline);
+	readRange(kSendWhenOnlineHours, _sendWhenOnlineHours, 1, 168);
+	// Round 5: send online end.
 }
 
 void Settings::save() {
@@ -479,6 +613,64 @@ void Settings::save() {
 	object.insert(QString::fromUtf8(kBadgeEnabled), _badgeEnabled);
 	object.insert(QString::fromUtf8(kBadgeAsked), _badgeAsked);
 	object.insert(QString::fromUtf8(kListenTogether), _listenTogether);
+
+	// Round 5: cloud.
+	object.insert(QString::fromUtf8(kCloudLinks), _cloudLinks);
+	// Round 5: cloud end.
+	// Round 5: rooms.
+	object.insert(QString::fromUtf8(kCloudRooms), _cloudRooms);
+	object.insert(
+		QString::fromUtf8(kRoomMusicVolume),
+		double(_roomMusicVolume));
+	object.insert(
+		QString::fromUtf8(kRoomVideoVolume),
+		double(_roomVideoVolume));
+	// Round 5: rooms end.
+	// Round 5: room extras.
+	object.insert(QString::fromUtf8(kRoomReactions), _roomReactions);
+	// Round 5: room extras end.
+	// Round 5: social.
+	object.insert(QString::fromUtf8(kCloudBadge), _cloudBadge);
+	object.insert(QString::fromUtf8(kCloudBadgeShow), _cloudBadgeShow);
+	object.insert(QString::fromUtf8(kCloudProfileShow), _cloudProfileShow);
+	object.insert(QString::fromUtf8(kCloudFriends), _cloudFriends);
+	object.insert(
+		QString::fromUtf8(kCloudProfileAudience),
+		double(_cloudProfileAudience));
+	object.insert(
+		QString::fromUtf8(kCloudActivityAudience),
+		double(_cloudActivityAudience));
+	object.insert(
+		QString::fromUtf8(kCloudChipListening),
+		_cloudChipListening);
+	object.insert(QString::fromUtf8(kCloudChipRoom), _cloudChipRoom);
+	object.insert(QString::fromUtf8(kCloudChipOnline), _cloudChipOnline);
+	auto chosen = QJsonArray();
+	for (const auto userId : _cloudChosen) {
+		chosen.push_back(QString::number(userId));
+	}
+	object.insert(QString::fromUtf8(kCloudChosen), chosen);
+	// Round 5: social end.
+	// Round 5: sync.
+	object.insert(
+		QString::fromUtf8(kCloudSettingsAutoSync),
+		_cloudSettingsAutoSync);
+	// Round 5: sync end.
+	// Round 5: update.
+	object.insert(QString::fromUtf8(kCloudUpdateCheck), _cloudUpdateCheck);
+	object.insert(
+		QString::fromUtf8(kCloudUpdateLastCheck),
+		double(_cloudUpdateLastCheck));
+	object.insert(
+		QString::fromUtf8(kCloudUpdateSeenBuild),
+		double(_cloudUpdateSeenBuild));
+	// Round 5: update end.
+	// Round 5: send online.
+	object.insert(QString::fromUtf8(kSendWhenOnline), _sendWhenOnline);
+	object.insert(
+		QString::fromUtf8(kSendWhenOnlineHours),
+		double(_sendWhenOnlineHours));
+	// Round 5: send online end.
 
 	// QSaveFile replaces the old file only after a complete write
 	// (a failed write() is remembered and makes commit() discard it),

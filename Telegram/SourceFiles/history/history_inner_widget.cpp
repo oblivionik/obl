@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_music_editor.h"
 #include "oblivion/oblivion_photo_integration.h"
 #include "oblivion/oblivion_playlists.h"
+#include "oblivion/oblivion_room_video.h"
 #include "oblivion/oblivion_round_video.h"
 #include "oblivion/oblivion_self_destruct.h"
 #include "oblivion/oblivion_settings.h"
@@ -3164,6 +3165,11 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 				item,
 				document);
 			Oblivion::AddVideoEditorAction(
+				_menu.get(),
+				_controller,
+				item,
+				document);
+			Oblivion::Rooms::AddVideoToRoomAction( // Oblivion: room video.
 				_menu.get(),
 				_controller,
 				item,

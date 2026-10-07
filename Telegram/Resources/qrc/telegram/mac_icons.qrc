@@ -3,5 +3,6 @@
     <file alias="art/icon_round512@2x.png">../../art/icon_round512@2x.png</file>
     <file alias="art/oblivion/telegram_icon.png">../../art/oblivion_icon/telegram_original_1024.png</file>
     <file alias="art/oblivion/squircle_mask.png">../../art/oblivion_icon/squircle_mask.png</file>
+    <file alias="art/oblivion/previous_icon.png">../../art/oblivion_icon/oblivion_previous_1024.png</file>
   </qresource>
 </RCC>

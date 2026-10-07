@@ -7,7 +7,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/window_main_menu.h"
 
+#include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_interface.h"
+#include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_unified_chats.h"
 #include "apiwrap.h"
 #include "base/event_filter.h"
@@ -720,6 +722,12 @@ void MainMenu::setupMenu() {
 		)->setClickedCallback([=] {
 			controller->showPeerHistory(controller->session().user());
 		});
+		// Oblivion round 5: social.
+		Oblivion::Social::AddMainMenuEntry(_menu, controller);
+		// Oblivion round 5: social end.
+		// Oblivion round 5: rooms.
+		Oblivion::Rooms::AddMainMenuEntry(_menu, controller);
+		// Oblivion round 5: rooms end.
 	} else {
 		addAction(
 			tr::lng_profile_add_contact(),

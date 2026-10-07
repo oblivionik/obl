@@ -39,4 +39,14 @@ void AddDeletedMessagesAction(
 // files that may reveal the IP address when opened, etc.
 void OpenSavedFile(std::shared_ptr<Ui::Show> show, const QString &path);
 
+// Oblivion round 5, for the search (oblivion_deleted_search.h): what a
+// saved media is in a few words ("Photo · name.jpg · 1.2 MB") and one
+// saved record shown in full, with its media, the way the list shows it.
+struct DeletedMedia;
+struct DeletedRecord;
+[[nodiscard]] QString DeletedMediaLabel(const DeletedMedia &media);
+void ShowDeletedRecord(
+	not_null<Window::SessionController*> controller,
+	const DeletedRecord &record);
+
 } // namespace Oblivion

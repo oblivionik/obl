@@ -38,6 +38,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/storage_account.h"
 #include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_playlists.h"
+#include "oblivion/oblivion_room_music.h"
 
 namespace Media {
 namespace Player {
@@ -65,6 +66,10 @@ base::options::toggle OptionDisableAutoplayNext({
 });
 
 [[nodiscard]] float64 LookupPlaybackSpeed(const AudioMsgId &audioId) {
+	// Oblivion: a track of a room is played at the tempo of the room.
+	if (const auto room = Oblivion::Rooms::PlayerSpeed(audioId); room > 0.) {
+		return room;
+	}
 	if (!audioId.changeablePlaybackSpeed()) {
 		return 1.;
 	}
@@ -557,6 +562,11 @@ bool Instance::moveInPlaylist(
 		not_null<Data*> data,
 		int delta,
 		bool autonext) {
+	// Oblivion: a track of a room, the room switches the tracks.
+	if (data->type == AudioMsgId::Type::Song
+		&& Oblivion::Rooms::DrivesPlayer(data->current)) {
+		return Oblivion::Rooms::PlayerMove(delta, autonext);
+	}
 	// Oblivion: listening together, only the host switches the tracks.
 	if (data->type == AudioMsgId::Type::Song
 		&& Oblivion::Listen::Follows(data->current)) {
@@ -759,6 +769,10 @@ bool Instance::previousAvailable(AudioMsgId::Type type) const {
 	Assert(data != nullptr);
 
 	if (type == AudioMsgId::Type::Song
+		&& Oblivion::Rooms::DrivesPlayer(data->current)) { // Oblivion
+		return Oblivion::Rooms::PlayerCanMove(-1);
+	}
+	if (type == AudioMsgId::Type::Song
 		&& Oblivion::Listen::Follows(data->current)) { // Oblivion
 		return false;
 	}
@@ -783,6 +797,10 @@ bool Instance::nextAvailable(AudioMsgId::Type type) const {
 	const auto data = getData(type);
 	Assert(data != nullptr);
 
+	if (type == AudioMsgId::Type::Song
+		&& Oblivion::Rooms::DrivesPlayer(data->current)) { // Oblivion
+		return Oblivion::Rooms::PlayerCanMove(1);
+	}
 	if (type == AudioMsgId::Type::Song
 		&& Oblivion::Listen::Follows(data->current)) { // Oblivion
 		return false;
@@ -823,6 +841,9 @@ rpl::producer<> Media::Player::Instance::playlistChanges(
 			: rpl::never<>()),
 		((type == AudioMsgId::Type::Song)
 			? Oblivion::Listen::FollowChanges() // Oblivion
+			: rpl::never<>()),
+		((type == AudioMsgId::Type::Song)
+			? Oblivion::Rooms::PlayerChanges() // Oblivion
 			: rpl::never<>()));
 }
 
@@ -950,8 +971,14 @@ Streaming::PlaybackOptions Instance::streamingOptions(
 	const auto oblivionFrom = (position < 0)
 		? Oblivion::Listen::TakeStartPosition(audioId)
 		: crl::time(-1);
+	// Oblivion: a track of a room starts where the room is now.
+	const auto oblivionRoomFrom = (position < 0)
+		? Oblivion::Rooms::TakeStartPosition(audioId)
+		: crl::time(-1);
 	if (position >= 0) {
 		result.position = position;
+	} else if (oblivionRoomFrom >= 0) {
+		result.position = oblivionRoomFrom;
 	} else if (oblivionFrom >= 0) {
 		result.position = oblivionFrom;
 	} else if (document) {
@@ -1257,6 +1284,15 @@ void Instance::cancelSeeking(AudioMsgId::Type type) {
 }
 
 void Instance::updatePlaybackSpeed() {
+	// Oblivion: the tempo of a track of a room is corrected by the room.
+	if (const auto data = getData(AudioMsgId::Type::Song)) {
+		if (Oblivion::Rooms::DrivesPlayer(data->current)) {
+			if (const auto streamed = data->streamed.get()) {
+				streamed->instance.setSpeed(
+					LookupPlaybackSpeed(data->current));
+			}
+		}
+	}
 	if (const auto data = getData(getActiveType())) {
 		if (!data->current.changeablePlaybackSpeed()) {
 			return;
@@ -1374,7 +1410,9 @@ void Instance::emitUpdate(AudioMsgId::Type type, CheckCallback check) {
 		auto finished = false;
 		_updatedNotifier.fire_copy({state});
 		if (data->isPlaying && state.state == State::StoppedAtEnd) {
-			if (repeat(data) == RepeatMode::One) {
+			if (repeat(data) == RepeatMode::One
+				// Oblivion: the repeat of a room is the room's own.
+				&& !Oblivion::Rooms::DrivesPlayer(data->current)) {
 				play(data->current);
 			} else if (OptionDisableAutoplayNext.value()) {
 				finished = true;

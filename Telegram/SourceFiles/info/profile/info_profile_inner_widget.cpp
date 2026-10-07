@@ -39,6 +39,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/saved/info_saved_music_common.h"
 #include "info_profile_actions.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_cloud_social.h" // Oblivion
 #include "apiwrap.h"
 #include "api/api_peer_photo.h"
 #include "lang/lang_keys.h"
@@ -226,6 +227,21 @@ object_ptr<Ui::RpWidget> InnerWidget::setupContent(
 	if (_topic && _topic->creating()) {
 		stack.finalize();
 		return result;
+	}
+
+	// Oblivion: the activity chips and the «Oblivion» block of a user.
+	if (const auto user = (_topic || _sublist) ? nullptr : _peer->asUser()) {
+		auto block = Oblivion::Social::CreateProfileBlock(
+			result.data(),
+			_controller->parentController(),
+			user);
+		if (block.widget) {
+			stack.add(Section{
+				.widget = std::move(block.widget),
+				.shown = std::move(block.shown),
+			});
+			stack.addPlainSeparator();
+		}
 	}
 
 	BuildProfileDetailsSections(

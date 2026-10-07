@@ -395,10 +395,12 @@ public:
 		apply(_attachTools, value);
 	}
 
-	// Round 4: the Oblivion badge (oblivion_badge.h). badgeEnabled means
-	// the invisible marker is kept in the bio of the user, it is switched
-	// only by Oblivion::Badge::SetEnabled(), after the consent. badgeAsked
-	// means the consent question was already answered once.
+	// Round 4: the Oblivion badge (oblivion_badge.h). Since round 5 the
+	// badge is published through Oblivion Cloud and these two only tell
+	// about the past: badgeEnabled mirrors "the old invisible marker is
+	// still in the bio of some account" (kept by oblivion_badge.cpp),
+	// badgeAsked that the round 4 consent was answered once. Nothing reads
+	// them to decide anything.
 	[[nodiscard]] bool badgeEnabled() const {
 		return _badgeEnabled;
 	}
@@ -419,6 +421,195 @@ public:
 	void setListenTogether(bool value) {
 		apply(_listenTogether, value);
 	}
+
+	// Round 5. App-wide switches of the Oblivion Cloud features and of
+	// the local features of the round. Whether an account talks to the
+	// cloud at all is not here: that is the consent of the account, kept
+	// with its key (oblivion_cloud.h). These switches say what the user
+	// wants for every connected account; the modules follow changes()
+	// and push what is public (the badge, the audiences, the chips) to
+	// the server with Cloud::Account::patchMe(). Everything that shows
+	// the user to other people is off by default. Each feature adds its
+	// own fields inside its own block.
+	// Round 5: cloud.
+	// Room / playlist / preset links of Oblivion Cloud clicked in a chat
+	// are opened in the app (off: in the browser, like any other link).
+	[[nodiscard]] bool cloudLinks() const {
+		return _cloudLinks;
+	}
+	void setCloudLinks(bool value) {
+		apply(_cloudLinks, value);
+	}
+	// Round 5: cloud end.
+	// Round 5: rooms.
+	// The entry points of the rooms (settings, menus, links). A room is
+	// only ever created or joined by a click.
+	[[nodiscard]] bool cloudRooms() const {
+		return _cloudRooms;
+	}
+	void setCloudRooms(bool value) {
+		apply(_cloudRooms, value);
+	}
+	// The own volume of the room players on this device, 0..100.
+	[[nodiscard]] int roomMusicVolume() const {
+		return int(_roomMusicVolume);
+	}
+	void setRoomMusicVolume(int value) {
+		apply(_roomMusicVolume, int64(std::clamp(value, 0, 100)));
+	}
+	[[nodiscard]] int roomVideoVolume() const {
+		return int(_roomVideoVolume);
+	}
+	void setRoomVideoVolume(int value) {
+		apply(_roomVideoVolume, int64(std::clamp(value, 0, 100)));
+	}
+	// Round 5: rooms end.
+	// Round 5: room extras.
+	// Reactions and stickers of other members are shown over the room.
+	[[nodiscard]] bool roomReactions() const {
+		return _roomReactions;
+	}
+	void setRoomReactions(bool value) {
+		apply(_roomReactions, value);
+	}
+	// Round 5: room extras end.
+	// Round 5: social.
+	// What the app shows of other people is set here: cloudBadgeShow,
+	// cloudProfileShow, cloudFriends. What is public about the own account
+	// (cloudBadge, the two audiences, the three chips, cloudChosen) is NOT
+	// taken from here: it belongs to one Telegram account, is kept by the
+	// server and is read / changed through Oblivion::Social (FlagValue,
+	// AudienceValue, ToggleFlag...), so a switch flipped in one account
+	// publishes nothing about the others. Those fields of the scaffold are
+	// left only so that an oblivion.json with them still loads.
+	[[nodiscard]] bool cloudBadge() const {
+		return _cloudBadge;
+	}
+	void setCloudBadge(bool value) {
+		apply(_cloudBadge, value);
+	}
+	// Badges of other people from the cloud list are shown.
+	[[nodiscard]] bool cloudBadgeShow() const {
+		return _cloudBadgeShow;
+	}
+	void setCloudBadgeShow(bool value) {
+		apply(_cloudBadgeShow, value);
+	}
+	// The «Oblivion» block and the activity chips are shown in the
+	// profiles of other people.
+	[[nodiscard]] bool cloudProfileShow() const {
+		return _cloudProfileShow;
+	}
+	void setCloudProfileShow(bool value) {
+		apply(_cloudProfileShow, value);
+	}
+	// «Друзья в Oblivion» in the main menu.
+	[[nodiscard]] bool cloudFriends() const {
+		return _cloudFriends;
+	}
+	void setCloudFriends(bool value) {
+		apply(_cloudFriends, value);
+	}
+	// Who sees the own Oblivion profile and the own activity chips:
+	// 0 nobody (default), 1 the chosen people, 2 everyone in Oblivion.
+	[[nodiscard]] int cloudProfileAudience() const {
+		return int(_cloudProfileAudience);
+	}
+	void setCloudProfileAudience(int value) {
+		apply(_cloudProfileAudience, int64(std::clamp(value, 0, 2)));
+	}
+	[[nodiscard]] int cloudActivityAudience() const {
+		return int(_cloudActivityAudience);
+	}
+	void setCloudActivityAudience(int value) {
+		apply(_cloudActivityAudience, int64(std::clamp(value, 0, 2)));
+	}
+	// The activity chips, each with its own switch.
+	[[nodiscard]] bool cloudChipListening() const {
+		return _cloudChipListening;
+	}
+	void setCloudChipListening(bool value) {
+		apply(_cloudChipListening, value);
+	}
+	[[nodiscard]] bool cloudChipRoom() const {
+		return _cloudChipRoom;
+	}
+	void setCloudChipRoom(bool value) {
+		apply(_cloudChipRoom, value);
+	}
+	[[nodiscard]] bool cloudChipOnline() const {
+		return _cloudChipOnline;
+	}
+	void setCloudChipOnline(bool value) {
+		apply(_cloudChipOnline, value);
+	}
+	// «Выбранные люди»: Telegram user ids picked by hand, never filled
+	// from the contacts automatically.
+	[[nodiscard]] bool isCloudChosen(uint64 userId) const {
+		return _cloudChosen.contains(userId);
+	}
+	void setCloudChosen(uint64 userId, bool chosen);
+	[[nodiscard]] const base::flat_set<uint64> &cloudChosen() const {
+		return _cloudChosen;
+	}
+	// Round 5: social end.
+	// Round 5: sync.
+	// The settings are sent and received by themselves (off: only by
+	// «Отправить» / «Получить»).
+	[[nodiscard]] bool cloudSettingsAutoSync() const {
+		return _cloudSettingsAutoSync;
+	}
+	void setCloudSettingsAutoSync(bool value) {
+		apply(_cloudSettingsAutoSync, value);
+	}
+	// For the settings sync (oblivion_cloud_sync.h): oblivion.json as it
+	// is saved now, and the way to put another one in its place. The
+	// new one is written to the disk, every setting is read from it again
+	// and changes() fires. The sync itself decides what of a received
+	// copy may get here, this only replaces the file. False: the json is
+	// not an object or could not be written, nothing has changed then.
+	[[nodiscard]] QByteArray syncSnapshot();
+	bool syncApply(const QByteArray &json);
+	// Round 5: sync end.
+	// Round 5: update.
+	// The update manifest is checked once a day (only while some account
+	// is connected to the cloud).
+	[[nodiscard]] bool cloudUpdateCheck() const {
+		return _cloudUpdateCheck;
+	}
+	void setCloudUpdateCheck(bool value) {
+		apply(_cloudUpdateCheck, value);
+	}
+	// Unixtime of the last check and the build the user was told about.
+	[[nodiscard]] int64 cloudUpdateLastCheck() const {
+		return _cloudUpdateLastCheck;
+	}
+	void setCloudUpdateLastCheck(int64 value) {
+		apply(_cloudUpdateLastCheck, value);
+	}
+	[[nodiscard]] int64 cloudUpdateSeenBuild() const {
+		return _cloudUpdateSeenBuild;
+	}
+	void setCloudUpdateSeenBuild(int64 value) {
+		apply(_cloudUpdateSeenBuild, value);
+	}
+	// Round 5: update end.
+	// Round 5: send online.
+	// «Отправить, когда будет в сети» in the send menu of a private chat
+	// and how long a message waits, in hours (1..168).
+	[[nodiscard]] bool sendWhenOnline() const {
+		return _sendWhenOnline;
+	}
+	void setSendWhenOnline(bool value) {
+		apply(_sendWhenOnline, value);
+	}
+	[[nodiscard]] int sendWhenOnlineHours() const {
+		return int(_sendWhenOnlineHours);
+	}
+	void setSendWhenOnlineHours(int value) {
+		apply(_sendWhenOnlineHours, int64(std::clamp(value, 1, 168)));
+	}
+	// Round 5: send online end.
 
 	[[nodiscard]] rpl::producer<> changes() const;
 
@@ -481,6 +672,41 @@ private:
 	bool _badgeEnabled = false;
 	bool _badgeAsked = false;
 	bool _listenTogether = true;
+	// Round 5: cloud.
+	bool _cloudLinks = true;
+	// Round 5: cloud end.
+	// Round 5: rooms.
+	bool _cloudRooms = true;
+	int64 _roomMusicVolume = 100;
+	int64 _roomVideoVolume = 100;
+	// Round 5: rooms end.
+	// Round 5: room extras.
+	bool _roomReactions = true;
+	// Round 5: room extras end.
+	// Round 5: social.
+	bool _cloudBadge = false;
+	bool _cloudBadgeShow = true;
+	bool _cloudProfileShow = true;
+	bool _cloudFriends = true;
+	int64 _cloudProfileAudience = 0;
+	int64 _cloudActivityAudience = 0;
+	bool _cloudChipListening = false;
+	bool _cloudChipRoom = false;
+	bool _cloudChipOnline = false;
+	base::flat_set<uint64> _cloudChosen;
+	// Round 5: social end.
+	// Round 5: sync.
+	bool _cloudSettingsAutoSync = false;
+	// Round 5: sync end.
+	// Round 5: update.
+	bool _cloudUpdateCheck = true;
+	int64 _cloudUpdateLastCheck = 0;
+	int64 _cloudUpdateSeenBuild = 0;
+	// Round 5: update end.
+	// Round 5: send online.
+	bool _sendWhenOnline = true;
+	int64 _sendWhenOnlineHours = 24;
+	// Round 5: send online end.
 
 	rpl::event_stream<> _changes;
 

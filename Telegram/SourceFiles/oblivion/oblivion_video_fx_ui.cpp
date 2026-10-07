@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/random.h"
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_cloud_share.h"
 #include "ui/layers/generic_box.h"
 #include "ui/layers/show.h"
 #include "ui/painter.h"
@@ -1597,6 +1598,42 @@ void Panel::showPresetsMenu(QPoint globalPosition) {
 	for (auto i = 0; i != count; ++i) {
 		_menu->addAction(presets[i].name(tr::now), [=] {
 			applyPreset(i);
+		});
+	}
+
+	// Oblivion round 5: sharing. After the ready stacks: the own presets
+	// of the user and the shared ones (oblivion_cloud_share.h). A preset
+	// replaces the list as one step of the undo, like a ready stack.
+	if (_show) {
+		const auto weak = QPointer<Panel>(this);
+		Share::FillPresetsMenu(_menu.get(), {
+			.kind = u"video"_q,
+			.show = _show,
+			.current = [=] {
+				const auto strong = weak.data();
+				return strong ? Serialize(strong->_stack) : QByteArray();
+			},
+			.apply = [=](const QByteArray &data) {
+				const auto strong = weak.data();
+				if (!strong) {
+					return;
+				}
+				auto stack = Deserialize(data);
+				if (int(stack.size()) > kMaxEffects) {
+					stack.resize(kMaxEffects);
+				}
+				for (auto &entry : stack) {
+					entry = Sanitized(std::move(entry));
+				}
+				if (stack.empty() || stack == strong->_stack) {
+					return;
+				}
+				strong->started();
+				strong->_stack = std::move(stack);
+				strong->_expanded = -1;
+				strong->scheduleRebuild();
+				strong->changed(false);
+			},
 		});
 	}
 	_menu->popup(globalPosition);

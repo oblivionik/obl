@@ -19,6 +19,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
 #include "mtproto/sender.h"
+#include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_lang.h"
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_ui_snapshots.h"
@@ -67,13 +68,14 @@ namespace {
 // expected to drop them; the word joiners at both ends keep the pair
 // from sticking to an emoji before it and may keep a bio made of the
 // marker alone from being taken for an empty one (U+200B..U+200F are
-// known to count as nothing in names). What the server really keeps
-// is found out by reading the bio back, see State::verify().
+// known to count as nothing in names).
 // This exact sequence does not occur in a text typed by a person.
 //
-// A marker alone is still recognized (a copy of Oblivion could have
-// written it) but never written: a bio without a visible text gets no
-// marker, see AppendMarker().
+// Since round 5 the marker is only recognized and removed, never
+// written (the badge is published through Oblivion Cloud): the code
+// that builds a bio with it, AppendMarker(), is kept for the self-test,
+// which checks that what an older Oblivion has written is still read
+// and cut off the right way.
 //
 // After a text the marker is appended with a space before it. Without
 // the space a link at the end of the bio would take the marker in: the
@@ -107,12 +109,7 @@ constexpr auto kFlowPause = crl::time(3000);
 // longer than kRequestTimeout, such a request was sent before the change.
 constexpr auto kSettleTime = crl::time(30000);
 
-// How long a bio the user has emptied may stay empty before the user is
-// told what that means for the badge: rewriting a bio (the old text is
-// deleted, the field saves itself, the new text is typed) says nothing.
-constexpr auto kBlankNoticeDelay = crl::time(15000);
 constexpr auto kNoticeDelay = crl::time(3000);
-constexpr auto kNoticeDuration = crl::time(8000);
 constexpr auto kToastMin = crl::time(3000);
 constexpr auto kToastMax = crl::time(9000);
 constexpr auto kToastPerChar = crl::time(60);
@@ -766,18 +763,10 @@ int PaintMarkAfterName(
 void ScheduleChanges();
 void SyncSetting();
 
-// user is only for the userpic in the preview of the name: without it
-// (the snapshots have no session) the initials of the name are painted.
-struct ConsentArgs {
-	QString name;
-	Fn<void()> confirm;
-	UserData *user = nullptr;
-};
-
-void ConsentBox(not_null<Ui::GenericBox*> box, ConsentArgs &&args);
-
-// The badge of one account: the known users, the state of the own badge
-// and the requests that switch it.
+// The badge of one account: the users known by a marker in the bio, the
+// old marker in the own bio and the requests that remove it. The marker
+// is never written any more: the badge is published through Oblivion
+// Cloud (see oblivion_cloud_social.h), a marker is only recognized.
 class State final : public base::has_weak_ptr {
 public:
 	explicit State(not_null<Main::Session*> session);
@@ -796,9 +785,7 @@ public:
 	[[nodiscard]] QString aboutLoaded(
 		not_null<UserData*> user,
 		const QString &about);
-	void setEnabled(
-		not_null<Window::SessionController*> controller,
-		bool enabled);
+	void removeMarker(not_null<Window::SessionController*> controller);
 	[[nodiscard]] QString bioForSaving(const QString &text);
 	void bioSaveFinished();
 	[[nodiscard]] int reservedBioLength() const;
@@ -807,7 +794,6 @@ public:
 private:
 	enum class Flow {
 		None,
-		Enable,
 		Disable,
 		Remove,
 		Restore,
@@ -820,16 +806,12 @@ private:
 	};
 
 	[[nodiscard]] static Failure FailureFrom(const MTP::Error &error);
-	[[nodiscard]] static QString FailureText(Failure failure);
 	[[nodiscard]] static bool Refused(Failure failure);
 
 	void selfAboutLoaded(const QString &about, bool marker);
 	void removeLeftover(const QString &about);
 	void restoreLeftover(const QString &about);
 	void dropLeftover();
-	void consented();
-	void enable();
-	void verify(const QString &original);
 	void disable();
 	void switchOff();
 	void disabledLater();
@@ -838,8 +820,6 @@ private:
 	[[nodiscard]] bool settled() const;
 	[[nodiscard]] bool waiting() const;
 	[[nodiscard]] bool removalDue() const;
-	[[nodiscard]] bool bioKnownBlank() const;
-	void blankNotice();
 
 	void begin(Flow flow);
 	void finish(const QString &text = QString(), bool important = false);
@@ -857,7 +837,6 @@ private:
 	void report(const QString &text, bool important = false);
 	void flushNotice();
 	[[nodiscard]] Window::SessionController *resolveWindow() const;
-	[[nodiscard]] int bioLimit() const;
 	[[nodiscard]] bool bioSavePending() const;
 
 	const not_null<Main::Session*> _session;
@@ -883,20 +862,11 @@ private:
 	bool _bioSaved = false; // The user has saved the bio in Settings.
 	bool _markerSent = false; // A bio with the marker was sent.
 
-	// The badge went off here in this launch (or its marker was still to
-	// remove when the launch began): a marker seen in the bio after that
-	// does not switch it on, whoever has written it. Reset only when the
-	// user switches the badge on, the next launch looks at the bio anew.
+	// The removal of the marker was asked here in this launch (or it was
+	// still to remove when the launch began): a marker seen in the bio
+	// after that is not taken for one that is back, it may be an answer
+	// from before the removal. The next launch looks at the bio anew.
 	bool _offHere = false;
-
-	// With the badge on the user has saved here a bio with nothing to
-	// see in it: it went without the marker and the badge stays on till
-	// the next text, which takes the marker again. People rewrite a bio
-	// this way (the old text is deleted, the field saves itself, the new
-	// one is typed), that must not switch the badge off. Only for this
-	// launch: a bio still empty in the next one switches the badge off
-	// with a notice, as any bio without the marker does.
-	bool _blankSaved = false;
 
 	// The text of the user in a bio that was written with the marker and
 	// could not be read back.
@@ -909,7 +879,6 @@ private:
 
 	base::Timer _saveTimer;
 	base::Timer _requestTimer;
-	base::Timer _blankTimer;
 
 };
 
@@ -932,7 +901,8 @@ struct Registry {
 	return (i != end(states)) ? i->second.get() : nullptr;
 }
 
-// Oblivion::Get().badgeEnabled() mirrors "on for some account".
+// Oblivion::Get().badgeEnabled() mirrors "the old marker is in the bio of
+// some account" (it used to mean the badge of round 4).
 void SyncSetting() {
 	const auto any = ranges::any_of(Global().states, [](const auto &pair) {
 		return pair.second->own();
@@ -981,8 +951,7 @@ State::State(not_null<Main::Session*> session)
 , _own(_data.own)
 , _offHere(_data.removePending)
 , _saveTimer([=] { save(); })
-, _requestTimer([=] { requestTimedOut(); })
-, _blankTimer([=] { blankNotice(); }) {
+, _requestTimer([=] { requestTimedOut(); }) {
 	if (_data.own != Get().badgeEnabled()) {
 		ScheduleChanges();
 	}
@@ -1001,7 +970,6 @@ State::State(not_null<Main::Session*> session)
 State::~State() {
 	_saveTimer.cancel();
 	_requestTimer.cancel();
-	_blankTimer.cancel();
 	if (_dirty && !_forgotten) {
 		WriteBytes(_path, Serialize(_data), NextGeneration(_path));
 	}
@@ -1094,20 +1062,19 @@ void State::selfAboutLoaded(const QString &about, bool marker) {
 	case SelfAction::Stuck: break;
 	case SelfAction::Adopt: {
 		if (_offHere) {
-			// It was switched off here in this launch: this may be an old
-			// answer, and even a marker written by another copy does not
-			// undo that. The next launch looks at the bio again.
+			// Its removal was asked here in this launch: this may be an
+			// old answer. The next launch looks at the bio again.
 			break;
 		}
-		_data.notice = Notice::Adopted;
+
+		// An old marker is in the bio (written by an older Oblivion on
+		// some device): it is only remembered, Settings > Oblivion
+		// offers to remove it. Nothing is changed and nothing is told.
 		setOwn(true);
 		saveSoon();
 	} break;
 	case SelfAction::Lost: {
-		if (BlankKeepsBadge(_blankSaved, about)) {
-			break;
-		}
-		_data.notice = Notice::Lost;
+		// The marker is gone (the bio was saved here or somewhere else).
 		setOwn(false);
 		saveSoon();
 	} break;
@@ -1173,10 +1140,12 @@ void State::removeLeftover(const QString &about) {
 	});
 }
 
-// The server has kept a part of the marker when the badge was switched
-// on (see verify()): the bio is put back to the text of the user, with
-// the one update of a launch in which nothing else has touched the bio,
-// and only while it is exactly the bio that was seen then.
+// The server has kept a part of the marker when the round 4 badge was
+// switched on (the user was told then that those few invisible
+// characters are removed in a next launch): the bio is put back to the
+// text of the user, with the one update of a launch in which nothing
+// else has touched the bio, and only while it is exactly the bio that
+// was seen then. Nothing new gets into this state any more.
 void State::restoreLeftover(const QString &about) {
 	const auto clean = WithoutLeftover(_data.leftover, about);
 	if (!clean
@@ -1209,155 +1178,29 @@ void State::dropLeftover() {
 	}
 }
 
-void State::setEnabled(
-		not_null<Window::SessionController*> controller,
-		bool enabled) {
+// «Убрать старую метку из «О себе»» in Settings > Oblivion: the only
+// way the bio is changed by Oblivion now, and only by that click.
+void State::removeMarker(not_null<Window::SessionController*> controller) {
 	if (_forgotten) {
 		return;
-	} else if (!enabled || _data.notice != Notice::Stuck) {
-		// "The marker could not be removed" makes no sense right before
-		// the user switches the badge on, it waits for the result.
-		flushNotice();
 	}
-
-	// Switching off does not wait for a bio that is being saved.
-	if (enabled ? busy() : flowBusy()) {
+	flushNotice();
+	if (flowBusy()) {
 		controller->showToast(tr::lng_oblivion_badge_busy(tr::now));
 		return;
-	} else if (_data.own == enabled) {
+	} else if (!_data.own && !_data.removePending) {
 		return;
 	}
 	_window = base::make_weak(controller);
-	if (!enabled) {
-		// With the update of this launch spent, while Telegram asks to
-		// wait or while the bio is being saved nothing is even asked: the
-		// marker is removed in the next launch.
-		if (_updatesSent > 0 || waiting() || bioSavePending()) {
-			disabledLater();
-		} else {
-			disable();
-		}
-	} else if (_updatesSent > 0 && !_data.removePending) {
-		// The marker is not in the bio and can't be written any more.
-		finish(tr::lng_oblivion_badge_once(tr::now), true);
-	} else if (waiting()) {
-		finish(tr::lng_oblivion_badge_wait(tr::now));
-	} else if (bioKnownBlank()) {
-		// Before the consent is even asked. If the bio was written in
-		// another app a moment ago, the next click knows about it.
-		_session->user()->updateFull();
-		finish(tr::lng_oblivion_badge_needs_bio(tr::now), true);
-	} else if (_data.asked) {
-		enable();
+
+	// With the update of this launch spent, while Telegram asks to wait
+	// or while the bio is being saved nothing is even asked: the marker
+	// is removed in the next launch.
+	if (_updatesSent > 0 || waiting() || bioSavePending()) {
+		disabledLater();
 	} else {
-		controller->show(Box(ConsentBox, ConsentArgs{
-			.name = _session->user()->name(),
-			.confirm = crl::guard(this, [=] { consented(); }),
-			.user = _session->user().get(),
-		}));
+		disable();
 	}
-}
-
-void State::consented() {
-	if (_forgotten || _data.own) {
-		return;
-	} else if (busy()) {
-		report(tr::lng_oblivion_badge_busy(tr::now));
-		return;
-	}
-	_data.asked = true;
-	saveSoon();
-	if (!Get().badgeAsked()) {
-		Get().setBadgeAsked(true);
-	}
-	enable();
-}
-
-void State::enable() {
-	_unverified = std::nullopt;
-	begin(Flow::Enable);
-	read([=](const QString &about) {
-		if (HasMarker(about)) {
-			RemovalFinished(_data);
-			dropLeftover();
-			_offHere = false;
-			setOwn(true);
-			finish(tr::lng_oblivion_badge_on(tr::now));
-			return;
-		}
-
-		// With a part of an old marker still in the bio the new one goes
-		// after the text of the user, not after that part.
-		const auto text = WithoutLeftover(_data.leftover, about).value_or(
-			about);
-		const auto appended = AppendMarker(text, bioLimit());
-		if (appended.blank) {
-			// Nothing is written and no update is spent: the user can
-			// write a bio and switch the badge on in this launch.
-			finish(tr::lng_oblivion_badge_needs_bio(tr::now), true);
-		} else if (appended.lacking > 0) {
-			finish(
-				tr::lng_oblivion_badge_no_room(
-					tr::now,
-					lt_count,
-					appended.lacking),
-				true);
-		} else if (_updatesSent > 0) {
-			finish(tr::lng_oblivion_badge_once(tr::now), true);
-		} else if (bioSavePending()) {
-			finish(tr::lng_oblivion_badge_busy(tr::now));
-		} else {
-			_markerSent = true;
-			write(appended.text, [=] {
-				verify(text);
-			}, [=](Failure failure) {
-				if (failure == Failure::Timeout) {
-					// The server may have got it all the same.
-					_unverified = text;
-				}
-				finish(FailureText(failure), true);
-			});
-		}
-	}, [=](Failure failure) {
-		finish(FailureText(failure));
-	});
-}
-
-// The bio is read back: with the marker in it the badge is on. Without
-// the marker the badge stays off and the user is told what has become of
-// the bio. Either it is the text it was (the server has dropped all that
-// was appended), or a few invisible characters are left after that text:
-// those are remembered and removed in the next launch, see
-// restoreLeftover(). Anything else is a bio changed somewhere else in
-// the meantime, nothing is said about its text then.
-void State::verify(const QString &original) {
-	read([=](const QString &about) {
-		if (HasMarker(about)) {
-			RemovalFinished(_data);
-			dropLeftover();
-			_offHere = false;
-			setOwn(true);
-			finish(tr::lng_oblivion_badge_on(tr::now));
-			return;
-		}
-		setOwn(false);
-		_data.leftover = MakeLeftover(original, about);
-		finish(
-			((about == original)
-				? tr::lng_oblivion_badge_dropped(tr::now)
-				: !_data.leftover.empty()
-				? tr::lng_oblivion_badge_dropped_part(tr::now)
-				: tr::lng_oblivion_badge_lost(tr::now)),
-			true);
-	}, [=](Failure) {
-		// The bio was updated, only the check did not go through: the
-		// own profile the app loads later is looked at instead.
-		_unverified = original;
-		RemovalFinished(_data);
-		_offHere = false;
-		setOwn(true);
-		finish(tr::lng_oblivion_badge_on(tr::now));
-	});
 }
 
 void State::disable() {
@@ -1366,13 +1209,13 @@ void State::disable() {
 	read([=](const QString &about) {
 		if (!HasMarker(about)) {
 			RemovalFinished(_data);
-			finish(tr::lng_oblivion_badge_off(tr::now));
+			finish(tr::lng_oblivion_social_marker_none(tr::now));
 		} else if (_updatesSent > 0 || bioSavePending()) {
 			disabledLater();
 		} else {
 			write(StripMarker(about), [=] {
 				RemovalFinished(_data);
-				finish(tr::lng_oblivion_badge_off_removed(tr::now));
+				finish(tr::lng_oblivion_social_marker_removed(tr::now));
 			}, [=](Failure) {
 				disabledLater();
 			});
@@ -1382,11 +1225,10 @@ void State::disable() {
 	});
 }
 
-// The badge is off from the click of the user, before anything is asked
-// from the server and whatever happens next (the app may be closed with
-// the requests on the way): the marker in the bio is to remove, and till
-// it is known to be gone it never switches the badge on again, see
-// DecideSelf().
+// The marker is to remove from the click of the user, before anything is
+// asked from the server and whatever happens next (the app may be closed
+// with the requests on the way): till it is known to be gone a marker
+// seen in the bio is not taken for a new one, see DecideSelf().
 void State::switchOff() {
 	_touched = true;
 	_offHere = true;
@@ -1402,8 +1244,8 @@ void State::disabledLater() {
 	switchOff();
 	_settleFrom = crl::now();
 	finish(waiting()
-		? tr::lng_oblivion_badge_off_wait(tr::now)
-		: tr::lng_oblivion_badge_off_later(tr::now));
+		? tr::lng_oblivion_social_marker_wait(tr::now)
+		: tr::lng_oblivion_social_marker_later(tr::now));
 }
 
 // One flow at a time, with a pause after it: clicking the toggle again
@@ -1437,13 +1279,6 @@ bool State::removalDue() const {
 	return !waiting() && RemovalDue(_data, base::unixtime::now());
 }
 
-// The own profile was loaded in this launch and its bio has nothing to
-// see in it. The server is asked anyway before anything is written.
-bool State::bioKnownBlank() const {
-	const auto self = _session->user();
-	return self->wasFullUpdated() && !HasVisibleText(self->about());
-}
-
 State::Failure State::FailureFrom(const MTP::Error &error) {
 	const auto code = error.code();
 	return MTP::IsFloodError(error)
@@ -1451,14 +1286,6 @@ State::Failure State::FailureFrom(const MTP::Error &error) {
 		: (code >= 400 && code < 500)
 		? Failure::Rejected
 		: Failure::Other;
-}
-
-QString State::FailureText(Failure failure) {
-	return (failure == Failure::Flood)
-		? tr::lng_oblivion_badge_wait(tr::now)
-		: (failure == Failure::Rejected)
-		? tr::lng_oblivion_badge_rejected(tr::now)
-		: tr::lng_oblivion_badge_failed(tr::now);
 }
 
 bool State::Refused(Failure failure) {
@@ -1569,58 +1396,10 @@ QString State::bioForSaving(const QString &text) {
 	_unverified = std::nullopt;
 	dropLeftover();
 
-	const auto wanted = _data.own
-		? (_flow == Flow::None)
-		: (_flow == Flow::Enable && _written);
-	const auto limit = bioLimit();
-	if (!wanted || BioLength(clean) > limit) {
-		// A text over the limit is refused by the server as a whole, the
-		// bio and the marker in it stay as they are.
-		return clean;
-	}
-
-	// Without the marker the text of the user is saved as it is: an
-	// emptied bio stays empty, a full one is not cut. A full one switches
-	// the badge off. An emptied one does not, people rewrite a bio by
-	// deleting the old text first and the field saves itself in between:
-	// the badge stays on and the next text takes the marker again. The
-	// user is told about a bio that stays empty, see blankNotice().
-	auto appended = AppendMarker(clean, limit);
-	if (!appended.blank && !appended.lacking) {
-		_markerSent = true;
-		_blankSaved = false;
-		_blankTimer.cancel();
-	} else if (_flow == Flow::None && appended.blank) {
-		_blankSaved = true;
-		_blankTimer.callOnce(kBlankNoticeDelay);
-	} else if (_flow == Flow::None) {
-		_offHere = true;
-		setOwn(false);
-		saveSoon();
-		const auto notice = tr::lng_oblivion_badge_no_room_off(tr::now);
-		crl::on_main(this, [=] {
-			report(notice);
-		});
-	}
-	return std::move(appended.text);
-}
-
-// The bio the user has emptied with the badge on is still empty: the
-// badge is on, but there is no marker for the others to see it by. Not
-// while that bio is still being saved, and not if it was not saved (the
-// bio the app keeps is the old one then). A bio still empty in the next
-// launch switches the badge off with a notice of its own.
-void State::blankNotice() {
-	if (_forgotten
-		|| !_blankSaved
-		|| !_data.own
-		|| Core::App().passcodeLocked()) {
-		return;
-	} else if (_bioSaving) {
-		_blankTimer.callOnce(kBlankNoticeDelay);
-	} else if (!HasVisibleText(_session->user()->about())) {
-		report(tr::lng_oblivion_badge_empty_bio(tr::now));
-	}
+	// The marker is not written any more: the bio is saved exactly as it
+	// was typed. An old marker goes away with that, the own profile that
+	// arrives after the save tells so.
+	return clean;
 }
 
 void State::bioSaveFinished() {
@@ -1630,20 +1409,19 @@ void State::bioSaveFinished() {
 	}
 }
 
+// Nothing is appended to the bio any more, so nothing is reserved.
 int State::reservedBioLength() const {
-	return (_data.own && !_forgotten) ? kMarkerCost : 0;
+	return 0;
 }
 
 void State::forget() {
 	_forgotten = true;
 	_saveTimer.cancel();
 	_requestTimer.cancel();
-	_blankTimer.cancel();
 	_api.request(base::take(_requestId)).cancel();
 	_requestFail = nullptr;
 	_flow = Flow::None;
 	_bioSaving = false;
-	_blankSaved = false;
 	_window = base::weak_ptr<Window::SessionController>();
 	_dirty = false;
 	const auto kept = Serialize(AfterLogout(_data));
@@ -1654,10 +1432,6 @@ void State::forget() {
 }
 
 void State::setOwn(bool value) {
-	if (!value) {
-		_blankSaved = false;
-		_blankTimer.cancel();
-	}
 	if (_data.own == value) {
 		return;
 	}
@@ -1707,32 +1481,29 @@ void State::report(const QString &text, bool important) {
 	}
 }
 
-// What the badge has done on its own is told as soon as there is a window
-// to tell it in (kept on disk till then): nothing about the badge of the
-// user changes silently.
+// A removal the user has asked for and that keeps failing is told as
+// soon as there is a window to tell it in (kept on disk till then). The
+// notices of the round 4 badge ("the badge was switched on / off by a
+// marker") mean nothing any more: one left in the file is dropped.
 void State::flushNotice() {
 	if ((_data.notice == Notice::None)
 		|| (_flow != Flow::None)
 		|| _forgotten
 		|| Core::App().passcodeLocked()) {
 		return;
+	} else if (_data.notice != Notice::Stuck) {
+		_data.notice = Notice::None;
+		saveSoon();
+		return;
 	}
 	const auto window = resolveWindow();
 	if (!window) {
 		return;
 	}
-	const auto notice = base::take(_data.notice);
+	_data.notice = Notice::None;
 	saveSoon();
-	if (notice == Notice::Stuck) {
-		window->show(
-			Ui::MakeInformBox(tr::lng_oblivion_badge_stuck(tr::now)));
-	} else {
-		window->showToast(
-			((notice == Notice::Adopted)
-				? tr::lng_oblivion_badge_adopted(tr::now)
-				: tr::lng_oblivion_badge_lost(tr::now)),
-			kNoticeDuration);
-	}
+	window->show(
+		Ui::MakeInformBox(tr::lng_oblivion_social_marker_stuck(tr::now)));
 }
 
 // Session::tryResolveWindow() is not used: without a window it switches
@@ -1748,15 +1519,6 @@ Window::SessionController *State::resolveWindow() const {
 		}
 	}
 	return windows.empty() ? nullptr : windows.front().get();
-}
-
-// Session::premium() is not asked: it is also true with the local "fake
-// premium" of Oblivion, while the server counts by the real one.
-int State::bioLimit() const {
-	const auto limits = Data::PremiumLimits(_session);
-	return _session->user()->isPremium()
-		? limits.aboutLengthPremium()
-		: limits.aboutLengthDefault();
 }
 
 // The user has saved the bio in Settings and that request is still on
@@ -1869,155 +1631,6 @@ bool MarkWidget::tooltipWindowActive() const {
 		st::infoVerifiedStar.size(),
 		st::infoVerifiedCheckPosition.x() / 2,
 		st::infoPeerBadge.premiumFg);
-}
-
-// The name with the mark after it, the way the others are going to see
-// it: a row of a peers list (its metrics, fonts and colours, the ones of
-// a row under the cursor) on a rounded card, with a caption in the place
-// of the status. With a user the userpic of the account is painted, the
-// initials of the name otherwise.
-class NamePreview final : public Ui::RpWidget {
-public:
-	NamePreview(QWidget *parent, const QString &name, UserData *user);
-
-protected:
-	void paintEvent(QPaintEvent *e) override;
-	int resizeGetHeight(int newWidth) override;
-
-private:
-	const style::PeerListItem &_st;
-	UserData * const _user = nullptr;
-	const QString _caption;
-	Ui::Text::String _name;
-	Ui::PeerUserpicView _userpicView;
-	const Ui::EmptyUserpic _initials;
-
-	// The user is not touched after the session has gone.
-	base::weak_ptr<Main::Session> _session;
-
-};
-
-NamePreview::NamePreview(
-	QWidget *parent,
-	const QString &name,
-	UserData *user)
-: RpWidget(parent)
-, _st(st::peerListBoxItem)
-, _user(user)
-, _caption(tr::lng_oblivion_badge_consent_preview(tr::now))
-, _name(_st.nameStyle, name, Ui::NameTextOptions())
-, _initials(
-	Ui::EmptyUserpic::UserpicColor(Ui::EmptyUserpic::ColorIndex(1)),
-	name) {
-	if (_user) {
-		_session = base::make_weak(&_user->session());
-
-		// The userpic may still be on its way from the cloud.
-		_user->session().downloaderTaskFinished(
-		) | rpl::on_next([=] {
-			update();
-		}, lifetime());
-	}
-}
-
-int NamePreview::resizeGetHeight(int newWidth) {
-	return _st.height;
-}
-
-void NamePreview::paintEvent(QPaintEvent *e) {
-	auto p = Painter(this);
-	{
-		auto hq = PainterHighQualityEnabler(p);
-		p.setPen(Qt::NoPen);
-		p.setBrush(_st.button.textBgOver);
-		p.drawRoundedRect(rect(), st::boxRadius, st::boxRadius);
-	}
-	const auto outer = width();
-	const auto photoLeft = _st.photoPosition.x();
-	const auto photoTop = _st.photoPosition.y();
-	if (_user && _session) {
-		_user->paintUserpicLeft(
-			p,
-			_userpicView,
-			photoLeft,
-			photoTop,
-			outer,
-			_st.photoSize);
-	} else {
-		_initials.paintCircle(p, photoLeft, photoTop, outer, _st.photoSize);
-	}
-
-	// The same room is left on the right as before the userpic.
-	const auto mark = Width();
-	const auto available = outer - _st.namePosition.x() - photoLeft;
-	if (available <= mark) {
-		return;
-	}
-	const auto place = QRect(
-		_st.namePosition.x(),
-		_st.namePosition.y(),
-		available,
-		_st.nameStyle.font->height);
-	PaintMarkAfterName(
-		p,
-		place,
-		_name.maxWidth(),
-		outer,
-		st::dialogsVerifiedIconBgOver->c);
-	p.setPen(_st.nameFg);
-	_name.drawLeftElided(p, place.x(), place.y(), available - mark, outer);
-
-	p.setFont(st::contactsStatusFont);
-	p.setPen(_st.statusFgOver);
-	p.drawTextLeft(
-		_st.statusPosition.x(),
-		_st.statusPosition.y(),
-		outer,
-		st::contactsStatusFont->elided(_caption, available));
-}
-
-void ConsentBox(not_null<Ui::GenericBox*> box, ConsentArgs &&args) {
-	box->setTitle(tr::lng_oblivion_badge_consent_title());
-	box->setWidth(st::boxWideWidth);
-
-	const auto skip = style::margins(0, 0, 0, st::boxLittleSkip);
-	box->addRow(
-		object_ptr<NamePreview>(box, args.name, args.user),
-		st::boxRowPadding + skip);
-	const auto paragraph = [&](TextWithEntities text) {
-		box->addRow(
-			object_ptr<Ui::FlatLabel>(
-				box,
-				rpl::single(std::move(text)),
-				st::boxLabel),
-			st::boxRowPadding + skip);
-	};
-
-	// Four short paragraphs, one fact each: what the badge is (and that
-	// it is no verification), what is done to the bio, who can tell and
-	// how to undo it. With a name of an ordinary length the box is not
-	// taller than a window of the default height, so nothing of the text
-	// is left under the fold.
-	paragraph({ tr::lng_oblivion_badge_consent_about(tr::now) });
-	paragraph(tr::lng_oblivion_badge_consent_bio(
-		tr::now,
-		lt_name,
-		tr::bold(args.name),
-		tr::marked));
-	paragraph({ tr::lng_oblivion_badge_consent_reveals(tr::now) });
-	paragraph({ tr::lng_oblivion_badge_consent_off(tr::now) });
-
-	const auto confirm = std::move(args.confirm);
-	box->addButton(tr::lng_oblivion_badge_consent_enable(), [=] {
-		const auto callback = confirm;
-		box->closeBox();
-		if (callback) {
-			callback();
-		}
-	});
-	box->addButton(tr::lng_cancel(), [=] {
-		box->closeBox();
-	});
 }
 
 [[nodiscard]] QString SampleText(const char *ru, const char *en) {
@@ -2411,60 +2024,17 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 
 	const auto width = style::ConvertScale(kSceneWidth);
 	const auto boxSize = QSize(style::ConvertScale(kSceneBoxWidth), 0);
-	RegisterBoxScene(
-		u"badge_consent"_q,
-		boxSize,
-		[](std::shared_ptr<Ui::Show> show) {
-			return Box(ConsentBox, ConsentArgs{
-				.name = SampleText("Аня Смирнова", "Anna Smirnova"),
-			});
-		});
 
-	// A name that does not fit: it is cut in the preview with the mark
-	// kept at the right edge, and takes more lines in the text.
-	RegisterBoxScene(
-		u"badge_consent_long_name"_q,
-		boxSize,
-		[](std::shared_ptr<Ui::Show> show) {
-			return Box(ConsentBox, ConsentArgs{
-				.name = SampleText(
-					"Константин Константинопольский-Задунайский",
-					"Constantine Constantinopolsky-Zadunaisky"),
-			});
-		});
-
-	// The boxes State::report() shows when the badge could not be
-	// switched on: the one with a number and the longest one.
-	RegisterBoxScene(
-		u"badge_notice_no_room"_q,
-		boxSize,
-		[](std::shared_ptr<Ui::Show> show) {
-			return Ui::MakeInformBox(
-				tr::lng_oblivion_badge_no_room(tr::now, lt_count, 12));
-		});
-	RegisterBoxScene(
-		u"badge_notice_rejected"_q,
-		boxSize,
-		[](std::shared_ptr<Ui::Show> show) {
-			return Ui::MakeInformBox(
-				tr::lng_oblivion_badge_rejected(tr::now));
-		});
-
-	// The answer to an empty bio and the notice about a marker that
-	// could not be removed.
-	RegisterBoxScene(
-		u"badge_notice_needs_bio"_q,
-		boxSize,
-		[](std::shared_ptr<Ui::Show> show) {
-			return Ui::MakeInformBox(
-				tr::lng_oblivion_badge_needs_bio(tr::now));
-		});
+	// The notice about an old marker that could not be removed. (The
+	// consent box of the round 4 badge and its notices are gone together
+	// with the marker being written; the settings rows of the badge are
+	// the scene "social_badge_settings" in oblivion_cloud_social_ui.cpp.)
 	RegisterBoxScene(
 		u"badge_notice_stuck"_q,
 		boxSize,
 		[](std::shared_ptr<Ui::Show> show) {
 			return Ui::MakeInformBox(
-				tr::lng_oblivion_badge_stuck(tr::now));
+				tr::lng_oblivion_social_marker_stuck(tr::now));
 		});
 	RegisterScene(
 		u"badge_rows"_q,
@@ -3596,15 +3166,25 @@ bool Has(not_null<PeerData*> peer) {
 	if (!user) {
 		return false;
 	}
-	const auto state = Lookup(&user->session());
-	return state
-		&& (user->isSelf()
-			? state->own()
-			: state->known(peerToUser(user->id).bare));
+	const auto session = &user->session();
+	const auto id = peerToUser(user->id).bare;
+	const auto state = Lookup(session);
+	if (user->isSelf()) {
+		// The own badge: published through the cloud, or an old marker
+		// that is still in the bio (the others see the badge by it).
+		return Social::BadgeListed(session, id) || (state && state->own());
+	} else if (!Get().cloudBadgeShow() || user->isBot()) {
+		return false;
+	}
+	return Social::BadgeListed(session, id) || (state && state->known(id));
 }
 
 rpl::producer<> Changes() {
 	return Global().changes.events();
+}
+
+void Refresh() {
+	ScheduleChanges();
 }
 
 QString AboutLoaded(not_null<UserData*> user, const QString &about) {
@@ -3702,23 +3282,16 @@ void SetWidgetColor(
 	}
 }
 
-bool Enabled(not_null<Main::Session*> session) {
-	const auto state = Lookup(session);
-	return state && state->own();
-}
-
-rpl::producer<bool> EnabledValue(not_null<Main::Session*> session) {
+rpl::producer<bool> OldMarkerValue(not_null<Main::Session*> session) {
 	if (const auto state = Lookup(session)) {
 		return state->ownValue();
 	}
 	return rpl::single(false);
 }
 
-void SetEnabled(
-		not_null<Window::SessionController*> controller,
-		bool enabled) {
+void RemoveOldMarker(not_null<Window::SessionController*> controller) {
 	if (const auto state = Lookup(&controller->session())) {
-		state->setEnabled(controller, enabled);
+		state->removeMarker(controller);
 	}
 }
 

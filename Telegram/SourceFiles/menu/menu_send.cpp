@@ -757,7 +757,19 @@ FillMenuResult FillSendMenu(
 			[=] { action({ .type = ActionType::Schedule }, details); },
 			&icons.menuSchedule);
 	}
-	if (sending && type == Type::ScheduledToUser) {
+	// Oblivion: the item that waits on this device takes the place of
+	// the one that waits on the server (that one stays in the schedule
+	// box), see oblivion_send_online.h.
+	const auto oblivionWhenOnline = sending && details.oblivionWhenOnline;
+	if (oblivionWhenOnline) {
+		menu->addAction(
+			tr::lng_oblivion_sendonline_menu(tr::now),
+			[=] { action(
+				{ Api::SendOptions{ .oblivionWhenOnline = true } },
+				details); },
+			&icons.menuWhenOnline);
+	}
+	if (sending && type == Type::ScheduledToUser && !oblivionWhenOnline) {
 		menu->addAction(
 			tr::lng_scheduled_send_until_online(tr::now),
 			[=] { action(

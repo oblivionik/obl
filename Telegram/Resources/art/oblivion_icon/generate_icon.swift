@@ -1,4 +1,10 @@
-// Oblivion app icon generator.
+// Oblivion app icon generator (the PREVIOUS icon).
+//
+// Since round 5 the default icon is the "eclipse" one, installed by
+// design-mockups/src/install_icon.py (next to the repository). This file
+// draws the former "black hole and paper plane" icon, which is kept as
+// oblivion_previous_1024.png and offered in the icon chooser. Running
+// "install" from here would put the former icon back as the default.
 //
 // Renders the "black hole swallowing the paper plane" icon procedurally
 // and writes every icon asset used by the build.

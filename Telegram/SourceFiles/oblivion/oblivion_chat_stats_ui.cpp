@@ -22,6 +22,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "oblivion/oblivion_chat_stats.h"
 #include "oblivion/oblivion_lang.h"
+#include "oblivion/oblivion_stats_export.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/boxes/confirm_box.h"
 #include "ui/effects/animation_value.h"
@@ -2004,6 +2005,7 @@ void StatsBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		rpl::variable<QString> progressText;
 		rpl::variable<QString> progressNote;
 		rpl::variable<QString> button;
+		rpl::variable<bool> canSavePage; // Oblivion round 5.
 		ContentUpdate updateContent;
 		Fn<void()> refreshStatus;
 	};
@@ -2100,6 +2102,33 @@ void StatsBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		.person = args.person,
 		.sticker = args.sticker,
 		.repaint = std::move(args.repaint),
+	});
+
+	// Oblivion round 5: «Сохранить страницу…», the numbers on the screen
+	// as one HTML file, see oblivion_stats_export.h.
+	StatsExport::AddSaveButton(content, {
+		.show = show,
+		.shown = state->canSavePage.value(),
+		.collect = [=,
+				chat = args.title,
+				group = args.group,
+				person = args.person] {
+			auto input = StatsExport::Input();
+			if (state->report && state->report->messages > 0) {
+				auto copy = std::make_shared<Report>(*state->report);
+				copy->group = group;
+				input.report = std::move(copy);
+				input.zone = zone;
+				input.chat = chat;
+				input.person = [=](uint64 id, const QString &name) {
+					const auto view = person
+						? person(id, name)
+						: PersonView{ .name = name };
+					return StatsExport::Person{ view.name, view.self };
+				};
+			}
+			return input;
+		},
 	});
 
 	// In one column with the rest of the box, not as wide as the rows
@@ -2273,6 +2302,8 @@ void StatsBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		args.reports
 	) | rpl::on_next([=](std::shared_ptr<const Report> &&report) {
 		state->report = std::move(report);
+		state->canSavePage = state->report // Oblivion round 5.
+			&& (state->report->messages > 0);
 		state->updateContent(state->report, state->status);
 	}, box->lifetime());
 

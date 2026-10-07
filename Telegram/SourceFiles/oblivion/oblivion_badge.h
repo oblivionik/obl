@@ -27,47 +27,41 @@ class SessionController;
 // The Oblivion badge: a small mark next to the names of the people who
 // use Oblivion and have agreed to show it.
 //
-// There is no server for it. A user who switches the badge on (asked
-// once per account, with a plain explanation) gets a short invisible
-// marker of zero-width characters appended to the bio ("about") of that
-// account, after a space, so that a link at the end of the bio still
-// ends where it did. Every Oblivion client that reads a profile with
-// the marker shows the badge next to that name and remembers the user
-// id on this device, so the badge is then shown in the chats list, the
-// top bar and the profile without any new requests. The marker never
-// gets into the bio the app keeps and shows: it is cut off when a
-// profile arrives and put back when the own bio is saved.
+// Since round 5 the badge comes from Oblivion Cloud: a user who switches
+// «Значок Oblivion» on (Settings > Oblivion, after the consent to the
+// cloud for that account) is put into the public badge list of the
+// server. Every client downloads that list as a whole, keeps it on disk
+// and refreshes it in the background (see oblivion_cloud_social.h); the
+// ids of the contacts and the chats of the user are never sent anywhere.
 //
-// The badge is switched for one account, the one of the window where the
-// toggle was clicked: a bio belongs to an account, and so does the
-// consent to change it. Oblivion::Get().badgeEnabled() only mirrors "it
-// is on for some account of this installation".
+// In round 4 there was no server and the badge was a short invisible
+// marker of zero-width characters at the end of the bio ("about"). What
+// is left of that:
+//  - the marker is never written any more, and nothing is reserved for
+//    it in the length limit of the bio;
+//  - a marker in the bio of somebody else is still recognized (an older
+//    Oblivion has written it): the badge is shown for that user and the
+//    id is remembered on this device. The marker never gets into the bio
+//    the app keeps and shows: it is cut off when a profile arrives;
+//  - a marker in the own bio is only noticed: Settings > Oblivion then
+//    offers «Убрать старую метку из «О себе»», and the bio is changed
+//    only by that click. Saving the bio in Settings removes it as well,
+//    because the bio is saved exactly as it was typed.
 //
-// Guard rails:
-//  - the bio is changed only after an explicit consent;
-//  - a bio without a visible text never gets the marker: a bio made of
-//    invisible characters alone is never written, the user is asked to
-//    write something first;
+// Guard rails of that removal (the only change Oblivion makes to a
+// profile):
 //  - at most one profile update per account per launch;
 //  - the bio is read from the server right before it is changed, so a
 //    stale local copy can never replace the text of the user;
-//  - the value is read back, if the server has dropped the marker the
-//    feature switches itself off and says so (what the server has kept
-//    of the marker is cleaned up in the next launch);
-//  - switching the badge off removes the marker (in the next launch, if
-//    the update of this launch was already spent);
-//  - a badge the user has switched off is never switched on by the app:
-//    while its marker could not be removed yet the badge stays off, and
-//    the user is told if the removal keeps failing; that the marker is
-//    still to remove is the one thing remembered after a logout, so
-//    signing in again removes it instead of taking it for a new badge;
-//  - a bio the user empties while rewriting it does not switch the badge
-//    off: it is saved empty, the next text takes the marker again;
+//  - if the removal could not be done right away (the update of this
+//    launch was spent, Telegram asks to wait, no connection), it is done
+//    in the next launch: the user has asked for it by the click, and is
+//    told so; that the marker is still to remove is the one thing
+//    remembered after a logout;
 //  - a wait Telegram asks for (FLOOD_WAIT) is kept between the launches,
 //    nothing is sent before it is over and it is not taken for a failure;
 //  - nothing is ever repeated in a loop, a failed request is not retried;
-//  - no request is sent to learn about the badge of somebody else, only
-//    the profiles the client loads anyway are looked at.
+//  - no request is sent to learn about the badge of somebody else.
 //
 // The mark is a small vector shape in the accent colour, painted in code:
 // a rounded diamond with a round hole. It must stay clearly different
@@ -75,8 +69,11 @@ class SessionController;
 // not look like one.
 namespace Oblivion::Badge {
 
-// Whether this peer is known to carry the badge. The own account has it
-// while the badge is on for that account. Cheap (a lookup in a set kept
+// Whether this peer is known to carry the badge: the id is in the badge
+// list of Oblivion Cloud, or a marker was seen in the bio. The own
+// account has it while its badge is published (or while the old marker
+// is still in its bio). The badges of other people are shown only with
+// «Показывать значки Oblivion у других» on. Cheap (lookups in sets kept
 // in memory), sends nothing, main thread only.
 [[nodiscard]] bool Has(not_null<PeerData*> peer);
 
@@ -84,6 +81,10 @@ namespace Oblivion::Badge {
 // code that applies an update) after the result of Has() could have
 // changed for any peer: the names that show the badge are to be repainted.
 [[nodiscard]] rpl::producer<> Changes();
+
+// The badge list of the cloud (or the setting that shows it) has changed:
+// Changes() fires soon. Called by oblivion_cloud_social.cpp.
+void Refresh();
 
 // The hook of Data::ApplyUserUpdate(): called on the main thread with
 // the "about" text of a user as the server has sent it. Looks for the
@@ -103,13 +104,8 @@ namespace Oblivion::Badge {
 [[nodiscard]] QString StripAbout(const QString &about);
 
 // The hook of ApiWrap::saveSelfBio(): the text that is really sent when
-// the user saves the bio. With the badge on the marker is appended again,
-// if it fits the length limit; if it does not, the text of the user is
-// sent as it is and the badge switches itself off with a notice. A bio
-// with no visible text is sent as it is too, but the badge stays on and
-// waits for the next text (the user is told if the bio stays empty; a
-// bio still empty in the next launch switches the badge off). With the
-// badge off the text is returned unchanged.
+// the user saves the bio. It is the text of the user (a marker that got
+// into it somehow is cut off): nothing is appended any more.
 [[nodiscard]] QString BioForSaving(
 	not_null<Main::Session*> session,
 	const QString &text);
@@ -119,7 +115,7 @@ namespace Oblivion::Badge {
 void BioSaveFinished(not_null<Main::Session*> session);
 
 // The hook of the bio field in Settings: how many characters of the
-// length limit the marker takes for this account (0 with the badge off).
+// length limit Oblivion takes. Always 0 since the marker is not written.
 [[nodiscard]] int ReservedBioLength(not_null<UserData*> self);
 
 // Paints the mark into rect (any size, it is a vector shape that takes
@@ -172,37 +168,26 @@ void SetWidgetColor(
 	not_null<Ui::RpWidget*> widget,
 	std::optional<QColor> color);
 
-// Whether the badge is on for the account of this session, and the same
-// as a value for the toggle in Settings > Oblivion.
-[[nodiscard]] bool Enabled(not_null<Main::Session*> session);
-[[nodiscard]] rpl::producer<bool> EnabledValue(
+// Whether the bio of the account of this session is known to still have
+// the old marker: Settings > Oblivion shows «Убрать старую метку из
+// «О себе»» while it does. (The switch «Значок Oblivion» itself is
+// Oblivion::Social::FlagValue(session, Social::Flag::Badge).)
+[[nodiscard]] rpl::producer<bool> OldMarkerValue(
 	not_null<Main::Session*> session);
 
-// The consent and enable flow, the only way the badge is switched:
-// Settings > Oblivion > Interface > "Oblivion badge" calls it and never
-// writes a setting itself. It works for the account of this window.
-//
-// enabled == true: the first time for this account a box explains in
-// plain words what will be done to the bio and asks for the consent;
-// nothing is changed if it is declined. After that the bio is read from
-// the server, the marker is appended (if it fits the bio length limit,
-// otherwise a box says how much room is missing; an empty bio is left
-// empty and a box asks to write something first) and read back.
-//
-// enabled == false: the marker is removed from the bio. The badge is off
-// from that click on, whatever happens to the request.
-//
-// The requests go one after another and the result is told by a toast
-// or a box; a click while they are on the way only shows a toast.
-void SetEnabled(
-	not_null<Window::SessionController*> controller,
-	bool enabled);
+// The click on that button, the only way Oblivion changes the bio: the
+// bio is read from the server, the marker is cut off and the text of the
+// user is written back. The result is told by a toast; if it can't be
+// done now the marker is removed the next time Oblivion starts with this
+// account, and the toast says so. A click while the requests are on the
+// way only shows a toast.
+void RemoveOldMarker(not_null<Window::SessionController*> controller);
 
 // Called by Main::Session: once after the session is set up (reads the
 // small file of this account with the known users) and from
 // finishLogout() (forgets everything and deletes that file; only for a
-// badge that was switched off with its marker still in the bio a record
-// of that alone is left, see the guard rails above).
+// marker the user has asked to remove and that is still in the bio a
+// record of that alone is left, see the guard rails above).
 void Start(not_null<Main::Session*> session);
 void Forget(not_null<Main::Session*> session);
 

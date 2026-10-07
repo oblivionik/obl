@@ -897,6 +897,23 @@ std::vector<EditVersion> DeletedStore::edits(
 	return (i != end(_edits)) ? i->second : std::vector<EditVersion>();
 }
 
+// Oblivion round 5: for the search in the saved messages.
+std::vector<EditedMessage> DeletedStore::edited() {
+	ensureEditsLoaded();
+	auto result = std::vector<EditedMessage>();
+	result.reserve(_edits.size());
+	for (const auto &[key, list] : _edits) {
+		if (!list.empty()) {
+			result.push_back({
+				.peerId = key.first,
+				.messageId = key.second,
+				.versions = list,
+			});
+		}
+	}
+	return result;
+}
+
 void DeletedStore::forget() {
 	_deleted.clear();
 	_deletedKeys.clear();

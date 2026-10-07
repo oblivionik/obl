@@ -19,6 +19,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_session.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_deleted_search.h"
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_settings.h"
 #include "platform/platform_file_utilities.h"
@@ -519,6 +520,14 @@ void DeletedMessagesBox(
 
 	refill();
 
+	// Oblivion round 5: the search with filters, in the edited ones too.
+	box->addButton(tr::lng_close(), [=] {
+		box->closeBox();
+	});
+	box->addButton(tr::lng_oblivion_dsearch_open(), [=] {
+		DeletedSearch::Show(controller, peer);
+	});
+
 	if (store->deletedCount(peerId) > 0) {
 		box->addLeftButton(tr::lng_oblivion_deleted_clear(), [=] {
 			controller->show(Ui::MakeConfirmBox({
@@ -534,12 +543,46 @@ void DeletedMessagesBox(
 			}));
 		}, st::attentionBoxButton);
 	}
+}
+
+// Oblivion round 5: one record, opened from the search.
+void DeletedRecordBox(
+		not_null<Ui::GenericBox*> box,
+		not_null<Window::SessionController*> controller,
+		DeletedRecord record) {
+	const auto session = &controller->session();
+	const auto store = &StoreFor(session);
+	box->setWidth(st::boxWideWidth);
+	box->setMaxHeight(st::boxMaxListHeight);
+	box->setTitle(tr::lng_oblivion_dsearch_record_title());
+	AddRecordRow(box->verticalLayout(), controller, store, record, true);
 	box->addButton(tr::lng_close(), [=] {
 		box->closeBox();
 	});
+	const auto peerId = PeerId(record.peerId);
+	const auto messageId = MsgId(record.messageId);
+	if (session->data().peerLoaded(peerId)) {
+		box->addLeftButton(tr::lng_oblivion_dsearch_jump(), [=] {
+			controller->hideLayer();
+			controller->showPeerHistory(
+				peerId,
+				Window::SectionShow::Way::Forward,
+				messageId);
+		});
+	}
 }
 
 } // namespace
+
+QString DeletedMediaLabel(const DeletedMedia &media) {
+	return MediaLabel(media);
+}
+
+void ShowDeletedRecord(
+		not_null<Window::SessionController*> controller,
+		const DeletedRecord &record) {
+	controller->show(Box(DeletedRecordBox, controller, record));
+}
 
 void ShowDeletedMessages(
 		not_null<Window::SessionController*> controller,

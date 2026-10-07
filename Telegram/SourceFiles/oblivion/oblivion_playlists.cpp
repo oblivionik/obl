@@ -28,7 +28,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "media/audio/media_audio.h"
 #include "media/player/media_player_instance.h"
 #include "media/media_common.h"
+#include "oblivion/oblivion_cloud_share.h"
 #include "oblivion/oblivion_music_editor.h"
+#include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "settings/settings_common.h"
 #include "settings.h"
@@ -1544,6 +1546,17 @@ public:
 	[[nodiscard]] virtual rpl::producer<FullMsgId> removed() = 0;
 	[[nodiscard]] virtual rpl::producer<> playerChanges() = 0;
 
+	// Oblivion round 5: sharing (oblivion_cloud_share.h). «Поделиться…»
+	// in the menu of a playlist and the way to «Общие плейлисты», nothing
+	// without a session.
+	virtual void addShareActions(
+			not_null<Ui::PopupMenu*> menu,
+			uint64 playlistId) {
+	}
+	[[nodiscard]] virtual Fn<void()> sharedLibrary() {
+		return nullptr;
+	}
+
 };
 
 class SessionPlaylistsBackend final : public PlaylistsBackend {
@@ -1564,6 +1577,10 @@ public:
 		FullMsgId id) override;
 	rpl::producer<FullMsgId> removed() override;
 	rpl::producer<> playerChanges() override;
+	void addShareActions(
+		not_null<Ui::PopupMenu*> menu,
+		uint64 playlistId) override;
+	Fn<void()> sharedLibrary() override;
 
 private:
 	[[nodiscard]] HistoryItem *playableItem(FullMsgId id) const;
@@ -1646,6 +1663,7 @@ void SessionPlaylistsBackend::addMessageActions(
 	if (restriction == CopyRestrictionType::None) {
 		AddMusicEditorAction(menu, controller, item);
 	}
+	Rooms::AddToRoomAction(menu, controller, item); // Oblivion rooms.
 }
 
 rpl::producer<FullMsgId> SessionPlaylistsBackend::removed() {
@@ -1657,6 +1675,57 @@ rpl::producer<FullMsgId> SessionPlaylistsBackend::removed() {
 
 rpl::producer<> SessionPlaylistsBackend::playerChanges() {
 	return PlayerChanges();
+}
+
+// Oblivion round 5: sharing. The tracks go to Share::SharePlaylist() as
+// plain values, it asks the consent and a confirmation before anything is
+// taken from Telegram or sent.
+void SessionPlaylistsBackend::addShareActions(
+		not_null<Ui::PopupMenu*> menu,
+		uint64 playlistId) {
+	const auto playlist = _store->find(playlistId);
+	if (!playlist || playlist->tracks.empty()) {
+		return;
+	}
+	const auto controller = _controller;
+	const auto session = _session;
+	const auto store = _store;
+	menu->addAction(tr::lng_oblivion_share_playlist_menu(tr::now), [=] {
+		const auto playlist = store->find(playlistId);
+		if (!playlist) {
+			return;
+		}
+		auto tracks = std::vector<Share::LocalTrack>();
+		tracks.reserve(playlist->tracks.size());
+		for (const auto &track : playlist->tracks) {
+			// Messages that are not in the memory yet are asked for now,
+			// they are there by the time their turn comes.
+			[[maybe_unused]] const auto status = store->status(
+				session,
+				track.id);
+			tracks.push_back({
+				.peer = track.id.peer.value,
+				.msg = track.id.msg.bare,
+				.document = track.document,
+				.title = track.title,
+				.performer = track.performer,
+				.fileName = track.fileName,
+				.duration = track.duration,
+			});
+		}
+		Share::SharePlaylist(
+			controller,
+			playlistId,
+			playlist->name,
+			std::move(tracks));
+	}, &st::menuIconShare);
+}
+
+Fn<void()> SessionPlaylistsBackend::sharedLibrary() {
+	const auto controller = _controller;
+	return [=] {
+		Share::ShowLibrary(controller);
+	};
 }
 
 struct ListState {
@@ -1766,6 +1835,7 @@ void PlaylistBox(
 				tr::lng_oblivion_playlists_rename(tr::now),
 				[=] { RenamePlaylist(show, store, playlistId); },
 				&st::menuIconEdit);
+			backend->addShareActions(menu, playlistId); // Oblivion round 5.
 			if (ranges::any_of(playlist->tracks, unavailable)) {
 				menu->addAction(
 					tr::lng_oblivion_playlists_remove_unavailable(tr::now),
@@ -2114,6 +2184,7 @@ void PlaylistsBox(
 				tr::lng_oblivion_playlists_rename(tr::now),
 				[=] { RenamePlaylist(show, store, id); },
 				&st::menuIconEdit);
+			backend->addShareActions(menu, id); // Oblivion round 5.
 			menu->addAction(
 				tr::lng_oblivion_playlists_delete(tr::now),
 				[=] { ConfirmDeletePlaylist(show, store, id); },
@@ -2169,6 +2240,10 @@ void PlaylistsBox(
 	state->rebuild();
 
 	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+	// Oblivion round 5: sharing.
+	if (const auto library = backend->sharedLibrary()) {
+		box->addLeftButton(tr::lng_oblivion_share_library(), library);
+	}
 }
 
 // Snapshot scenes (OBLIVION_SELFTEST=ui, see oblivion_ui_snapshots.h).
@@ -2417,6 +2492,8 @@ void AddToPlaylistMenu(
 		not_null<Ui::PopupMenu*> menu,
 		not_null<Window::SessionController*> controller,
 		not_null<HistoryItem*> item) {
+	// Oblivion rooms: «Добавить в комнату» while a room window is open.
+	Rooms::AddToRoomAction(menu, controller, item);
 	const auto document = TrackDocument(item);
 	const auto session = &controller->session();
 	if (!document
@@ -2500,6 +2577,53 @@ bool PlaylistPlayerMove(int delta, [[maybe_unused]] bool autonext) {
 
 rpl::producer<> PlaylistPlayerChanges() {
 	return PlayerData().changes.events();
+}
+
+// Oblivion rooms: «Добавить из плейлиста».
+std::vector<RoomPlaylistBrief> RoomPlaylists(
+		not_null<Main::Session*> session) {
+	auto result = std::vector<RoomPlaylistBrief>();
+	for (const auto &playlist : StoreFor(session).list()) {
+		result.push_back({
+			.id = playlist.id,
+			.name = playlist.name,
+			.count = int(playlist.tracks.size()),
+		});
+	}
+	return result;
+}
+
+std::vector<RoomPlaylistTrack> RoomPlaylistTracks(
+		not_null<Main::Session*> session,
+		uint64 playlistId) {
+	auto result = std::vector<RoomPlaylistTrack>();
+	const auto store = &StoreFor(session);
+	const auto playlist = store->find(playlistId);
+	if (!playlist) {
+		return result;
+	}
+	const auto tracks = playlist->tracks;
+	for (const auto &track : tracks) {
+		const auto status = store->status(session, track.id);
+		result.push_back({
+			.id = track.id,
+			.title = track.title,
+			.performer = track.performer,
+			.fileName = track.fileName,
+			.duration = track.duration,
+			.ready = (status == TrackStatus::Ready),
+			.failed = (status == TrackStatus::Unavailable)
+				|| (status == TrackStatus::Failed),
+		});
+	}
+	return result;
+}
+
+rpl::producer<> RoomPlaylistsChanges(not_null<Main::Session*> session) {
+	const auto store = &StoreFor(session);
+	return rpl::merge(
+		store->changes() | rpl::to_empty,
+		store->resolved() | rpl::to_empty);
 }
 
 } // namespace Oblivion

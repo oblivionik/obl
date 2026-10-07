@@ -327,7 +327,18 @@ struct NoiseSpec {
 	float hot = 0.f;
 	float banding = 0.f;
 	uint32 seed = 0;
+	// The noise is laid over the picture in the "overlay" mode instead of
+	// being added: black and white stay clean, the middle tones get it.
+	bool overlay = false;
+	// How much of the noise leaves the lights (one: none is left there).
+	float shadows = 0.f;
 };
+
+[[nodiscard]] inline float OverlayBlend(float base, float blend) {
+	return (base < 0.5f)
+		? (2.f * base * blend)
+		: (1.f - 2.f * (1.f - base) * (1.f - blend));
+}
 
 void StageNoise(QImage &image, const NoiseSpec &spec, float unit) {
 	const auto cell = spec.cell * unit;
@@ -346,15 +357,48 @@ void StageNoise(QImage &image, const NoiseSpec &spec, float unit) {
 		4294967295.));
 	const auto hotSeed = spec.seed ^ 0x40B7C1E5U;
 	const auto bandSeed = spec.seed ^ 0x0BADB17EU;
+	const auto blended = spec.overlay || (spec.shadows > 0.f);
 	FxForEachColor(image, [&](FxRgba &c, int x, int y) {
-		if (lumaAmount > 0.f) {
+		if (blended) {
+			// The same noise, weighted by the brightness of the pixel and
+			// (in the "overlay" mode) by its distance from black and white.
+			const auto level = FxLuma(c.r, c.g, c.b);
+			auto red = 0.f;
+			auto green = 0.f;
+			auto blue = 0.f;
+			if (lumaAmount > 0.f) {
+				const auto n = luma.at(x, y)
+					* lumaAmount
+					* (1.2f - 0.65f * level);
+				red += n;
+				green += n;
+				blue += n;
+			}
+			if (chromaAmount > 0.f) {
+				const auto r = chromaRed.at(x, y) * chromaAmount;
+				const auto b = chromaBlue.at(x, y) * chromaAmount;
+				red += r;
+				blue += b;
+				green -= (r * 0.299f + b * 0.114f) / 0.587f;
+			}
+			const auto k = FxMix(1.f, FxClamp01(1.f - level), spec.shadows);
+			if (spec.overlay) {
+				c.r = OverlayBlend(c.r, FxClamp01(0.5f + red * k));
+				c.g = OverlayBlend(c.g, FxClamp01(0.5f + green * k));
+				c.b = OverlayBlend(c.b, FxClamp01(0.5f + blue * k));
+			} else {
+				c.r += red * k;
+				c.g += green * k;
+				c.b += blue * k;
+			}
+		} else if (lumaAmount > 0.f) {
 			const auto level = FxLuma(c.r, c.g, c.b);
 			const auto n = luma.at(x, y) * lumaAmount * (1.2f - 0.65f * level);
 			c.r += n;
 			c.g += n;
 			c.b += n;
 		}
-		if (chromaAmount > 0.f) {
+		if (!blended && chromaAmount > 0.f) {
 			const auto red = chromaRed.at(x, y) * chromaAmount;
 			const auto blue = chromaBlue.at(x, y) * chromaAmount;
 			c.r += red;
@@ -2290,6 +2334,20 @@ void RegisterOptics() {
 				0,
 				100,
 				0),
+			FxChoice(
+				"blend",
+				tr::lng_oblivion_photo_digicam_noise_blend,
+				{
+					tr::lng_oblivion_photo_digicam_blend_add,
+					tr::lng_oblivion_photo_digicam_blend_overlay,
+				}),
+			FxInt(
+				"shadows",
+				tr::lng_oblivion_photo_digicam_noise_shadows,
+				0,
+				100,
+				0,
+				u"%"_q),
 			FxSeed(),
 		},
 		.flags = kFxNeighbours | kFxSeeded,
@@ -2305,6 +2363,8 @@ void RegisterOptics() {
 				.hot = Percent(params, "hot"),
 				.banding = Percent(params, "banding"),
 				.seed = LofiSeed(params, context, 0x2015EU),
+				.overlay = (params.integer("blend") == 1),
+				.shadows = Percent(params, "shadows"),
 			}, LofiUnit(context));
 			return !context.cancelled();
 		},
@@ -3149,6 +3209,31 @@ const auto Registered = FxRegistrar([] {
 		check(differ, u"another seed or instance gives another picture"_q);
 	}
 
+	// Noise laid over the picture and noise kept in the shadows.
+	{
+		auto black = QImage(96, 64, QImage::Format_ARGB32_Premultiplied);
+		black.fill(QColor(0, 0, 0));
+		auto white = black;
+		white.fill(QColor(255, 255, 255));
+		const auto noise = [&](const QImage &source, int blend, int shadows) {
+			return run(MakeFx("lofi.noise", {
+				{ "hot", FxValue::Integer(0) },
+				{ "blend", FxValue::Integer(blend) },
+				{ "shadows", FxValue::Integer(shadows) },
+			}), source, context);
+		};
+		check(
+			!LofiSamePixels(noise(black, 0, 0), black)
+				&& LofiSamePixels(noise(black, 1, 0), black)
+				&& !LofiSamePixels(noise(full, 1, 0), full),
+			u"overlaid noise keeps the black clean"_q);
+		check(
+			!LofiSamePixels(noise(white, 0, 0), white)
+				&& LofiSamePixels(noise(white, 0, 100), white)
+				&& !LofiSamePixels(noise(black, 0, 100), black),
+			u"noise in the shadows keeps the white clean"_q);
+	}
+
 	// Zero strength.
 	{
 		const auto zero = [](int value = 0) {
@@ -3824,9 +3909,17 @@ struct GalleryTile {
 	QImage image;
 };
 
+// A tile of a contact sheet that is not "every effect of a group": a
+// stack of effects under its own title.
+struct GallerySource {
+	QString title;
+	std::vector<FxInstance> stack;
+};
+
 class FxGallery final : public Ui::RpWidget {
 public:
 	FxGallery(QWidget *parent, FxGroup group, bool presets);
+	FxGallery(QWidget *parent, std::vector<GallerySource> sources);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -3839,6 +3932,7 @@ private:
 
 	const FxGroup _group = FxGroup::Lofi;
 	const bool _presets = false;
+	const std::vector<GallerySource> _sources;
 	const QImage _source;
 	std::vector<GalleryTile> _tiles;
 	QSize _built;
@@ -3849,6 +3943,12 @@ FxGallery::FxGallery(QWidget *parent, FxGroup group, bool presets)
 : RpWidget(parent)
 , _group(group)
 , _presets(presets)
+, _source(FxSceneSampleImage()) {
+}
+
+FxGallery::FxGallery(QWidget *parent, std::vector<GallerySource> sources)
+: RpWidget(parent)
+, _sources(std::move(sources))
 , _source(FxSceneSampleImage()) {
 }
 
@@ -3894,7 +3994,14 @@ void FxGallery::build(QSize tile) {
 		tr::lng_oblivion_photo_filter_original(tr::now),
 		base,
 	});
-	if (_presets) {
+	if (!_sources.empty()) {
+		for (const auto &source : _sources) {
+			auto image = base;
+			if (ApplyFxStack(image, source.stack, context)) {
+				_tiles.push_back({ source.title, std::move(image) });
+			}
+		}
+	} else if (_presets) {
 		for (const auto preset : AllFxPresets()) {
 			if (preset->group != _group) {
 				continue;
@@ -4199,6 +4306,116 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			return ParamsScene(parent, controller, MakeFx("lofi.depth"));
 		},
 	});
+
+	// The digicam pack (oblivion_photo_fx_digicam.h). Its effects are in
+	// the two galleries above with the rest of the group, these sheets
+	// show what one tile can't: every filter, every lens reflection and
+	// the colors of the bloom of the CCD camera.
+	SelfTest::RegisterScene(
+		u"photo_digicam_looks"_q,
+		QSize(Px(kGalleryWidth), 0),
+		[](not_null<Ui::RpWidget*> parent) {
+			auto sources = std::vector<GallerySource>();
+			const auto descriptor = FindFx("digicam.look");
+			const auto param = descriptor ? descriptor->param("look") : nullptr;
+			const auto count = param ? int(param->choices.size()) : 0;
+			for (auto i = 0; i != count; ++i) {
+				sources.push_back({
+					param->choices[i].now(),
+					{ MakeFx("digicam.look", {
+						{ "look", FxValue::Integer(i) },
+					}) },
+				});
+			}
+			return Ui::CreateChild<FxGallery>(
+				parent.get(),
+				std::move(sources));
+		});
+	SelfTest::RegisterScene(
+		u"photo_digicam_reflections"_q,
+		QSize(Px(kGalleryWidth), 0),
+		[](not_null<Ui::RpWidget*> parent) {
+			auto sources = std::vector<GallerySource>();
+			const auto descriptor = FindFx("digicam.reflection");
+			const auto param = descriptor
+				? descriptor->param("variant")
+				: nullptr;
+			const auto count = param ? int(std::lround(param->max)) : 0;
+			for (auto i = 1; i <= count; ++i) {
+				sources.push_back({
+					QString::number(i),
+					{ MakeFx("digicam.reflection", {
+						{ "variant", FxValue::Integer(i) },
+						{ "strength", FxValue::Integer(80) },
+					}) },
+				});
+			}
+			return Ui::CreateChild<FxGallery>(
+				parent.get(),
+				std::move(sources));
+		});
+	SelfTest::RegisterScene(
+		u"photo_digicam_tints"_q,
+		QSize(Px(kGalleryWidth), 0),
+		[](not_null<Ui::RpWidget*> parent) {
+			auto sources = std::vector<GallerySource>();
+			if (FindFx("digicam.ccd")) {
+				// Violet, magenta, blue, orange, green and white.
+				for (const auto &tint : {
+					QColor(64, 0, 255),
+					QColor(255, 0, 255),
+					QColor(0, 0, 255),
+					QColor(255, 128, 0),
+					QColor(0, 255, 0),
+					QColor(255, 255, 255),
+				}) {
+					sources.push_back({
+						tint.name().toUpper(),
+						{ MakeFx("digicam.ccd", {
+							{ "tint", FxValue::Color(tint) },
+							{ "bloom", FxValue::Integer(160) },
+						}) },
+					});
+				}
+			}
+			return Ui::CreateChild<FxGallery>(
+				parent.get(),
+				std::move(sources));
+		});
+	RegisterEditorScene({
+		.name = u"photo_digicam_ccd"_q,
+		.document = [] { return FxSceneSampleDocument(); },
+		.tab = PhotoEditorTab::Layer,
+		.prepare = [](not_null<Controller*> controller) {
+			AppendToActiveLayer(controller, { MakeFx("digicam.ccd") });
+		},
+	});
+	RegisterEditorScene({
+		.name = u"photo_digicam_nokia"_q,
+		.size = QSize(520, 820),
+		.document = [] { return FxSceneSampleDocument(); },
+		.tab = PhotoEditorTab::Layer,
+		.prepare = [](not_null<Controller*> controller) {
+			AppendToActiveLayer(controller, { MakeFx("digicam.nokia") });
+		},
+	});
+	RegisterFxStackScene(u"photo_digicam_stack"_q, "digicam.preset_jpeg_low");
+	for (const auto &[name, id] : {
+		std::pair{ "photo_digicam_ccd_panel", "digicam.ccd" },
+		std::pair{ "photo_digicam_look_panel", "digicam.look" },
+		std::pair{ "photo_digicam_vignette_panel", "digicam.vignette" },
+		std::pair{ "photo_digicam_noise_panel", "lofi.noise" },
+	}) {
+		RegisterPanelScene({
+			.name = QString::fromLatin1(name),
+			.size = QSize(width, 0),
+			.create = [id = QByteArray(id)](
+					not_null<QWidget*> parent,
+					not_null<Controller*> controller) {
+				return ParamsScene(parent, controller, MakeFx(id));
+			},
+		});
+	}
 });
 
 } // namespace

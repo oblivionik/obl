@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_deleted_store.h"
 #include "oblivion/oblivion_interface.h"
 #include "oblivion/oblivion_listen_ui.h"
+#include "oblivion/oblivion_send_online.h"
 #include "oblivion/oblivion_settings.h"
 #include "api/api_compose_with_ai.h"
 #include "api/api_editing.h"
@@ -3104,11 +3105,19 @@ void HistoryWidget::showHistory(
 			updateControlsGeometry();
 		}, _contactStatus->bar().lifetime());
 
-		// Oblivion: listening to music together, see oblivion_listen.h.
-		_oblivionListenBar = Oblivion::Listen::CreateBar(
+		// Oblivion: listening to music together, see oblivion_listen.h,
+		// and under it the messages that wait for the person to come
+		// online, see oblivion_send_online.h.
+		_oblivionListenBar = Oblivion::SendOnline::WithChatBar(
 			_topBars.get(),
 			controller(),
-			_peer);
+			_peer,
+			[=](not_null<QWidget*> parent) {
+				return Oblivion::Listen::CreateBar(
+					parent,
+					controller(),
+					_peer);
+			});
 		if (const auto raw = _oblivionListenBar.data()) {
 			raw->heightValue(
 			) | rpl::on_next([=] {
@@ -5188,7 +5197,16 @@ void HistoryWidget::setupSendMenu(
 	SetupMenuAndShortcuts(
 		button,
 		controller()->uiShow(),
-		[=] { return sendButtonMenuDetails(); },
+		[=] {
+			auto result = sendButtonMenuDetails();
+			if (button.get() != _send.get()) {
+				// Oblivion: only the send button of the chat itself
+				// puts the text of the field into the queue of
+				// oblivion_send_online.h.
+				result.oblivionWhenOnline = false;
+			}
+			return result;
+		},
 		[=](Action value, Details details) {
 			if (value.type == ActionType::CaptionUp
 				|| value.type == ActionType::CaptionDown
@@ -5509,6 +5527,18 @@ void HistoryWidget::send(Api::SendOptions options) {
 		return;
 	} else if (const auto page = shownRichMessage()) {
 		sendRichDraft(page, options);
+		return;
+	} else if (options.oblivionWhenOnline) {
+		// Oblivion: «Отправить, когда будет в сети», the text waits on
+		// this device, nothing is sent now (oblivion_send_online.h).
+		if (Oblivion::SendOnline::Enqueue(
+				controller(),
+				_history,
+				_field->getTextWithAppliedMarkdown())) {
+			clearFieldText();
+			saveDraftWithTextNow();
+			setInnerFocus();
+		}
 		return;
 	}
 	if (!options.scheduled) {
@@ -5835,6 +5865,16 @@ SendMenu::Details HistoryWidget::sendButtonDefaultDetails() const {
 	if (!hasSendableContent() && !_previewDrawPreview) {
 		result.effectAllowed = false;
 	}
+	// Oblivion: «Отправить, когда будет в сети» for a plain text only:
+	// no reply, no forwarded messages, no recorded voice (they would go
+	// out at once or be lost), see oblivion_send_online.h.
+	result.oblivionWhenOnline = _history
+		&& fieldHasSendText()
+		&& !replyTo()
+		&& _forwardPanel->empty()
+		&& !_voiceRecordBar->isListenState()
+		&& !shownRichMessage()
+		&& Oblivion::SendOnline::Offered(_peer);
 	return result;
 }
 

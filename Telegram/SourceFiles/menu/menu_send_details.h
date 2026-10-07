@@ -55,6 +55,10 @@ struct Details {
 	std::optional<uint64> commentPriceMin;
 	const style::EmojiPan *effectsPan = nullptr;
 	bool effectAllowed = false;
+
+	// Oblivion: «Отправить, когда будет в сети» that waits on this
+	// device is offered (see oblivion_send_online.h).
+	bool oblivionWhenOnline = false;
 };
 
 } // namespace SendMenu

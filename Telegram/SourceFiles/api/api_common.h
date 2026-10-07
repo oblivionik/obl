@@ -46,6 +46,11 @@ struct SendOptions {
 	// effect is applied, see oblivion_voice_changer.h).
 	bool oblivionAnnounced = false;
 
+	// Oblivion: «Отправить, когда будет в сети» of the send button menu,
+	// the text waits on this device and nothing is sent by this call
+	// (see oblivion_send_online.h).
+	bool oblivionWhenOnline = false;
+
 	crl::time ttlSeconds = 0;
 	SuggestOptions suggest;
 
