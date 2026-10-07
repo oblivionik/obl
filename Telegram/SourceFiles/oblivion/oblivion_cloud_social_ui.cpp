@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_cloud_social_ui.h"
 
+#include "base/call_delayed.h"
 #include "base/weak_ptr.h"
 #include "boxes/peer_list_box.h"
 #include "boxes/peer_list_controllers.h"
@@ -21,6 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_cloud_share.h"
 #include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_lang.h"
+#include "oblivion/oblivion_look.h"
+#include "oblivion/oblivion_look_ui.h"
 #include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_ui_snapshots.h"
@@ -67,9 +70,18 @@ constexpr auto kChipPadding = 9;
 constexpr auto kChipIcon = 14;
 constexpr auto kChipIconSkip = 6;
 constexpr auto kChipSkip = 6;
-constexpr auto kChipJoinSkip = 10;
+constexpr auto kChipJoinSkip = 8;
+constexpr auto kChipJoinInset = 3;
+constexpr auto kChipJoinPadding = 9;
 constexpr auto kChipBgOpacity = 0.14;
-constexpr auto kChipLineOpacity = 0.35;
+constexpr auto kChipLabelOpacity = 0.62;
+
+// «Войти» in the colour of a person: a fill brighter than this gets a
+// dark text instead of a white one; the percent it changes by under the
+// mouse; how dark the dark text is.
+constexpr auto kChipJoinDarkFrom = 0.36;
+constexpr auto kChipJoinOverFactor = 110;
+constexpr auto kChipJoinDarkAlpha = 217;
 constexpr auto kCardGlyph = 16;
 constexpr auto kCardSkip = 4;
 constexpr auto kCardRadius = 10;
@@ -80,10 +92,50 @@ constexpr auto kNameLimit = 64;
 constexpr auto kStatusLimit = 80;
 constexpr auto kCellSize = 36;
 constexpr auto kCellRadius = 8;
+constexpr auto kCellsPerRow = 8;
 constexpr auto kSwatchSize = 22;
 constexpr auto kAvatarSide = 160;
 constexpr auto kAvatarBytes = 60 * 1024;
 constexpr auto kSceneWidth = 340;
+
+// The looks («Тема Oblivion», oblivion_look.h), at the 100% scale. The
+// plain look uses the values above and paints what it always has.
+//
+// «Родной, но лучше» and «Ночной эфир»: the chips are a little higher,
+// «Войти» is smaller inside them.
+constexpr auto kLookChipHeight = 30;
+constexpr auto kLookChipLeft = 9;
+constexpr auto kLookChipRight = 12;
+constexpr auto kLookChipSkip = 8;
+constexpr auto kLookJoinInset = 4;
+// «Ночной эфир»: «слушает» is a card in the whole width, with a mark of
+// the gradient at its left.
+constexpr auto kLiveHeight = 54;
+constexpr auto kLiveMark = 34;
+constexpr auto kLiveMarkRadius = 11;
+constexpr auto kLivePadding = 10;
+constexpr auto kLiveSkip = 12;
+constexpr auto kLiveValueSize = 15;
+// «Тишина»: a chip is a row with a hairline under it, the label is small
+// capitals over the value.
+constexpr auto kRowHeight = 48;
+constexpr auto kRowIcon = 16;
+constexpr auto kRowSkip = 12;
+constexpr auto kRowJoinHeight = 28;
+constexpr auto kRowJoinPadding = 14;
+constexpr auto kCapsSize = 11;
+constexpr auto kCapsSpacing = 1.1;
+// The block of a profile as a card: what it has around its content.
+constexpr auto kBlockCardPadding = 12;
+// A row of a list under the mouse.
+constexpr auto kRowHoverInset = 6;
+constexpr auto kFlatCellRadius = 4;
+
+// The edits of «Выбранные люди» are sent as one request this long after
+// the last click; a "too often" of the server is waited out, not longer
+// than the second value.
+constexpr auto kChosenSendDelay = crl::time(1500);
+constexpr auto kChosenRetryMax = crl::time(30'000);
 
 // The quick choices of the editor. Anything else that is already set for
 // the account is kept and shown first.
@@ -114,6 +166,22 @@ constexpr uint32 kAccentColors[] = {
 	return st::boxRowPadding + style::margins(0, 0, 0, st::boxLittleSkip);
 }
 
+// A strip of choices stands out of the column of the box by the gap
+// around a swatch: the first and the last choice of a line are exactly
+// under the edges of the fields above.
+[[nodiscard]] style::margins StripPadding() {
+	const auto out = (Scaled(kCellSize) - Scaled(kSwatchSize)) / 2;
+	return st::boxRowPadding
+		+ style::margins(-out, 0, -out, st::boxLittleSkip);
+}
+
+// A state of a list that has no rows: a text in the middle of the box,
+// the way the lists of the app say that they are empty.
+[[nodiscard]] style::margins EmptyPadding() {
+	return st::boxRowPadding
+		+ style::margins(0, st::boxMediumSkip, 0, st::boxMediumSkip);
+}
+
 void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 	if (show && show->valid() && !text.isEmpty()) {
 		show->showToast(text);
@@ -133,6 +201,13 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 		.roomUntitled = tr::lng_oblivion_social_chip_text_room_plain(tr::now),
 		.online = tr::lng_oblivion_social_chip_text_online(tr::now),
 	};
+}
+
+// What a phrase of a chip begins with, «слушает: » of «слушает: {text}».
+// A chip paints it lighter than the track or the room that follows.
+[[nodiscard]] QString PhraseLabel(const QString &phrase, const QString &tag) {
+	const auto index = phrase.indexOf(tag);
+	return (index > 0) ? phrase.left(index) : QString();
 }
 
 // One emoji the app knows, or nothing: what has come from another person
@@ -173,6 +248,15 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 	return parts.join(QString::fromUtf8(" · "));
 }
 
+// Whether the «Oblivion» block of a profile has anything a person would
+// see: a status line as it is painted (an emoji the app knows, a text)
+// or shared things. A profile made of anything else shows no block.
+[[nodiscard]] bool HasVisibleContent(const Profile &profile) {
+	return profile.hasContent()
+		&& (!StatusLine(profile).isEmpty()
+			|| !SharedLine(profile).isEmpty());
+}
+
 [[nodiscard]] QString SharedItemTitle(const SharedItem &item) {
 	const auto detail = item.playlist
 		? tr::lng_oblivion_social_shared_tracks(tr::now, lt_count, item.count)
@@ -183,6 +267,20 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 	return title.isEmpty()
 		? detail
 		: (title + QString::fromUtf8(" · ") + detail);
+}
+
+// Whether a dark text reads better than a white one on a fill: by the
+// relative luminance of the fill.
+[[nodiscard]] bool DarkTextOn(const QColor &fill) {
+	const auto channel = [](double value) {
+		return (value <= 0.03928)
+			? (value / 12.92)
+			: std::pow((value + 0.055) / 1.055, 2.4);
+	};
+	const auto luminance = 0.2126 * channel(fill.redF())
+		+ 0.7152 * channel(fill.greenF())
+		+ 0.0722 * channel(fill.blueF());
+	return (luminance > kChipJoinDarkFrom);
 }
 
 // The icons of the chips are painted in code, in the colour of the chip.
@@ -237,9 +335,51 @@ void PaintChipIcon(QPainter &p, ChipType type, QRectF rect, QColor color) {
 	p.restore();
 }
 
+// The small capitals of «Ночной эфир» and «Тишина».
+[[nodiscard]] QFont CapsFont() {
+	auto result = st::semiboldFont->f;
+	result.setPixelSize(Scaled(kCapsSize));
+	result.setLetterSpacing(
+		QFont::AbsoluteSpacing,
+		style::ConvertScaleExact(kCapsSpacing));
+	return result;
+}
+
+// «слушает: » as a line of its own over the track: «СЛУШАЕТ».
+[[nodiscard]] QString CapsLabel(QString label) {
+	label = label.trimmed();
+	while (label.endsWith(QChar(':'))) {
+		label.chop(1);
+	}
+	return label.trimmed().toUpper();
+}
+
+// The track in the big «слушает» card of «Ночной эфир».
+[[nodiscard]] const style::font &LiveFont() {
+	static const auto result = style::font(
+		Scaled(kLiveValueSize),
+		st::semiboldFont->flags(),
+		st::semiboldFont->family());
+	return result;
+}
+
+[[nodiscard]] Look::Chip ChipKind(ChipType type) {
+	return (type == ChipType::Room)
+		? Look::Chip::Room
+		: (type == ChipType::Online)
+		? Look::Chip::Neutral
+		: Look::Chip::Accent;
+}
+
 // The activity chips: rounded pills with an icon and a text, wrapped to
-// as many lines as the width needs. The chip of a room that lets people
-// in ends with «Войти».
+// as many lines as the width needs. «слушает:» and «в комнате:» are
+// painted lighter, the track and the room stand out. The chip of a room
+// that lets people in ends with the button «Войти».
+//
+// With a look («Тема Oblivion») the chips have its shapes and colours:
+// tinted pills in «Родной, но лучше»; pills with a stroke and a big card
+// for «слушает» in «Ночной эфир»; rows with hairlines in «Тишина». The
+// colour of a person stays on the mark of a chip in every look.
 class ChipsView final : public Ui::RpWidget {
 public:
 	explicit ChipsView(QWidget *parent);
@@ -258,15 +398,26 @@ protected:
 private:
 	struct Item {
 		Chip chip;
-		QString text;
+		QString label; // «слушает: », or nothing.
+		QString value; // The rest of the text.
+		QString shown; // The value as it fits.
+		QString caps; // A look: the label as a line of its own.
+		int labelWidth = 0;
 		QRect rect;
 		QRect join;
+		bool live = false; // The big card of «Ночной эфир».
 	};
 
 	[[nodiscard]] int joinAt(QPoint point) const;
 	void setHovered(int index);
+	[[nodiscard]] int layoutPlain(int newWidth);
+	[[nodiscard]] int layoutLook(int newWidth);
+	void paintPlain(QPainter &p);
+	void paintLook(QPainter &p);
 
 	const QString _joinText;
+	const QString _listeningLabel;
+	const QString _roomLabel;
 	std::vector<Item> _items;
 	std::optional<QColor> _accent;
 	Fn<void(QString)> _join;
@@ -277,8 +428,19 @@ private:
 
 ChipsView::ChipsView(QWidget *parent)
 : RpWidget(parent)
-, _joinText(tr::lng_oblivion_social_chip_join(tr::now)) {
+, _joinText(tr::lng_oblivion_social_chip_join(tr::now))
+, _listeningLabel(PhraseLabel(LangPhrases().listening, u"{text}"_q))
+, _roomLabel(PhraseLabel(LangPhrases().room, u"{title}"_q)) {
 	setMouseTracking(true);
+
+	// A look has chips of its own size.
+	Look::Updates(
+	) | rpl::on_next([=] {
+		if (width() > 0) {
+			resizeToWidth(width());
+		}
+		update();
+	}, lifetime());
 }
 
 void ChipsView::setChips(
@@ -289,7 +451,19 @@ void ChipsView::setChips(
 	_items.clear();
 	_items.reserve(chips.size());
 	for (auto &chip : chips) {
-		_items.push_back({ .chip = std::move(chip) });
+		const auto &label = (chip.type == ChipType::Listening)
+			? _listeningLabel
+			: (chip.type == ChipType::Room)
+			? _roomLabel
+			: QString();
+		const auto split = !label.isEmpty()
+			&& (chip.text.size() > label.size())
+			&& chip.text.startsWith(label);
+		auto item = Item();
+		item.label = split ? label : QString();
+		item.value = split ? chip.text.mid(label.size()) : chip.text;
+		item.chip = std::move(chip);
+		_items.push_back(std::move(item));
 	}
 	if (width() > 0) {
 		resizeToWidth(width());
@@ -305,22 +479,154 @@ int ChipsView::resizeGetHeight(int newWidth) {
 	if (_items.empty()) {
 		return 0;
 	}
-	const auto &font = st::normalFont;
+	return Look::Is(Look::kPlain)
+		? layoutPlain(newWidth)
+		: layoutLook(newWidth);
+}
+
+int ChipsView::layoutLook(int newWidth) {
+	const auto look = Look::Current();
+	const auto capsMetrics = QFontMetrics(CapsFont());
+	const auto &joinFont = st::semiboldFont;
+	const auto full = std::max(newWidth, 1);
+	if (look == Look::kSilence) {
+		// Rows: the mark, the label over the value, «Войти» at the right.
+		const auto height = Scaled(kRowHeight);
+		const auto joinHeight = Scaled(kRowJoinHeight);
+		const auto joinWidth = joinFont->width(_joinText)
+			+ 2 * Scaled(kRowJoinPadding);
+		const auto textLeft = Scaled(kRowIcon) + Scaled(kRowSkip);
+		auto top = 0;
+		for (auto &item : _items) {
+			const auto join = !item.chip.joinCode.isEmpty();
+			const auto available = std::max(
+				newWidth
+					- textLeft
+					- (join ? (joinWidth + Scaled(kRowSkip)) : 0),
+				0);
+			item.live = false;
+			item.labelWidth = 0;
+			item.caps = capsMetrics.elidedText(
+				CapsLabel(item.label),
+				Qt::ElideRight,
+				available);
+			item.shown = st::normalFont->elided(item.value, available);
+			item.rect = QRect(0, top, full, height);
+			item.join = join
+				? QRect(
+					full - joinWidth,
+					top + (height - joinHeight) / 2,
+					joinWidth,
+					joinHeight)
+				: QRect();
+			top += height;
+		}
+		return top;
+	}
+
+	// Pills, and under them the card of «слушает» in «Ночной эфир».
+	const auto height = Scaled(kLookChipHeight);
+	const auto skip = Scaled(kLookChipSkip);
+	const auto inset = Scaled(kLookJoinInset);
+	const auto joinWidth = joinFont->width(_joinText)
+		+ 2 * Scaled(kChipJoinPadding);
+	const auto icon = Scaled(kChipIcon) + Scaled(kChipIconSkip);
+	auto left = 0;
+	auto top = 0;
+	auto pills = false;
+	Item *live = nullptr;
+	for (auto &item : _items) {
+		item.caps = QString();
+		item.live = !live
+			&& (look == Look::kNightAir)
+			&& (item.chip.type == ChipType::Listening);
+		if (item.live) {
+			live = &item;
+			continue;
+		}
+		const auto join = !item.chip.joinCode.isEmpty();
+		const auto &font = item.label.isEmpty()
+			? st::normalFont
+			: st::semiboldFont;
+		item.labelWidth = item.label.isEmpty()
+			? 0
+			: st::normalFont->width(item.label);
+		const auto fixed = Scaled(kLookChipLeft)
+			+ icon
+			+ item.labelWidth
+			+ (join
+				? (Scaled(kChipJoinSkip) + joinWidth + inset)
+				: Scaled(kLookChipRight));
+		const auto available = std::max(newWidth - fixed, 0);
+		item.shown = font->elided(item.value, available);
+		const auto width = std::min(fixed + font->width(item.shown), full);
+		if (left > 0 && left + width > newWidth) {
+			left = 0;
+			top += height + skip;
+		}
+		item.rect = QRect(left, top, width, height);
+		item.join = join
+			? QRect(
+				left + width - inset - joinWidth,
+				top + inset,
+				joinWidth,
+				height - 2 * inset)
+			: QRect();
+		left += width + skip;
+		pills = true;
+	}
+	auto bottom = pills ? (top + height) : 0;
+	if (live) {
+		const auto cardTop = pills ? (bottom + skip) : 0;
+		const auto cardHeight = Scaled(kLiveHeight);
+		const auto available = std::max(
+			newWidth
+				- 2 * Scaled(kLivePadding)
+				- Scaled(kLiveMark)
+				- Scaled(kLiveSkip),
+			0);
+		live->labelWidth = 0;
+		live->caps = capsMetrics.elidedText(
+			CapsLabel(live->label),
+			Qt::ElideRight,
+			available);
+		live->shown = LiveFont()->elided(live->value, available);
+		live->rect = QRect(0, cardTop, full, cardHeight);
+		live->join = QRect();
+		bottom = cardTop + cardHeight;
+	}
+	return bottom;
+}
+
+int ChipsView::layoutPlain(int newWidth) {
 	const auto height = Scaled(kChipHeight);
 	const auto padding = Scaled(kChipPadding);
 	const auto skip = Scaled(kChipSkip);
-	const auto joinSkip = Scaled(kChipJoinSkip);
-	const auto joinWidth = joinSkip + st::semiboldFont->width(_joinText);
+	const auto inset = Scaled(kChipJoinInset);
+	const auto joinWidth = st::semiboldFont->width(_joinText)
+		+ 2 * Scaled(kChipJoinPadding);
 	const auto icon = Scaled(kChipIcon) + Scaled(kChipIconSkip);
 	auto left = 0;
 	auto top = 0;
 	for (auto &item : _items) {
-		const auto join = item.chip.joinCode.isEmpty() ? 0 : joinWidth;
-		const auto fixed = 2 * padding + icon + (join ? (join + joinSkip) : 0);
+		const auto join = !item.chip.joinCode.isEmpty();
+		const auto &font = item.label.isEmpty()
+			? st::normalFont
+			: st::semiboldFont;
+		item.labelWidth = item.label.isEmpty()
+			? 0
+			: st::normalFont->width(item.label);
+
+		// The button stands inside the chip, the same distance from its
+		// top, bottom and right edges.
+		const auto fixed = padding
+			+ icon
+			+ item.labelWidth
+			+ (join ? (Scaled(kChipJoinSkip) + joinWidth + inset) : padding);
 		const auto available = std::max(newWidth - fixed, 0);
-		item.text = font->elided(item.chip.text, available);
+		item.shown = font->elided(item.value, available);
 		const auto width = std::min(
-			fixed + font->width(item.text),
+			fixed + font->width(item.shown),
 			std::max(newWidth, 1));
 		if (left > 0 && left + width > newWidth) {
 			left = 0;
@@ -328,7 +634,11 @@ int ChipsView::resizeGetHeight(int newWidth) {
 		}
 		item.rect = QRect(left, top, width, height);
 		item.join = join
-			? QRect(left + width - padding - join, top, join + padding, height)
+			? QRect(
+				left + width - inset - joinWidth,
+				top + inset,
+				joinWidth,
+				height - 2 * inset)
 			: QRect();
 		left += width + skip;
 	}
@@ -338,11 +648,197 @@ int ChipsView::resizeGetHeight(int newWidth) {
 void ChipsView::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
+	if (Look::Is(Look::kPlain)) {
+		paintPlain(p);
+	} else {
+		paintLook(p);
+	}
+}
+
+void ChipsView::paintLook(QPainter &p) {
+	using Role = Look::Role;
+	const auto look = Look::Current();
+	const auto rows = (look == Look::kSilence);
+	const auto air = (look == Look::kNightAir);
+	const auto capsFont = CapsFont();
+	const auto capsMetrics = QFontMetrics(capsFont);
+	const auto capsLine = capsMetrics.height() + Scaled(2);
+	const auto &joinFont = st::semiboldFont;
+	auto index = 0;
+	for (const auto &item : _items) {
+		const auto over = (index++ == _hovered);
+		const auto &rect = item.rect;
+		const auto kind = ChipKind(item.chip.type);
+		const auto quiet = (kind == Look::Chip::Neutral);
+		// The colour of a person stays on the mark of the chip, without
+		// one the mark has the colour the look gives it.
+		const auto mark = _accent.value_or(rows
+			? Look::Color(Role::SubText)
+			: air
+			? Look::Color(Role::Accent)
+			: quiet
+			? Look::ChipLabel(kind, QColor())
+			: Look::ChipText(kind, QColor()));
+		Look::PaintChip(
+			p,
+			QRectF(rect),
+			QColor(),
+			0,
+			item.live ? Look::Chip::Live : kind);
+		if (item.live) {
+			// The mark: a tile of the gradient (of the colour of a person
+			// who has one) with the equalizer on it.
+			const auto size = Scaled(kLiveMark);
+			const auto glyph = Scaled(kRowIcon);
+			const auto radius = Scaled(kLiveMarkRadius);
+			const auto tile = QRectF(
+				rect.x() + Scaled(kLivePadding),
+				rect.y() + (rect.height() - size) / 2.,
+				size,
+				size);
+			if (_accent) {
+				p.setPen(Qt::NoPen);
+				p.setBrush(*_accent);
+				p.drawRoundedRect(tile, radius, radius);
+			} else {
+				Look::PaintAccentGradient(p, tile, radius, QColor());
+			}
+			PaintChipIcon(
+				p,
+				item.chip.type,
+				QRectF(
+					tile.x() + (size - glyph) / 2.,
+					tile.y() + (size - glyph) / 2.,
+					glyph,
+					glyph),
+				((_accent && DarkTextOn(*_accent))
+					? QColor(0, 0, 0, kChipJoinDarkAlpha)
+					: QColor(255, 255, 255)));
+			const auto textLeft = rect.x()
+				+ Scaled(kLivePadding)
+				+ size
+				+ Scaled(kLiveSkip);
+			const auto &valueFont = LiveFont();
+			const auto labeled = !item.caps.isEmpty();
+			auto top = rect.y()
+				+ (rect.height()
+					- valueFont->height
+					- (labeled ? capsLine : 0)) / 2;
+			if (labeled) {
+				p.setFont(capsFont);
+				p.setPen(Look::ChipLabel(Look::Chip::Live, QColor()));
+				p.drawText(textLeft, top + capsMetrics.ascent(), item.caps);
+				top += capsLine;
+			}
+			p.setFont(valueFont);
+			p.setPen(Look::ChipText(Look::Chip::Live, QColor()));
+			p.drawText(textLeft, top + valueFont->ascent, item.shown);
+			continue;
+		} else if (rows) {
+			if (&item == &_items.front()) {
+				Look::PaintDivider(
+					p,
+					QRectF(rect.x(), rect.y(), rect.width(), st::lineWidth),
+					st::shadowFg->c);
+			}
+			const auto icon = Scaled(kRowIcon);
+			PaintChipIcon(
+				p,
+				item.chip.type,
+				QRectF(
+					rect.x(),
+					rect.y() + (rect.height() - icon) / 2.,
+					icon,
+					icon),
+				mark);
+			const auto textLeft = rect.x() + icon + Scaled(kRowSkip);
+			const auto &valueFont = st::normalFont;
+			const auto labeled = !item.caps.isEmpty();
+			auto top = rect.y()
+				+ (rect.height()
+					- valueFont->height
+					- (labeled ? capsLine : 0)) / 2;
+			if (labeled) {
+				p.setFont(capsFont);
+				p.setPen(Look::Color(Role::SubText));
+				p.drawText(textLeft, top + capsMetrics.ascent(), item.caps);
+				top += capsLine;
+			}
+			p.setFont(valueFont);
+			p.setPen(Look::Color(Role::Text));
+			p.drawText(textLeft, top + valueFont->ascent, item.shown);
+		} else {
+			const auto icon = Scaled(kChipIcon);
+			PaintChipIcon(
+				p,
+				item.chip.type,
+				QRectF(
+					rect.x() + Scaled(kLookChipLeft),
+					rect.y() + (rect.height() - icon) / 2.,
+					icon,
+					icon),
+				mark);
+			auto textLeft = rect.x()
+				+ Scaled(kLookChipLeft)
+				+ icon
+				+ Scaled(kChipIconSkip);
+			const auto baseline = rect.y()
+				+ (rect.height() - st::normalFont->height) / 2
+				+ st::normalFont->ascent;
+			if (!item.label.isEmpty()) {
+				p.setFont(st::normalFont);
+				p.setPen(Look::ChipLabel(kind, QColor()));
+				p.drawText(textLeft, baseline, item.label);
+				textLeft += item.labelWidth;
+			}
+			p.setFont(item.label.isEmpty()
+				? st::normalFont
+				: st::semiboldFont);
+			p.setPen(quiet
+				? Look::ChipLabel(kind, QColor())
+				: Look::ChipText(kind, QColor()));
+			p.drawText(textLeft, baseline, item.shown);
+		}
+		if (!item.join.isEmpty()) {
+			// «Войти»: the fill of the room of the look, its gradient in
+			// «Ночной эфир»; under the mouse a touch of the text colour
+			// lies over it.
+			const auto join = QRectF(item.join);
+			const auto corner = join.height() / 2.;
+			const auto text = Look::Color(air
+				? Role::OnAccent
+				: Role::OnRoom);
+			if (air) {
+				Look::PaintAccentGradient(p, join, corner, QColor());
+			} else {
+				p.setPen(Qt::NoPen);
+				p.setBrush(Look::Color(Role::RoomFill));
+				p.drawRoundedRect(join, corner, corner);
+			}
+			if (over) {
+				auto veil = text;
+				veil.setAlpha(36);
+				p.setPen(Qt::NoPen);
+				p.setBrush(veil);
+				p.drawRoundedRect(join, corner, corner);
+			}
+			p.setFont(joinFont);
+			p.setPen(text);
+			p.drawText(
+				item.join.x()
+					+ (item.join.width() - joinFont->width(_joinText)) / 2,
+				item.join.y()
+					+ (item.join.height() - joinFont->height) / 2
+					+ joinFont->ascent,
+				_joinText);
+		}
+	}
+}
+
+void ChipsView::paintPlain(QPainter &p) {
 	const auto accent = _accent.value_or(st::windowActiveTextFg->c);
-	const auto &font = st::normalFont;
 	const auto padding = Scaled(kChipPadding);
 	const auto icon = Scaled(kChipIcon);
-	const auto joinSkip = Scaled(kChipJoinSkip);
 	auto index = 0;
 	for (const auto &item : _items) {
 		const auto &rect = item.rect;
@@ -359,26 +855,50 @@ void ChipsView::paintEvent(QPaintEvent *e) {
 				icon,
 				icon),
 			accent);
-		const auto textLeft = rect.x() + padding + icon + Scaled(kChipIconSkip);
-		const auto textTop = rect.y() + (rect.height() - font->height) / 2;
-		p.setFont(font);
+		auto textLeft = rect.x() + padding + icon + Scaled(kChipIconSkip);
+		const auto baseline = rect.y()
+			+ (rect.height() - st::normalFont->height) / 2
+			+ st::normalFont->ascent;
+		if (!item.label.isEmpty()) {
+			// The colour of the text, lighter: on a tinted chip it stays
+			// easier to read than the grey of the secondary texts.
+			p.setFont(st::normalFont);
+			p.setPen(anim::with_alpha(st::windowFg->c, kChipLabelOpacity));
+			p.drawText(textLeft, baseline, item.label);
+			textLeft += item.labelWidth;
+		}
+		p.setFont(item.label.isEmpty() ? st::normalFont : st::semiboldFont);
 		p.setPen(st::windowFg);
-		p.drawText(textLeft, textTop + font->ascent, item.text);
+		p.drawText(textLeft, baseline, item.shown);
 		if (!item.join.isEmpty()) {
-			const auto line = item.join.x() - (joinSkip / 2);
-			p.setPen(anim::with_alpha(accent, kChipLineOpacity));
-			p.drawLine(
-				QPointF(line + 0.5, rect.y() + padding * 0.6),
-				QPointF(line + 0.5, rect.y() + rect.height() - padding * 0.6));
-			const auto &joinFont = (index == _hovered)
-				? st::semiboldFont->underline()
-				: st::semiboldFont;
+			// A small filled button. A person with a colour of their own
+			// has it in that colour, with the text that reads better on
+			// it; without one it is an active button of the app.
+			const auto &join = item.join;
+			const auto corner = join.height() / 2.;
+			const auto over = (index == _hovered);
+			const auto dark = _accent && DarkTextOn(*_accent);
+			const auto fill = !_accent
+				? (over ? st::activeButtonBgOver : st::activeButtonBg)->c
+				: !over
+				? (*_accent)
+				: dark
+				? _accent->darker(kChipJoinOverFactor)
+				: _accent->lighter(kChipJoinOverFactor);
+			p.setPen(Qt::NoPen);
+			p.setBrush(fill);
+			p.drawRoundedRect(join, corner, corner);
+			const auto &joinFont = st::semiboldFont;
 			p.setFont(joinFont);
-			p.setPen(st::windowActiveTextFg);
+			p.setPen(!_accent
+				? st::activeButtonFg->c
+				: dark
+				? QColor(0, 0, 0, kChipJoinDarkAlpha)
+				: st::windowFgActive->c);
 			p.drawText(
-				item.join.x() + (joinSkip / 2),
-				rect.y()
-					+ (rect.height() - joinFont->height) / 2
+				join.x() + (join.width() - joinFont->width(_joinText)) / 2,
+				join.y()
+					+ (join.height() - joinFont->height) / 2
 					+ joinFont->ascent,
 				_joinText);
 		}
@@ -387,9 +907,13 @@ void ChipsView::paintEvent(QPaintEvent *e) {
 }
 
 int ChipsView::joinAt(QPoint point) const {
+	// The whole end of the chip around the button takes the click.
+	const auto inset = Scaled(kChipJoinInset);
+	const auto around = QMargins(inset, inset, inset, inset);
 	auto index = 0;
 	for (const auto &item : _items) {
-		if (!item.join.isEmpty() && item.join.contains(point)) {
+		if (!item.join.isEmpty()
+			&& item.join.marginsAdded(around).contains(point)) {
 			return index;
 		}
 		++index;
@@ -443,7 +967,7 @@ struct CardData {
 	bool preview = false; // In the editor: the block is always there.
 
 	[[nodiscard]] bool profileShown() const {
-		return profile && (preview || profile->hasContent());
+		return profile && (preview || HasVisibleContent(*profile));
 	}
 	[[nodiscard]] bool empty() const {
 		return chips.empty() && !profileShown();
@@ -469,6 +993,8 @@ protected:
 	int resizeGetHeight(int newWidth) override;
 
 private:
+	void refreshStatus();
+
 	const style::margins _padding;
 	const bool _framed = false;
 	const not_null<ChipsView*> _chips;
@@ -476,8 +1002,13 @@ private:
 	const not_null<Ui::LinkButton*> _edit;
 	CardData _data;
 	Ui::Text::String _status;
+	bool _statusHint = false; // Not a status: what to do to get the block.
 	int _titleTop = 0;
 	int _statusTop = 0;
+
+	// A look («Тема Oblivion») that has cards puts the block of a profile
+	// page into one, this is where it lies.
+	QRect _card;
 
 };
 
@@ -493,6 +1024,37 @@ ProfileCard::ProfileCard(QWidget *parent, style::margins padding, bool framed)
 	_chips->hide();
 	_shared->hide();
 	_edit->hide();
+
+	// A look has its own chips, type and card: everything is laid out
+	// again (the chips have just done that for themselves).
+	Look::Updates(
+	) | rpl::on_next([=] {
+		refreshStatus();
+		if (width() > 0) {
+			resizeToWidth(width());
+		}
+		update();
+	}, lifetime());
+}
+
+void ProfileCard::refreshStatus() {
+	if (!_data.profileShown()) {
+		_statusHint = false;
+		_status = Ui::Text::String();
+		return;
+	}
+	// The preview of a profile that has nothing to show yet says how
+	// to get the block, instead of a title with nothing under it.
+	_statusHint = _data.preview && !HasVisibleContent(*_data.profile);
+
+	// «Ночной эфир» and «Тишина» write the status in a heavier type.
+	const auto heavy = !_statusHint && Look::CapsLabels();
+	_status.setText(
+		heavy ? st::semiboldTextStyle : st::defaultTextStyle,
+		(_statusHint
+			? tr::lng_oblivion_social_editor_preview_empty(tr::now)
+			: StatusLine(*_data.profile)),
+		Ui::NameTextOptions());
 }
 
 void ProfileCard::setData(CardData data) {
@@ -503,16 +1065,10 @@ void ProfileCard::setData(CardData data) {
 	_chips->setChips(
 		_data.chips,
 		_data.profile ? _data.profile->accent : std::nullopt);
-	if (_data.profileShown()) {
-		_status.setText(
-			st::defaultTextStyle,
-			StatusLine(*_data.profile),
-			Ui::NameTextOptions());
-		_shared->setText(SharedLine(*_data.profile));
-	} else {
-		_status = Ui::Text::String();
-		_shared->setText(QString());
-	}
+	refreshStatus();
+	_shared->setText(_data.profileShown()
+		? SharedLine(*_data.profile)
+		: QString());
 	if (width() > 0) {
 		resizeToWidth(width());
 	}
@@ -548,6 +1104,18 @@ int ProfileCard::resizeGetHeight(int newWidth) {
 	const auto left = _padding.left();
 	const auto inner = std::max(newWidth - left - _padding.right(), 1);
 	const auto skip = Scaled(kCardSkip);
+
+	// «Родной, но лучше» and «Ночной эфир»: the block of a profile page
+	// is a card. It has the edges of the chips over it, its content
+	// stands inside.
+	const auto look = Look::Current();
+	const auto carded = profile
+		&& !_framed
+		&& (look == Look::kNative || look == Look::kNightAir);
+	const auto inset = carded ? Scaled(kBlockCardPadding) : 0;
+	const auto blockLeft = left + inset;
+	const auto blockInner = std::max(inner - 2 * inset, 1);
+	_card = QRect();
 	auto top = _padding.top();
 	if (hasChips) {
 		_chips->resizeToWidth(inner);
@@ -558,11 +1126,13 @@ int ProfileCard::resizeGetHeight(int newWidth) {
 		if (hasChips) {
 			top += 2 * skip;
 		}
+		const auto cardTop = top;
+		top += inset;
 		const auto line = st::semiboldFont->height;
 		_titleTop = top;
 		if (editShown) {
 			_edit->moveToRight(
-				_padding.right(),
+				_padding.right() + inset,
 				top + (line - _edit->height()) / 2,
 				newWidth);
 		}
@@ -571,13 +1141,17 @@ int ProfileCard::resizeGetHeight(int newWidth) {
 			top += skip;
 			_statusTop = top;
 			top += std::min(
-				_status.countHeight(inner),
+				_status.countHeight(blockInner),
 				kStatusLines * st::defaultTextStyle.font->height);
 		}
 		if (sharedShown) {
 			top += skip;
-			_shared->moveToLeft(left, top, newWidth);
+			_shared->moveToLeft(blockLeft, top, newWidth);
 			top += _shared->height();
+		}
+		if (carded) {
+			top += inset;
+			_card = QRect(left, cardTop, inner, top - cardTop);
 		}
 	}
 	return top + _padding.bottom();
@@ -588,36 +1162,64 @@ void ProfileCard::paintEvent(QPaintEvent *e) {
 	if (_data.empty()) {
 		return;
 	}
+	// With the plain look Look::PaintCard() is the rounded rect that was
+	// always here; a look paints its own card (or, in «Тишина», only a
+	// hairline along the bottom).
 	if (_framed) {
 		auto hq = PainterHighQualityEnabler(p);
 		const auto radius = Scaled(kCardRadius);
-		p.setPen(Qt::NoPen);
-		p.setBrush(st::windowBgOver);
-		p.drawRoundedRect(rect(), radius, radius);
+		Look::PaintCard(p, QRectF(rect()), st::windowBgOver->c, radius);
+	} else if (!_card.isEmpty()) {
+		Look::PaintCard(
+			p,
+			QRectF(_card),
+			st::windowBgOver->c,
+			Scaled(kCardRadius));
 	}
 	if (!_data.profileShown()) {
 		return;
 	}
-	const auto left = _padding.left();
-	const auto inner = std::max(width() - left - _padding.right(), 1);
-	const auto accent = _data.profile->accent.value_or(
-		st::windowActiveTextFg->c);
+	// The content of a card stands inside it, see resizeGetHeight().
+	const auto inset = _card.isEmpty() ? 0 : Scaled(kBlockCardPadding);
+	const auto left = _padding.left() + inset;
+	const auto inner = std::max(
+		width() - left - _padding.right() - inset,
+		1);
+	// The mark keeps the colour of the person in every look.
+	const auto quiet = Look::Is(Look::kSilence);
+	const auto accent = _data.profile->accent.value_or(quiet
+		? st::windowSubTextFg->c
+		: st::windowActiveTextFg->c);
 	const auto line = st::semiboldFont->height;
 	const auto glyph = Scaled(kCardGlyph);
 	const auto glyphLeft = rtl() ? (width() - left - glyph) : left;
+	const auto title = tr::lng_oblivion_social_block_title(tr::now);
 	Badge::Paint(
 		p,
 		QRect(glyphLeft, _titleTop + (line - glyph) / 2, glyph, glyph),
 		accent);
-	p.setFont(st::semiboldFont);
-	p.setPen(st::windowActiveTextFg);
-	p.drawTextLeft(
-		left + glyph + Scaled(kCardSkip),
-		_titleTop,
-		width(),
-		tr::lng_oblivion_social_block_title(tr::now));
+	if (Look::CapsLabels()) {
+		// «Ночной эфир» and «Тишина»: a quiet label in small capitals.
+		const auto font = CapsFont();
+		const auto metrics = QFontMetrics(font);
+		p.setFont(font);
+		p.setPen(st::windowSubTextFg);
+		p.drawTextLeft(
+			left + glyph + Scaled(kCardSkip + 2),
+			_titleTop + (line - metrics.height()) / 2,
+			width(),
+			title.toUpper());
+	} else {
+		p.setFont(st::semiboldFont);
+		p.setPen(st::windowActiveTextFg);
+		p.drawTextLeft(
+			left + glyph + Scaled(kCardSkip),
+			_titleTop,
+			width(),
+			title);
+	}
 	if (!_status.isEmpty()) {
-		p.setPen(st::windowFg);
+		p.setPen(_statusHint ? st::windowSubTextFg : st::windowFg);
 		_status.drawLeftElided(
 			p,
 			left,
@@ -728,8 +1330,32 @@ int PersonRow::resizeGetHeight(int newWidth) {
 void PersonRow::paintEvent(QPaintEvent *e) {
 	auto p = Painter(this);
 	const auto over = isOver() || isDown();
-	if (over) {
+	// The looks («Тема Oblivion»): a rounded row under the mouse where
+	// the look has cards, hairlines between the rows in «Тишина».
+	const auto look = Look::Current();
+	if (over && (look == Look::kNative || look == Look::kNightAir)) {
+		auto hq = PainterHighQualityEnabler(p);
+		const auto inset = Scaled(kRowHoverInset);
+		const auto radius = Look::RowRadius(0);
+		p.setPen(Qt::NoPen);
+		p.setBrush(_st.button.textBgOver);
+		p.drawRoundedRect(
+			QRectF(rect()).marginsRemoved(QMarginsF(inset, 1, inset, 1)),
+			radius,
+			radius);
+	} else if (over) {
 		p.fillRect(rect(), _st.button.textBgOver);
+	}
+	if (look == Look::kSilence) {
+		const auto from = _st.namePosition.x();
+		Look::PaintDivider(
+			p,
+			QRectF(
+				from,
+				height() - st::lineWidth,
+				width() - from - _st.photoPosition.x(),
+				st::lineWidth),
+			st::shadowFg->c);
 	}
 	const auto outer = width();
 	const auto photoLeft = _st.photoPosition.x();
@@ -752,13 +1378,21 @@ void PersonRow::paintEvent(QPaintEvent *e) {
 	if (available <= 0) {
 		return;
 	}
+	// A row with nothing under the name has it in the middle, next to
+	// the userpic, not hanging at the top.
+	const auto nameTop = _person.about.isEmpty()
+		? ((_st.height - _st.nameStyle.font->height) / 2)
+		: _st.namePosition.y();
 	p.setPen(_st.nameFg);
 	_name.drawLeftElided(
 		p,
 		_st.namePosition.x(),
-		_st.namePosition.y(),
+		nameTop,
 		available,
 		outer);
+	if (_person.about.isEmpty()) {
+		return;
+	}
 	p.setPen(_person.aboutActive
 		? _st.statusFgActive
 		: over
@@ -773,7 +1407,8 @@ void PersonRow::paintEvent(QPaintEvent *e) {
 }
 
 // A row of small square cells to choose one of: the emoji of the status,
-// the accent colour. The cells are painted by the owner.
+// the accent colour. The cells are painted by the owner. A full line is
+// kCellsPerRow cells spread evenly over the whole width.
 class ChoiceStrip final : public Ui::RpWidget {
 public:
 	using Paint = Fn<void(QPainter &p, int index, QRect cell)>;
@@ -801,6 +1436,7 @@ private:
 	int _selected = 0;
 	int _hovered = -1;
 	int _perRow = 1;
+	double _pitch = 0.; // From the left of a cell to the left of the next.
 	rpl::event_stream<int> _changes;
 
 };
@@ -823,25 +1459,37 @@ rpl::producer<int> ChoiceStrip::selectedChanges() const {
 }
 
 int ChoiceStrip::resizeGetHeight(int newWidth) {
-	_perRow = std::max(newWidth / _cell, 1);
+	_perRow = std::clamp(newWidth / _cell, 1, kCellsPerRow);
+	_pitch = (_perRow > 1)
+		? std::max((newWidth - _cell) / double(_perRow - 1), double(_cell))
+		: double(_cell);
 	const auto rows = (_count + _perRow - 1) / _perRow;
 	return rows * _cell;
 }
 
 QRect ChoiceStrip::cellRect(int index) const {
 	return QRect(
-		(index % _perRow) * _cell,
+		qRound((index % _perRow) * _pitch),
 		(index / _perRow) * _cell,
 		_cell,
 		_cell);
 }
 
 int ChoiceStrip::indexAt(QPoint point) const {
-	if (point.x() < 0 || point.y() < 0 || point.x() >= _perRow * _cell) {
+	if (point.x() < 0 || point.y() < 0 || _pitch <= 0.) {
 		return -1;
 	}
-	const auto index = (point.y() / _cell) * _perRow + (point.x() / _cell);
-	return (index < _count) ? index : -1;
+	const auto row = point.y() / _cell;
+	const auto column = int(point.x() / _pitch);
+	for (const auto candidate : { column, column + 1 }) {
+		const auto index = row * _perRow + candidate;
+		if (candidate < _perRow
+			&& index < _count
+			&& cellRect(index).contains(point)) {
+			return index;
+		}
+	}
+	return -1;
 }
 
 void ChoiceStrip::setHovered(int index) {
@@ -855,7 +1503,10 @@ void ChoiceStrip::setHovered(int index) {
 
 void ChoiceStrip::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
-	const auto radius = Scaled(kCellRadius);
+	// «Тишина» has almost square shapes.
+	const auto radius = Scaled(Look::HasCards()
+		? kCellRadius
+		: kFlatCellRadius);
 	const auto inset = Scaled(2);
 	for (auto i = 0; i != _count; ++i) {
 		const auto cell = cellRect(i);
@@ -976,17 +1627,28 @@ void PaintNoneCell(QPainter &p, QRect cell) {
 // The editor «Мой профиль Oblivion». Everything session-bound comes in
 // as callbacks, so the box is shown in a snapshot scene as it is. The
 // callbacks tell the user about a failure themselves and answer with
-// false; they may answer after the box is gone.
+// false (std::nullopt); they may answer after the box is gone.
+//
+// setShown is «Показывать в профиле», setListed is «Показывать всем в
+// «Общих наборах»»: two switches for two different audiences. Both
+// answer with the item as the server has it after the change.
 struct EditorArgs {
+	using Changed = Fn<void(std::optional<SharedItem>)>;
+
 	std::shared_ptr<Ui::Show> show;
 	Cloud::Me me;
 	Fn<void(
 		Fn<void(std::vector<SharedItem>)> done,
 		Fn<void()> fail)> loadShared;
-	Fn<void(SharedItem item, bool shown, Fn<void(bool)> done)> setShown;
+	Fn<void(SharedItem item, bool shown, Changed done)> setShown;
+	Fn<void(SharedItem item, bool listed, Changed done)> setListed;
 	Fn<void(QJsonObject patch, Fn<void(bool)> done)> save;
 	Fn<void(Fn<void(bool)> done)> setPhoto;
 	Fn<void(Fn<void(bool)> done)> removePhoto;
+
+	// The account is not connected any more: nothing in the box can be
+	// done and what was asked will not be answered, so the box closes.
+	rpl::producer<> closeRequests;
 };
 
 void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
@@ -1055,7 +1717,7 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 					cell.x() + (cell.width() - side) / 2,
 					cell.y() + (cell.height() - side) / 2);
 			}),
-		RowPadding());
+		StripPadding());
 
 	Ui::AddSubsectionTitle(content, tr::lng_oblivion_social_editor_accent());
 	const auto colorNow = QColor(args.me.accent);
@@ -1088,6 +1750,15 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 					size,
 					size));
 			}),
+		StripPadding() - style::margins(0, 0, 0, st::boxLittleSkip / 2));
+
+	// The preview shows the colour only on a small mark: what else it
+	// paints is said in words.
+	content->add(
+		object_ptr<Ui::FlatLabel>(
+			content,
+			tr::lng_oblivion_social_editor_accent_about(),
+			st::boxDividerLabel),
 		RowPadding());
 
 	const auto refresh = [=] {
@@ -1116,9 +1787,14 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 	}, color->lifetime());
 	refresh();
 
-	// What is shown in the profile: the own playlists and presets that
-	// are on the server. Each switch is sent at once.
-	Ui::AddSubsectionTitle(content, tr::lng_oblivion_social_editor_shared());
+	// What other people see of the own playlists and presets that are on
+	// the server. Two different switches, each sent at once:
+	//  - «Показывать в профиле»: for those who see the profile. Playlists
+	//    always have it; presets only where the server keeps the profile
+	//    apart from the gallery (SharedItem::profileSwitch);
+	//  - «Показывать всем в «Общих наборах»»: a preset in the gallery,
+	//    for everybody who uses Oblivion with the name of the owner next
+	//    to it. Turning it on is asked about first, turning it off is not.
 	const auto list = content->add(object_ptr<Ui::VerticalLayout>(content));
 	const auto clear = [=] {
 		while (list->count()) {
@@ -1127,12 +1803,83 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 	};
 	const auto note = [=](const QString &text) {
 		clear();
+		Ui::AddSubsectionTitle(list, tr::lng_oblivion_social_editor_shared());
 		list->add(
 			object_ptr<Ui::FlatLabel>(list, text, st::boxDividerLabel),
 			RowPadding());
 		list->resizeToWidth(content->width());
 	};
+	const auto about = [=](rpl::producer<QString> text) {
+		list->add(
+			object_ptr<Ui::FlatLabel>(
+				list,
+				std::move(text),
+				st::boxDividerLabel),
+			st::boxRowPadding + style::margins(
+				0,
+				st::boxLittleSkip / 2,
+				0,
+				st::boxLittleSkip));
+	};
+	const auto show = args.show;
 	const auto setShown = args.setShown;
+	const auto setListed = args.setListed;
+	const auto addSwitch = [=](int index, bool gallery) {
+		const auto &item = state->shared[index];
+		const auto button = list->add(object_ptr<Ui::SettingsButton>(
+			list,
+			rpl::single(SharedItemTitle(item)),
+			st::settingsButtonNoIcon));
+		const auto value = button->lifetime().make_state<
+			rpl::variable<bool>>(gallery ? item.listed : item.shown);
+		const auto pending = button->lifetime().make_state<bool>(false);
+		const auto alive = QPointer<Ui::SettingsButton>(button);
+		button->toggleOn(value->value(), true);
+		const auto send = [=](bool now) {
+			const auto &callback = gallery ? setListed : setShown;
+			if (!alive || *pending || !callback) {
+				return;
+			}
+			*pending = true;
+			callback(
+				state->shared[index],
+				now,
+				crl::guard(button, [=](std::optional<SharedItem> result) {
+					*pending = false;
+					if (result) {
+						*value = gallery ? result->listed : result->shown;
+						state->shared[index] = std::move(*result);
+						refresh();
+					}
+				}));
+		};
+		button->setClickedCallback([=] {
+			const auto now = !value->current();
+			if (*pending) {
+				return;
+			} else if (!gallery || !now) {
+				send(now);
+				return;
+			} else if (!show || !show->valid()) {
+				return;
+			}
+			const auto title = state->shared[index].title.simplified();
+			show->showBox(Ui::MakeConfirmBox({
+				.text = tr::lng_oblivion_social_gallery_confirm(
+					tr::now,
+					lt_title,
+					title.isEmpty()
+						? SharedItemTitle(state->shared[index])
+						: title),
+				.confirmed = [=](Fn<void()> close) {
+					close();
+					send(true);
+				},
+				.confirmText = tr::lng_oblivion_social_gallery_confirm_yes(),
+				.title = tr::lng_oblivion_social_gallery_confirm_title(),
+			}));
+		});
+	};
 	const auto fill = [=](std::vector<SharedItem> items) {
 		state->shared = std::move(items);
 		if (state->shared.empty()) {
@@ -1141,45 +1888,39 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 			return;
 		}
 		clear();
+		auto profile = std::vector<int>();
+		auto presets = std::vector<int>();
+		auto apart = true;
 		for (auto i = 0, count = int(state->shared.size()); i != count; ++i) {
 			const auto &item = state->shared[i];
-			const auto button = list->add(object_ptr<Ui::SettingsButton>(
-				list,
-				rpl::single(SharedItemTitle(item)),
-				st::settingsButtonNoIcon));
-			const auto value = button->lifetime().make_state<
-				rpl::variable<bool>>(item.shown);
-			const auto pending = button->lifetime().make_state<bool>(false);
-			button->toggleOn(value->value(), true);
-			button->setClickedCallback([=] {
-				if (*pending || !setShown) {
-					return;
-				}
-				const auto shown = !value->current();
-				*pending = true;
-				setShown(
-					state->shared[i],
-					shown,
-					crl::guard(button, [=](bool success) {
-						*pending = false;
-						if (success) {
-							*value = shown;
-							state->shared[i].shown = shown;
-							refresh();
-						}
-					}));
-			});
+			if (item.playlist || item.profileSwitch) {
+				profile.push_back(i);
+			}
+			if (!item.playlist) {
+				presets.push_back(i);
+				apart = apart && item.profileSwitch;
+			}
 		}
-		list->add(
-			object_ptr<Ui::FlatLabel>(
+		if (!profile.empty()) {
+			Ui::AddSubsectionTitle(
 				list,
-				tr::lng_oblivion_social_editor_shared_about(),
-				st::boxDividerLabel),
-			st::boxRowPadding + style::margins(
-				0,
-				st::boxLittleSkip / 2,
-				0,
-				st::boxLittleSkip));
+				tr::lng_oblivion_social_editor_shared());
+			for (const auto index : profile) {
+				addSwitch(index, false);
+			}
+			about(tr::lng_oblivion_social_editor_shared_about());
+		}
+		if (!presets.empty()) {
+			Ui::AddSubsectionTitle(
+				list,
+				tr::lng_oblivion_social_editor_gallery());
+			for (const auto index : presets) {
+				addSwitch(index, true);
+			}
+			about(apart
+				? tr::lng_oblivion_social_editor_gallery_apart()
+				: tr::lng_oblivion_social_editor_gallery_about());
+		}
 		list->resizeToWidth(content->width());
 		refresh();
 	};
@@ -1188,6 +1929,13 @@ void EditorBox(not_null<Ui::GenericBox*> box, EditorArgs &&args) {
 		load(crl::guard(box, fill), crl::guard(box, [=] {
 			note(tr::lng_oblivion_social_shared_failed(tr::now));
 		}));
+	}
+	if (auto closes = std::move(args.closeRequests)) {
+		std::move(
+			closes
+		) | rpl::on_next([=] {
+			box->closeBox();
+		}, box->lifetime());
 	}
 
 	// The photo: sent only by a click here.
@@ -1282,6 +2030,10 @@ struct SharedArgs {
 		Fn<void(std::vector<SharedItem>)> done,
 		Fn<void()> fail)> load;
 	Fn<void(SharedItem item)> open;
+
+	// The account is not connected any more: a list that is still being
+	// loaded will not come.
+	rpl::producer<> aborted;
 };
 
 void SharedBox(not_null<Ui::GenericBox*> box, SharedArgs &&args) {
@@ -1296,12 +2048,15 @@ void SharedBox(not_null<Ui::GenericBox*> box, SharedArgs &&args) {
 			delete list->widgetAt(0);
 		}
 		list->add(
-			object_ptr<Ui::FlatLabel>(list, text, st::boxDividerLabel),
-			RowPadding());
+			object_ptr<Ui::FlatLabel>(list, text, st::defaultPeerListAbout),
+			EmptyPadding(),
+			style::al_justify);
 		list->resizeToWidth(content->width());
 	};
 	const auto open = args.open;
+	const auto loading = box->lifetime().make_state<bool>(true);
 	const auto fill = [=](std::vector<SharedItem> items) {
+		*loading = false;
 		if (items.empty()) {
 			note(tr::lng_oblivion_social_shared_empty(tr::now));
 			return;
@@ -1315,6 +2070,9 @@ void SharedBox(not_null<Ui::GenericBox*> box, SharedArgs &&args) {
 				if (item.playlist != playlists) {
 					continue;
 				} else if (!std::exchange(added, true)) {
+					if (list->count()) {
+						Ui::AddSkip(list);
+					}
 					Ui::AddSubsectionTitle(list, rpl::duplicate(title));
 				}
 				const auto detail = playlists
@@ -1344,11 +2102,17 @@ void SharedBox(not_null<Ui::GenericBox*> box, SharedArgs &&args) {
 		section(false, tr::lng_oblivion_social_shared_presets());
 		list->resizeToWidth(content->width());
 	};
+	const auto failed = [=] {
+		if (base::take(*loading)) {
+			note(tr::lng_oblivion_social_shared_failed(tr::now));
+		}
+	};
 	note(tr::lng_oblivion_social_shared_loading(tr::now));
 	if (const auto load = args.load) {
-		load(crl::guard(box, fill), crl::guard(box, [=] {
-			note(tr::lng_oblivion_social_shared_failed(tr::now));
-		}));
+		load(crl::guard(box, fill), crl::guard(box, failed));
+	}
+	if (auto aborted = std::move(args.aborted)) {
+		std::move(aborted) | rpl::on_next(failed, box->lifetime());
 	}
 	box->addButton(tr::lng_close(), [=] {
 		box->closeBox();
@@ -1397,13 +2161,27 @@ void FriendsBox(not_null<Ui::GenericBox*> box, FriendsArgs &&args) {
 				object_ptr<Ui::FlatLabel>(list, text, st::boxDividerLabel),
 				RowPadding());
 		};
+		// A list without rows says what is going on in the middle of the
+		// box, the same way as «Пока никого нет» below.
+		const auto about = [&](TextWithEntities text) {
+			list->add(
+				object_ptr<Ui::FlatLabel>(
+					list,
+					rpl::single(std::move(text)),
+					st::defaultPeerListAbout),
+				EmptyPadding(),
+				style::al_justify);
+		};
 		const auto empty = state.people.empty();
 		if (state.status == Status::Offline) {
-			note(empty
-				? tr::lng_oblivion_social_friends_offline_empty(tr::now)
-				: tr::lng_oblivion_social_friends_offline(tr::now));
+			if (empty) {
+				about({ tr::lng_oblivion_social_friends_offline_empty(
+					tr::now) });
+			} else {
+				note(tr::lng_oblivion_social_friends_offline(tr::now));
+			}
 		} else if (state.status == Status::Loading && empty) {
-			note(tr::lng_oblivion_social_friends_loading(tr::now));
+			about({ tr::lng_oblivion_social_friends_loading(tr::now) });
 		}
 		for (const auto &person : state.people) {
 			const auto id = person.id;
@@ -1429,20 +2207,10 @@ void FriendsBox(not_null<Ui::GenericBox*> box, FriendsArgs &&args) {
 			});
 		}
 		if (empty && state.status == Status::Ready) {
-			list->add(
-				object_ptr<Ui::FlatLabel>(
-					list,
-					rpl::single(tr::bold(
-						tr::lng_oblivion_social_friends_empty_title(tr::now)
-					).append(u"\n\n"_q).append(
-						tr::lng_oblivion_social_friends_empty(tr::now))),
-					st::defaultPeerListAbout),
-				st::boxRowPadding + style::margins(
-					0,
-					st::boxMediumSkip,
-					0,
-					st::boxMediumSkip),
-				style::al_justify);
+			about(tr::bold(
+				tr::lng_oblivion_social_friends_empty_title(tr::now)
+			).append(u"\n\n"_q).append(
+				tr::lng_oblivion_social_friends_empty(tr::now)));
 		}
 		if (state.hidden && state.status != Status::Off) {
 			note(tr::lng_oblivion_social_friends_hidden(tr::now));
@@ -1655,10 +2423,11 @@ void ChosenAddController::rowClicked(not_null<PeerListRow*> row) {
 }
 
 [[nodiscard]] std::vector<Person> ChosenPeople(
-		not_null<Main::Session*> session) {
+		not_null<Main::Session*> session,
+		const std::vector<uint64> &ids) {
 	auto result = std::vector<Person>();
 	const auto remove = tr::lng_oblivion_social_chosen_remove(tr::now);
-	for (const auto id : Cloud::For(session).me().chosen) {
+	for (const auto id : ids) {
 		const auto user = session->data().userLoaded(UserId(id));
 		result.push_back({
 			.id = id,
@@ -1673,6 +2442,175 @@ void ChosenAddController::rowClicked(not_null<PeerListRow*> row) {
 		});
 	}
 	return result;
+}
+
+// «Выбранные люди» while the list is being edited. Clicks come faster
+// than the answers, and the server takes PATCH /v1/me only so often (20
+// at once, then one in two seconds): the list is kept here, shown at
+// once, and sent as a whole a moment after the last click, one request
+// at a time. So adding twenty people is a request or two, not twenty.
+//
+// The object is shared by the box, the picker of contacts and whatever
+// is on its way (the timer, the request), so an edit made right before
+// the box was closed is still sent. A request the server refuses puts
+// the list back to what the server has, with a toast; only "too often"
+// (429) is waited out and tried again, once.
+class ChosenEdit final : public std::enable_shared_from_this<ChosenEdit> {
+public:
+	ChosenEdit(
+		not_null<Main::Session*> session,
+		std::shared_ptr<Ui::Show> show);
+
+	[[nodiscard]] const std::vector<uint64> &list();
+	[[nodiscard]] rpl::producer<> changes() const;
+	bool add(uint64 id);
+	void remove(uint64 id);
+
+private:
+	void sync();
+	void edited();
+	void sendSoon(crl::time delay);
+	void send();
+	void done();
+	void fail(const Cloud::Error &error);
+
+	const base::weak_ptr<Main::Session> _session;
+	const base::weak_ptr<Cloud::Account> _account;
+	const std::shared_ptr<Ui::Show> _show;
+	std::vector<uint64> _list;
+	bool _dirty = false; // Edited here and not sent yet.
+	bool _waiting = false; // The timer of the next request runs.
+	bool _sending = false; // A request is on its way.
+	bool _retried = false;
+	rpl::event_stream<> _changes;
+
+};
+
+ChosenEdit::ChosenEdit(
+	not_null<Main::Session*> session,
+	std::shared_ptr<Ui::Show> show)
+: _session(base::make_weak(session))
+, _account(base::make_weak(&Cloud::For(session)))
+, _show(std::move(show)) {
+}
+
+const std::vector<uint64> &ChosenEdit::list() {
+	sync();
+	return _list;
+}
+
+rpl::producer<> ChosenEdit::changes() const {
+	return _changes.events();
+}
+
+// What the server has replaces the list whenever nothing of this device
+// is waiting to be sent or answered.
+void ChosenEdit::sync() {
+	const auto account = _account.get();
+	if (!account) {
+		return;
+	} else if (!account->ready()) {
+		// Nothing can be sent, and what was on its way is dropped with
+		// the connection: it will never be answered.
+		_dirty = _sending = false;
+	}
+	if (!_dirty && !_sending) {
+		_list = account->me().chosen;
+	}
+}
+
+bool ChosenEdit::add(uint64 id) {
+	sync();
+	const auto account = _account.get();
+	if (!account || !id || ranges::contains(_list, id)) {
+		return false;
+	} else if (int64(_list.size()) >= account->limit("chosen", 1000)) {
+		Toast(_show, tr::lng_oblivion_social_chosen_full(tr::now));
+		return false;
+	}
+	_list.push_back(id);
+	edited();
+	return true;
+}
+
+void ChosenEdit::remove(uint64 id) {
+	sync();
+	const auto i = ranges::find(_list, id);
+	if (i != end(_list)) {
+		_list.erase(i);
+		edited();
+	}
+}
+
+void ChosenEdit::edited() {
+	_dirty = true;
+	_changes.fire({});
+	sendSoon(kChosenSendDelay);
+}
+
+void ChosenEdit::sendSoon(crl::time delay) {
+	const auto session = _session.get();
+	if (!session || _waiting || _sending) {
+		return;
+	}
+	_waiting = true;
+	base::call_delayed(delay, session, [self = shared_from_this()] {
+		self->_waiting = false;
+		self->send();
+	});
+}
+
+void ChosenEdit::send() {
+	const auto account = _account.get();
+	if (!account || !_dirty || _sending) {
+		return;
+	}
+	auto ids = QJsonArray();
+	for (const auto id : _list) {
+		ids.push_back(double(id));
+	}
+	auto privacy = QJsonObject();
+	privacy.insert(u"chosen"_q, ids);
+	auto patch = QJsonObject();
+	patch.insert(u"privacy"_q, privacy);
+	_dirty = false;
+	_sending = true;
+	const auto self = shared_from_this();
+	account->patchMe(std::move(patch), [=] {
+		self->done();
+	}, [=](const Cloud::Error &error) {
+		self->fail(error);
+	});
+}
+
+void ChosenEdit::done() {
+	_sending = false;
+	_retried = false;
+	if (_dirty) {
+		sendSoon(kChosenSendDelay);
+	} else {
+		sync();
+	}
+	_changes.fire({});
+}
+
+void ChosenEdit::fail(const Cloud::Error &error) {
+	_sending = false;
+	const auto often = (error.type == Cloud::Error::Type::Http)
+		&& (error.status == 429);
+	if (often && !std::exchange(_retried, true)) {
+		_dirty = true;
+		sendSoon(std::clamp(
+			error.retryAfter,
+			kChosenSendDelay,
+			kChosenRetryMax));
+		return;
+	}
+	_retried = false;
+	_dirty = false;
+	sync();
+	_changes.fire({});
+	Cloud::ShowError(_show, error);
 }
 
 [[nodiscard]] QJsonObject FlagPatch(Flag flag, bool value) {
@@ -1711,6 +2649,17 @@ void ChosenAddController::rowClicked(not_null<PeerListRow*> row) {
 	return result;
 }
 
+// Fires when the account stops being connected («Отключиться», a ban,
+// an old protocol): the requests that are on their way are dropped then
+// and their callbacks are never called.
+[[nodiscard]] rpl::producer<> DisconnectedEvents(
+		not_null<Main::Session*> session) {
+	return Cloud::For(session).readyValue(
+	) | rpl::filter([](bool ready) {
+		return !ready;
+	}) | rpl::to_empty;
+}
+
 void ShowShared(
 		not_null<Window::SessionController*> controller,
 		uint64 userId) {
@@ -1734,6 +2683,7 @@ void ShowShared(
 				Share::OpenPresetLink(strong, item.id);
 			}
 		},
+		.aborted = DisconnectedEvents(session),
 	}));
 }
 
@@ -1785,7 +2735,10 @@ protected:
 	return BuildChips(activity, LangPhrases(), true);
 }
 
-[[nodiscard]] std::vector<SharedItem> SampleShared() {
+// Two playlists with the switch of the profile and two presets with the
+// switch of the gallery, the way the server of today has them. With
+// "apart" the presets have a switch of the profile of their own too.
+[[nodiscard]] std::vector<SharedItem> SampleShared(bool apart = false) {
 	return {
 		{
 			.id = QString(22, QChar('a')),
@@ -1793,23 +2746,29 @@ protected:
 			.title = SampleText("Ночная", "Night drive"),
 			.count = 24,
 			.shown = true,
+			.profileSwitch = true,
 		},
 		{
 			.id = QString(22, QChar('b')),
 			.playlist = true,
 			.title = SampleText("В дорогу", "On the road"),
 			.count = 112,
+			.profileSwitch = true,
 		},
 		{
 			.id = QString(22, QChar('c')),
 			.title = u"CCD 2004"_q,
 			.kind = u"photo"_q,
-			.shown = true,
+			.shown = !apart,
+			.listed = true,
+			.profileSwitch = apart,
 		},
 		{
 			.id = QString(22, QChar('d')),
 			.title = SampleText("VHS с дачи", "VHS from the 90s"),
 			.kind = u"video"_q,
+			.shown = apart,
+			.profileSwitch = apart,
 		},
 	};
 }
@@ -1864,19 +2823,25 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 
 	// The block as it stands in a profile: the chips, the «Oblivion»
 	// block and the separator the page puts after it.
-	const auto block = [=](const QString &name, Fn<CardData()> data) {
-		RegisterScene(
-			name,
-			QSize(width, 0),
-			[=](not_null<Ui::RpWidget*> parent) {
-				const auto column = Ui::CreateChild<SceneColumn>(parent.get());
-				column->add(
-					object_ptr<ProfileCard>(column, InfoCardPadding(), false)
-				)->setData(data());
-				Ui::AddSkip(column, st::infoProfileSkip);
-				column->add(object_ptr<Ui::BoxContentDivider>(column));
-				return column;
-			});
+	// looks: the scene is rendered with every look («Тема Oblivion») too,
+	// as name_look1, name_look2 and name_look3.
+	const auto block = [=](
+			const QString &name,
+			Fn<CardData()> data,
+			bool looks = false) {
+		const auto create = [=](not_null<Ui::RpWidget*> parent) -> QWidget* {
+			const auto column = Ui::CreateChild<SceneColumn>(parent.get());
+			column->add(
+				object_ptr<ProfileCard>(column, InfoCardPadding(), false)
+			)->setData(data());
+			Ui::AddSkip(column, st::infoProfileSkip);
+			column->add(object_ptr<Ui::BoxContentDivider>(column));
+			return column;
+		};
+		RegisterScene(name, QSize(width, 0), create);
+		if (looks) {
+			Look::RegisterScenes(name, QSize(width, 0), create);
+		}
 	};
 	block(u"social_profile_block"_q, [] {
 		auto activity = SampleListening();
@@ -1887,7 +2852,22 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.profile = SampleProfile(),
 			.chips = SampleChips(activity),
 		};
-	});
+	}, true);
+
+	// The same without a colour of the person: the marks, «Войти» and the
+	// card of «слушает» have the colours of the look.
+	block(u"social_profile_block_no_accent"_q, [] {
+		auto profile = SampleProfile();
+		profile.accent = std::nullopt;
+		auto activity = SampleListening();
+		activity.inRoom = true;
+		activity.roomTitle = SampleRoom(true).roomTitle;
+		activity.roomCode = SampleRoom(true).roomCode;
+		return CardData{
+			.profile = std::move(profile),
+			.chips = SampleChips(activity),
+		};
+	}, true);
 	block(u"social_profile_block_plain"_q, [] {
 		auto profile = SampleProfile();
 		profile.accent = std::nullopt;
@@ -1897,6 +2877,35 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	});
 	block(u"social_profile_block_chips_only"_q, [] {
 		return CardData{ .chips = SampleChips(SampleRoom(false)) };
+	});
+
+	// Everything as long as it gets: a track and a room that don't fit
+	// (the room keeps its «Войти»), a status of the full length.
+	block(u"social_profile_block_long"_q, [] {
+		auto profile = SampleProfile();
+		profile.accent = QColor(0x7c, 0x5c, 0xff);
+		profile.statusEmoji = QString::fromUtf8("📚");
+		profile.statusText = SampleText(
+			"до конца месяца на сессии, отвечаю по вечерам, "
+			"в субботу собираю комнату с кино",
+			"exams till the end of the month, I answer in the "
+			"evenings, a movie room on Saturday");
+		auto activity = SampleListening();
+		activity.performer = SampleText(
+			"Симфонический оркестр Мариинского театра",
+			"The Mariinsky Theatre Symphony Orchestra");
+		activity.title = SampleText(
+			"Времена года. Декабрь. Святки",
+			"The Seasons. December. Christmas");
+		activity.inRoom = true;
+		activity.roomTitle = SampleText(
+			"Смотрим «Властелина колец» всю ночь напролёт",
+			"Watching The Lord of the Rings all night long");
+		activity.roomCode = SampleRoom(true).roomCode;
+		return CardData{
+			.profile = std::move(profile),
+			.chips = SampleChips(activity),
+		};
 	});
 	block(u"social_profile_block_self"_q, [] {
 		auto profile = SampleProfile();
@@ -1912,10 +2921,17 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	// The chips in every variant, each on a line of its own: a track
 	// that does not fit, a room with and without «Войти», «в Oblivion»,
 	// with the accent colours of different people.
-	RegisterScene(
+	const auto withLooks = [](
+			const QString &name,
+			QSize size,
+			SnapshotScene create) {
+		RegisterScene(name, size, create);
+		Look::RegisterScenes(name, size, create);
+	};
+	withLooks(
 		u"social_chips"_q,
 		QSize(width, 0),
-		[=](not_null<Ui::RpWidget*> parent) {
+		[=](not_null<Ui::RpWidget*> parent) -> QWidget* {
 			const auto column = Ui::CreateChild<SceneColumn>(parent.get());
 			const auto margin = style::margins(
 				st::boxLittleSkip,
@@ -1949,6 +2965,16 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			add(
 				Activity{ .userId = 1, .online = true },
 				QColor(0x2a, 0xa9, 0xe0));
+
+			// A long title next to «Войти», a room without a title.
+			auto longRoom = SampleRoom(true);
+			longRoom.roomTitle = SampleText(
+				"Смотрим «Властелина колец» всю ночь напролёт",
+				"Watching The Lord of the Rings all night long");
+			add(longRoom, std::nullopt);
+			add(
+				Activity{ .userId = 1, .inRoom = true },
+				QColor(0xff, 0x8a, 0x3d));
 			Ui::AddSkip(column, st::boxLittleSkip);
 			return column;
 		});
@@ -1963,8 +2989,8 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		me.accent = u"#ff5c8a"_q;
 		return me;
 	};
-	RegisterBoxScene(u"social_editor"_q, boxSize, [=](
-			std::shared_ptr<Ui::Show> show) {
+	const auto editor = [=](
+			std::shared_ptr<Ui::Show> show) -> object_ptr<Ui::BoxContent> {
 		return Box(EditorBox, EditorArgs{
 			.show = show,
 			.me = sampleMe(),
@@ -1973,6 +2999,31 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 					Fn<void()> fail) {
 				done(SampleShared());
 			},
+		});
+	};
+	RegisterBoxScene(u"social_editor"_q, boxSize, editor);
+	Look::RegisterBoxScenes(u"social_editor"_q, boxSize, editor);
+	RegisterBoxScene(u"social_editor_apart"_q, boxSize, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(EditorBox, EditorArgs{
+			.show = show,
+			.me = sampleMe(),
+			.loadShared = [](
+					Fn<void(std::vector<SharedItem>)> done,
+					Fn<void()> fail) {
+				done(SampleShared(true));
+			},
+		});
+	});
+	RegisterBoxScene(u"social_gallery_confirm"_q, boxSize, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Ui::MakeConfirmBox({
+			.text = tr::lng_oblivion_social_gallery_confirm(
+				tr::now,
+				lt_title,
+				u"CCD 2004"_q),
+			.confirmText = tr::lng_oblivion_social_gallery_confirm_yes(),
+			.title = tr::lng_oblivion_social_gallery_confirm_title(),
 		});
 	});
 	RegisterBoxScene(u"social_editor_new"_q, boxSize, [=](
@@ -1994,22 +3045,34 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		return Box(EditorBox, EditorArgs{ .show = show, .me = sampleMe() });
 	});
 
-	const auto friends = [=](const QString &name, FriendsState state) {
-		RegisterBoxScene(name, boxSize, [=](
-				std::shared_ptr<Ui::Show> show) {
+	const auto friends = [=](
+			const QString &name,
+			FriendsState state,
+			bool looks = false) {
+		const auto create = [=](
+				std::shared_ptr<Ui::Show> show) -> object_ptr<Ui::BoxContent> {
 			return Box(FriendsBox, FriendsArgs{
 				.state = rpl::single(state),
 				.profile = [] {},
 			});
-		});
+		};
+		RegisterBoxScene(name, boxSize, create);
+		if (looks) {
+			Look::RegisterBoxScenes(name, boxSize, create);
+		}
 	};
 	friends(u"social_friends"_q, {
 		.status = Status::Ready,
 		.people = SamplePeople(),
-	});
+	}, true);
 	friends(u"social_friends_empty"_q, {
 		.status = Status::Ready,
 		.hidden = true,
+	});
+	friends(u"social_friends_hidden"_q, {
+		.status = Status::Ready,
+		.hidden = true,
+		.people = SamplePeople(),
 	});
 	friends(u"social_friends_offline"_q, {
 		.status = Status::Offline,
@@ -2068,6 +3131,16 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 					Fn<void(std::vector<SharedItem>)> done,
 					Fn<void()> fail) {
 				fail();
+			},
+		});
+	});
+	RegisterBoxScene(u"social_shared_empty"_q, boxSize, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(SharedBox, SharedArgs{
+			.load = [](
+					Fn<void(std::vector<SharedItem>)> done,
+					Fn<void()> fail) {
+				done({});
 			},
 		});
 	});
@@ -2135,6 +3208,20 @@ QString AudienceName(Audience audience) {
 	return tr::lng_oblivion_social_audience_nobody(tr::now);
 }
 
+rpl::producer<QString> SettingsAboutValue(not_null<Main::Session*> session) {
+	return rpl::combine(
+		LeftPublicValue(session),
+		tr::lng_oblivion_social_settings_about(),
+		tr::lng_oblivion_social_settings_left()
+	) | rpl::map([](bool left, const QString &about, const QString &note) {
+		return left ? (note + u"\n\n"_q + about) : about;
+	});
+}
+
+// The switches show what the server has (FlagNow), also for an account
+// that is switched off: a click then asks to connect again first, and
+// what was clicked is changed on the server after that. So a badge or a
+// chip that is still public can always be switched off from here.
 void ToggleFlag(not_null<Window::SessionController*> controller, Flag flag) {
 	const auto session = &controller->session();
 	const auto account = base::make_weak(&Cloud::For(session));
@@ -2332,14 +3419,29 @@ void ShowMyProfile(not_null<Window::SessionController*> controller) {
 			.setShown = [=](
 					SharedItem item,
 					bool shown,
-					Fn<void(bool)> done) {
-				SetSharedShown(session, item, shown, [=] {
-					done(true);
-				}, failed(done));
+					EditorArgs::Changed done) {
+				SetSharedShown(session, item, shown, [=](SharedItem now) {
+					done(std::move(now));
+				}, [=](const Cloud::Error &error) {
+					Cloud::ShowError(show, error);
+					done(std::nullopt);
+				});
+			},
+			.setListed = [=](
+					SharedItem item,
+					bool listed,
+					EditorArgs::Changed done) {
+				SetPresetListed(session, item, listed, [=](SharedItem now) {
+					done(std::move(now));
+				}, [=](const Cloud::Error &error) {
+					Cloud::ShowError(show, error);
+					done(std::nullopt);
+				});
 			},
 			.save = [=](QJsonObject patch, Fn<void(bool)> done) {
 				const auto strong = account.get();
 				if (!strong) {
+					done(false);
 					return;
 				}
 				strong->patchMe(std::move(patch), [=] {
@@ -2355,6 +3457,7 @@ void ShowMyProfile(not_null<Window::SessionController*> controller) {
 			.setPhoto = [=](Fn<void(bool)> done) {
 				const auto strong = account.get();
 				if (!strong) {
+					done(false);
 					return;
 				}
 
@@ -2394,6 +3497,7 @@ void ShowMyProfile(not_null<Window::SessionController*> controller) {
 			.removePhoto = [=](Fn<void(bool)> done) {
 				const auto strong = account.get();
 				if (!strong) {
+					done(false);
 					return;
 				}
 				strong->request(
@@ -2407,6 +3511,7 @@ void ShowMyProfile(not_null<Window::SessionController*> controller) {
 					},
 					failed(done));
 			},
+			.closeRequests = DisconnectedEvents(session),
 		}));
 	});
 }
@@ -2419,79 +3524,32 @@ void ShowChosenList(not_null<Window::SessionController*> controller) {
 			return;
 		}
 		const auto session = &strong->session();
-		const auto raw = &Cloud::For(session);
-		const auto account = base::make_weak(raw);
 		const auto show = std::shared_ptr<Ui::Show>(strong->uiShow());
-
-		// Clicks come faster than the answers: the list that is being
-		// edited is kept here and sent as a whole every time.
-		struct Edit {
-			std::vector<uint64> list;
-			int pending = 0;
-		};
-		const auto edit = std::make_shared<Edit>();
-		const auto sync = [=] {
-			const auto strong = account.get();
-			if (strong && !edit->pending) {
-				edit->list = strong->me().chosen;
-			}
-		};
-		const auto push = [=] {
-			const auto strong = account.get();
-			if (!strong) {
-				return;
-			}
-			auto ids = QJsonArray();
-			for (const auto id : edit->list) {
-				ids.push_back(double(id));
-			}
-			auto privacy = QJsonObject();
-			privacy.insert(u"chosen"_q, ids);
-			auto patch = QJsonObject();
-			patch.insert(u"privacy"_q, privacy);
-			++edit->pending;
-			strong->patchMe(std::move(patch), [=] {
-				--edit->pending;
-				sync();
-			}, [=](const Cloud::Error &error) {
-				--edit->pending;
-				sync();
-				Cloud::ShowError(show, error);
-			});
-		};
+		const auto edit = std::make_shared<ChosenEdit>(session, show);
 		const auto remove = [=](uint64 id) {
-			sync();
-			const auto i = ranges::find(edit->list, id);
-			if (i != end(edit->list)) {
-				edit->list.erase(i);
-				push();
-			}
+			edit->remove(id);
 		};
 		const auto add = [=](not_null<UserData*> user) {
-			sync();
-			const auto strong = account.get();
-			const auto id = peerToUser(user->id).bare;
-			if (!strong || ranges::contains(edit->list, id)) {
-				return false;
-			} else if (int64(edit->list.size())
-				>= strong->limit("chosen", 1000)) {
-				Toast(show, tr::lng_oblivion_social_chosen_full(tr::now));
-				return false;
-			}
-			edit->list.push_back(id);
-			push();
-			return true;
+			return edit->add(peerToUser(user->id).bare);
 		};
 		const auto chosen = [=](uint64 id) {
-			sync();
-			return ranges::contains(edit->list, id);
+			return ranges::contains(edit->list(), id);
 		};
+
+		// The rows are what is being edited here, at once; when nothing
+		// is on its way they are what the server has. (The edit is not
+		// held by what listens to its own changes.)
+		const auto editing = std::weak_ptr<ChosenEdit>(edit);
 		auto people = rpl::single(
 			rpl::empty
-		) | rpl::then(
-			raw->meUpdated()
-		) | rpl::map([=] {
-			return ChosenPeople(session);
+		) | rpl::then(rpl::merge(
+			Cloud::For(session).meUpdated(),
+			edit->changes()
+		)) | rpl::map([=] {
+			const auto strong = editing.lock();
+			return ChosenPeople(
+				session,
+				strong ? strong->list() : Cloud::For(session).me().chosen);
 		});
 		show->showBox(Box(ChosenBox, ChosenArgs{
 			.people = std::move(people),
@@ -2552,6 +3610,13 @@ ProfileBlock CreateProfileBlock(
 		Get().changes()
 	) | rpl::on_next(update, raw->lifetime());
 	update();
+
+	// The chips of the page are what the server shows now, not what an
+	// event has told some time ago: the list is asked again (no id is
+	// sent, not more often than once a minute).
+	if (!self && Get().cloudProfileShow()) {
+		RefreshActivity(session);
+	}
 
 	auto shown = slide->toggledValue();
 	return {

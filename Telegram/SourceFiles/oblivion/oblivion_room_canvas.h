@@ -36,6 +36,14 @@ class RpWidget;
 // background colour" give the same picture, and the second one needs no
 // separate layer.
 //
+// What the others draw is what they send: a stroke of another member may
+// be a wide line from edge to edge thousands of times, and stroking that
+// takes seconds. So nothing of the others is painted on the main thread
+// without a limit: the previews have a small budget (see CanvasModel::
+// Live) and are kept as a picture only the new points are added to, the
+// finished strokes heavier than a few board widths and a board heavier
+// than that are painted off the main thread, one picture at a time.
+//
 // The tab registers itself (Rooms::TabRegistrar, id "canvas", order 300),
 // nothing here is called by the room window directly.
 namespace Oblivion::Rooms {
@@ -109,15 +117,27 @@ void PaintStroke(
 	const QColor &background,
 	double shown = -1.);
 
+// What painting a line costs, roughly: its length in canvas units and
+// a few units more for every point. The points of a stroke of another
+// member may be anywhere on the board (a zig-zag from edge to edge), so
+// their number alone says little about it. What is painted on the main
+// thread is limited by this weight.
+[[nodiscard]] int64 StrokeWeight(const CanvasStroke &stroke);
+
 // The strokes of a board in the order they are painted.
 class CanvasModel final {
 public:
 	using StrokePtr = std::shared_ptr<const CanvasStroke>;
 
-	// A stroke somebody else is drawing right now.
+	// A stroke somebody else is drawing right now. What comes here is
+	// what another member has sent: a member has a few previews at most,
+	// all of them together have a limited weight, and the width is not
+	// more than the tools of the app give.
 	struct Live {
 		CanvasStroke stroke;
-		crl::time updated = 0;
+		int64 weight = 0; // StrokeWeight(stroke).
+		crl::time started = 0;
+		crl::time updated = 0; // When points were taken last.
 		double shown = 0.; // Points revealed so far.
 	};
 
@@ -139,9 +159,14 @@ public:
 	void addPending(CanvasStroke &&stroke);
 	bool removePending(const QString &id);
 
-	// New points of a stroke in progress. false: nothing to show.
+	// New points of a stroke in progress. false: nothing was taken (and
+	// the preview does not live longer for it). When the previews are too
+	// many or too heavy together, the oldest previews of the member who
+	// has the most give way first; if that is the line these points are
+	// for and nothing else, it stops growing.
 	bool addLive(CanvasStroke &&part, crl::time now, int maxPoints);
-	// Previews nobody has finished for five seconds. true: some are gone.
+	// Previews that got no points for five seconds (or are drawn for an
+	// impossibly long time). true: some are gone.
 	bool expireLive(crl::time now);
 	// Reveals the points that came. true: there is more to reveal.
 	bool advanceLive(crl::time elapsed);
@@ -170,7 +195,20 @@ public:
 	[[nodiscard]] int numbers() const {
 		return _numbers;
 	}
+	// StrokeWeight() of all the strokes() together.
+	[[nodiscard]] int64 weight() const {
+		return _weight;
+	}
+	// Changes when a preview is gone: a picture of lives() can't be
+	// continued by painting the new points only.
+	[[nodiscard]] int livesGeneration() const {
+		return _livesGeneration;
+	}
+	// The weight of all the previews together.
+	[[nodiscard]] int64 liveWeight() const;
 	[[nodiscard]] bool contains(const QString &id) const;
+	// An own stroke with this id still waits for the server.
+	[[nodiscard]] bool waiting(const QString &id) const;
 	// The newest stroke of the user that is not in skip, for the undo.
 	[[nodiscard]] QString lastOwn(
 		uint64 userId,
@@ -187,7 +225,9 @@ private:
 	std::vector<StrokePtr> _pending;
 	std::vector<Live> _lives;
 	int _generation = 0;
+	int _livesGeneration = 0;
 	int _numbers = 0;
+	int64 _weight = 0;
 
 };
 

@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+class DocumentData;
+
 namespace Main {
 class Session;
 } // namespace Main
@@ -28,7 +30,11 @@ class SessionController;
 // boxes are in oblivion_cloud_share_ui.cpp.
 //
 // Nothing here talks to the server before a click, and every click goes
-// through Cloud::RequireConsent() first.
+// through Cloud::RequireConsent() first. The one thing that goes on by
+// itself is what a click has started: the files of a playlist the user
+// has added with «Добавить к себе» that are not on this device yet are
+// taken later (after a restart, after a time without connection), only
+// while the account is connected.
 namespace Oblivion::Share {
 
 // Called by Cloud::SessionStarted() / Cloud::SessionLoggedOut().
@@ -88,10 +94,15 @@ void SharePlaylist(
 struct PresetHost {
 	QString kind; // "photo" | "video".
 	std::shared_ptr<Ui::Show> show; // Boxes and toasts of the editor.
-	// The effects that are in the editor now, empty without them.
+	// The effects that are in the editor now, empty without them. Asked
+	// before and after apply() as well: «Набор применён» is shown (and a
+	// use of a shared preset is counted) only if the editor has taken
+	// the stack, so both callbacks must work at once, not later.
 	Fn<QByteArray()> current;
 	// Puts a stack into the editor (as one undo step). The data is
-	// validated already, the editor still applies its own limits.
+	// validated already, the editor still applies its own limits and
+	// tells the user itself when it refuses (a locked layer, too many
+	// effects).
 	Fn<void(const QByteArray &stack)> apply;
 	// The menu of the photo editor is dark in every theme.
 	bool dark = false;
@@ -105,6 +116,13 @@ void ShowPresetsMenu(
 	not_null<QWidget*> parent,
 	QPoint globalPosition,
 	PresetHost host);
+
+// The file of this document is being taken from Telegram for an upload
+// of a playlist. A failure of such a download is told by the upload
+// itself (the track is counted as skipped), so the «Не удалось скачать,
+// повторить?» box of the app is not needed for it: see
+// DocumentData::handleLoaderUpdates().
+[[nodiscard]] bool QuietLoad(not_null<DocumentData*> document);
 
 // OBLIVION_SELFTEST=cloud_share, pure logic, no network.
 [[nodiscard]] bool RunSelfTest(QStringList &log);

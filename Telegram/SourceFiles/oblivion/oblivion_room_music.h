@@ -47,9 +47,10 @@ class Show;
 // player are the user's own business: the app pauses the player by
 // itself too (a call, a video with sound), and that must never stop the
 // music for everybody. A pause leaves the air, play (or «Вернуться в
-// эфир» in the tab) brings back to where the room is now. Playing
-// another track of Telegram leaves the air as well. Without
-// Right::Control a seek is undone by the correction.
+// эфир» in the tab) brings back to where the room is now. Stop (a media
+// key, the system controls) and playing another track of Telegram leave
+// the air as well. Without Right::Control a seek is undone by the
+// correction.
 namespace Oblivion::Rooms {
 
 // ---- Pure sync maths (OBLIVION_SELFTEST=room_sync).
@@ -113,6 +114,18 @@ private:
 
 };
 
+// What a stopped player with a track of the room means for the engine.
+enum class StopKind {
+	Ended, // The track was played to its end: the server switches.
+	Failed, // The player could not play the file.
+	AfterEnd, // The player was cleared after the end: nothing new.
+	ByUser, // Stop of a media key or of the system controls.
+};
+// atEnd / error: what the player says (StoppedAtEnd / StoppedAtError or
+// StoppedAtStart, neither: a plain stop). endedKnown: the engine has
+// already seen this item end at this rev of the room.
+[[nodiscard]] StopKind ClassifyStop(bool atEnd, bool error, bool endedKnown);
+
 // ---- The engine: one per open room (Room::music()).
 
 enum class LocalState {
@@ -144,7 +157,8 @@ public:
 	[[nodiscard]] LocalStatus status() const;
 	[[nodiscard]] rpl::producer<LocalStatus> statusValue() const;
 
-	// «Вернуться в эфир».
+	// «Вернуться в эфир» and «Повторить загрузку»: also asks once more
+	// for the files that could not be downloaded.
 	void rejoin();
 
 	// A music file message of Telegram goes to the queue of the room:
@@ -154,6 +168,18 @@ public:
 		not_null<DocumentData*> document,
 		FullMsgId origin,
 		std::shared_ptr<Ui::Show> show);
+	// «Добавить все» of a playlist, one click: the messages wait in line
+	// and go the same way a few at a time, none is dropped because the
+	// others are still being downloaded. Returns how many were taken (not
+	// more than twenty at once, a message that waits already is not
+	// taken twice).
+	int addMessages(
+		const std::vector<FullMsgId> &ids,
+		std::shared_ptr<Ui::Show> show);
+
+	// The player holds this file of the temp folder now (playing or on
+	// pause): the room does not delete it yet.
+	[[nodiscard]] bool usesFile(const QString &path) const;
 
 	// The hooks below.
 	[[nodiscard]] bool drives(const AudioMsgId &current) const;

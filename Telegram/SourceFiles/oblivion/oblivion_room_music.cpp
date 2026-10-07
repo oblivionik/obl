@@ -28,9 +28,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "media/audio/media_audio.h"
 #include "media/player/media_player_instance.h"
+#include "oblivion/oblivion_lang.h"
+#include "oblivion/oblivion_look.h"
 #include "oblivion/oblivion_playlists.h"
 #include "oblivion/oblivion_room_window.h"
 #include "oblivion/oblivion_settings.h"
+#include "oblivion/oblivion_ui_snapshots.h"
 #include "storage/file_download.h"
 #include "ui/boxes/confirm_box.h"
 #include "ui/image/image.h"
@@ -77,6 +80,7 @@ constexpr auto kNudgeStart = int64(80);
 constexpr auto kNudgeStop = int64(25);
 constexpr auto kNudgeStep = 0.1;
 constexpr auto kEndMargin = int64(400);
+constexpr auto kEndSlack = int64(5000);
 constexpr auto kTick = crl::time(1000);
 constexpr auto kOwnActionGuard = crl::time(800);
 constexpr auto kRetryDelay = crl::time(15000);
@@ -86,6 +90,16 @@ constexpr auto kPendingLimit = 5;
 constexpr auto kBatchLimit = 20;
 constexpr auto kPositionTick = crl::time(250);
 constexpr auto kSeekShown = crl::time(1500);
+constexpr auto kVolumeSaveDelay = crl::time(200);
+
+// The looks («Тема Oblivion»), at the 100% scale: the place of the ring
+// around the round cover of «Ночной эфир», the square cover of «Тишина»
+// in a narrow and in a wide window, the sizes of the titles.
+constexpr auto kCoverRing = 10;
+constexpr auto kSilenceCover = 96;
+constexpr auto kSilenceCoverWide = 116;
+constexpr auto kAirTitle = 20;
+constexpr auto kSilenceTitle = 22;
 
 [[nodiscard]] int Scaled(int value) {
 	return style::ConvertScale(value);
@@ -150,6 +164,19 @@ StartPlan PlanStart(
 	result.over = (duration > 0)
 		&& (PositionAt(state, duration, serverNow) >= duration - kEndMargin);
 	return result;
+}
+
+StopKind ClassifyStop(bool atEnd, bool error, bool endedKnown) {
+	// The player reports the end, then it is cleared and reports a plain
+	// stop of the same track: only a plain stop that follows no end is
+	// the user's own.
+	return atEnd
+		? StopKind::Ended
+		: error
+		? StopKind::Failed
+		: endedKnown
+		? StopKind::AfterEnd
+		: StopKind::ByUser;
 }
 
 void SyncCorrector::reset() {
@@ -268,9 +295,18 @@ struct MusicEngine::Private {
 	void seekFinished();
 	void closeRequested();
 
+	enum class Added {
+		Sent, // The file is here, it goes to the relay.
+		Loading, // It is being downloaded from Telegram first.
+		Failed,
+		Busy, // Too many are being downloaded already.
+		Skipped, // A track of the room itself, or it waits already.
+	};
+
 	[[nodiscard]] Entry &ensureEntry(const QueueItem &item);
 	[[nodiscard]] Entry *findEntry(const QString &itemId);
 	void cleanupEntries();
+	void retryFailed();
 	void fileReady(const QString &itemId, const QString &path);
 	void fileFailed(const QString &itemId);
 	void fileProgress(const QString &itemId, int64 ready, int64 total);
@@ -279,6 +315,7 @@ struct MusicEngine::Private {
 		const QString &path);
 
 	[[nodiscard]] bool oursCurrent() const;
+	[[nodiscard]] bool endedHere(const QueueItem &item) const;
 	void startPlay(not_null<DocumentData*> document, int64 from, bool cold);
 	void seekLocal(int64 target);
 	void resumeLocal(int64 from);
@@ -292,18 +329,32 @@ struct MusicEngine::Private {
 
 	[[nodiscard]] bool tryUpload(const PendingDocument &pending);
 	void checkPending(not_null<DocumentData*> document);
+	[[nodiscard]] Added start(
+		not_null<DocumentData*> document,
+		FullMsgId origin,
+		std::shared_ptr<Ui::Show> show);
+	void feedBacklog();
+	void scheduleFeed();
 
 	const not_null<MusicEngine*> owner;
 	const not_null<Room*> room;
 	std::map<QString, Entry> entries;
-	base::flat_set<not_null<DocumentData*>> documents;
+	// The documents made for the files of the room, with those files.
+	base::flat_map<not_null<DocumentData*>, QString> documents;
 	std::vector<PendingDocument> pending;
+	std::vector<FullMsgId> backlog; // «Добавить все»: what waits in line.
+	std::shared_ptr<Ui::Show> backlogShow;
+	bool feeding = false;
+	bool feedScheduled = false;
 	PendingStart pendingStart;
 	SyncCorrector corrector;
 	base::Timer timer;
 	rpl::variable<LocalStatus> status;
 	QString itemId; // The current item of the room the engine has seen.
 	QString playingItem; // The item whose document was given to the player.
+	// The item that was played to its end at the rev endedRev of the
+	// room: nothing is started for it again, the server switches.
+	QString endedItem;
 	int64 endedRev = -1;
 	int64 startRev = -1;
 	int startAttempts = 0;
@@ -357,14 +408,24 @@ MusicEngine::Private::Private(
 		if (changes & (Changes(Change::Rights) | Change::MusicQueue)) {
 			PlayerChangesStream().fire({});
 		}
-		if (changes & (Changes(Change::MusicQueue)
+		const auto back = (changes & Change::Connection)
+			&& this->room->connected();
+		if (back) {
+			// The connection is here again: what could not be downloaded
+			// while it was away gets its attempts once more.
+			retryFailed();
+		}
+		if (back || (changes & (Changes(Change::MusicQueue)
 			| Change::MusicPlayer
 			| Change::Gone
-			| Change::Reloaded)) {
+			| Change::Reloaded))) {
 			if (changes & Change::MusicPlayer) {
 				corrector.reset();
 			}
 			sync();
+		}
+		if (changes & Change::Uploads) {
+			scheduleFeed();
 		}
 	}, lifetime);
 
@@ -393,6 +454,20 @@ bool MusicEngine::Private::oursCurrent() const {
 	const auto current = Media::Player::instance()->current(SongType::Song);
 	const auto document = current.audio();
 	return document && documents.contains(document);
+}
+
+// The file may be a bit shorter than the room thinks (a duration that
+// came from Telegram is in whole seconds). Once the item was played to its
+// end here, at this state of the room, nothing of it is started or
+// corrected again and the next track that may play already is not
+// interrupted: the server switches in a moment. A file that ends long
+// before its time is another story, that one is not "ended".
+bool MusicEngine::Private::endedHere(const QueueItem &item) const {
+	const auto &state = room->player(Kind::Music).state;
+	return (endedRev == state.rev)
+		&& (endedItem == item.id)
+		&& (PositionAt(state, item.duration, room->now())
+			>= item.duration - kEndSlack);
 }
 
 MusicEngine::Private::Entry *MusicEngine::Private::findEntry(
@@ -447,6 +522,20 @@ void MusicEngine::Private::cleanupEntries() {
 	}
 }
 
+// The files that could not be downloaded get their attempts again: the
+// connection has come back, or the user has asked for it.
+void MusicEngine::Private::retryFailed() {
+	for (auto &[id, entry] : entries) {
+		if (entry.failed && !entry.document && !entry.transfer) {
+			entry.failed = false;
+			entry.requested = false;
+			entry.failures = 0;
+			entry.percent = 0;
+		}
+	}
+	startAttempts = 0;
+}
+
 DocumentData *MusicEngine::Private::makeDocument(
 		const QueueItem &item,
 		const QString &path) {
@@ -458,18 +547,26 @@ DocumentData *MusicEngine::Private::makeDocument(
 	const auto document = session->data().document(
 		base::RandomValue<DocumentId>());
 	const auto seconds = int(std::max(item.duration / 1000, int64(1)));
-	using Flag = MTPDdocumentAttributeAudio::Flag;
+	// The attribute goes without the title and the performer: with both
+	// of them the document asks Telegram for an album cover at once, and
+	// this one is not a document of Telegram (nothing about a track of
+	// a room is ever sent there). The texts for the player bar are set
+	// right after, they are read when the bar is painted.
 	document->setattributes({
 		MTP_documentAttributeAudio(
-			MTP_flags(Flag::f_title | Flag::f_performer),
+			MTP_flags(0),
 			MTP_int(seconds),
-			MTP_string(item.title),
-			MTP_string(item.performer),
+			MTPstring(),
+			MTPstring(),
 			MTPstring()),
 		MTP_documentAttributeFilename(MTP_string(item.fileName.isEmpty()
 			? u"track"_q
 			: item.fileName)),
 	});
+	if (const auto song = document->song()) {
+		song->title = item.title;
+		song->performer = item.performer;
+	}
 	document->size = size;
 	document->setLocation(Core::FileLocation(path));
 	return document->filepath(true).isEmpty() ? nullptr : document.get();
@@ -492,7 +589,7 @@ void MusicEngine::Private::fileReady(
 	entry->percent = 100;
 	entry->document = makeDocument(*item, path);
 	if (entry->document) {
-		documents.emplace(entry->document);
+		documents.emplace(entry->document, path);
 	} else {
 		entry->failed = true;
 		entry->failures = kRetryLimit;
@@ -604,8 +701,17 @@ void MusicEngine::Private::holdOurs() {
 
 void MusicEngine::Private::stopOurs() {
 	if (oursCurrent()) {
+		const auto player = Media::Player::instance();
+		const auto voice = player->getState(AudioMsgId::Type::Voice);
 		acting = true;
-		Media::Player::instance()->stopAndClose();
+		if (voice.id && !Media::Player::IsStoppedOrStopping(voice.state)) {
+			// A voice message is in the player too (playing or on
+			// pause): only the track of the room goes, the message and
+			// the bar with it stay.
+			player->stop(SongType::Song);
+		} else {
+			player->stopAndClose();
+		}
 		acting = false;
 	}
 	playingItem = QString();
@@ -653,6 +759,7 @@ void MusicEngine::Private::sync() {
 	timer.cancel();
 	const auto &state = room->state();
 	if (state.gone != Gone::No) {
+		backlog.clear();
 		stopOurs();
 		setStatus({});
 		return;
@@ -690,7 +797,12 @@ void MusicEngine::Private::sync() {
 	if (entry.failed) {
 		holdOurs();
 		setStatus({ .state = LocalState::Failed });
-		timer.callOnce(kRetryDelay);
+		if (entry.failures < kRetryLimit) {
+			// One more attempt by itself a bit later. After the last
+			// one: when the connection comes back or by «Повторить
+			// загрузку», nothing is asked in a loop.
+			timer.callOnce(kRetryDelay + crl::time(200));
+		}
 		return;
 	} else if (!entry.document) {
 		holdOurs();
@@ -723,10 +835,7 @@ void MusicEngine::Private::sync() {
 		&& !Media::Player::IsStopped(playerState.state);
 	const auto playing = active
 		&& Media::Player::ShowPauseIcon(playerState.state);
-	const auto ended = same
-		&& (playerState.state == Media::Player::State::StoppedAtEnd)
-		&& (endedRev == data.state.rev);
-	if (plan.over || ended) {
+	if (plan.over || endedHere(*item)) {
 		// The end of a track belongs to the server.
 		setStatus({ .state = LocalState::Waiting });
 		return;
@@ -784,11 +893,25 @@ void MusicEngine::Private::playerUpdated() {
 		}
 		return;
 	} else if (Media::Player::IsStopped(state.state)) {
-		if (state.state == Media::Player::State::StoppedAtEnd) {
+		using PlayState = Media::Player::State;
+		const auto kind = ClassifyStop(
+			(state.state == PlayState::StoppedAtEnd),
+			(state.state == PlayState::StoppedAtError
+				|| state.state == PlayState::StoppedAtStart),
+			(endedRev == data.state.rev) && (endedItem == item->id));
+		if (kind == StopKind::Ended) {
 			endedRev = data.state.rev;
+			endedItem = item->id;
 			if (following && data.state.playing) {
 				setStatus({ .state = LocalState::Waiting });
 			}
+		} else if (kind == StopKind::ByUser && following) {
+			// Stop of a media key or of the system controls: the user
+			// does not listen any more, the same as closing the player
+			// bar. Otherwise the track would start again in a second.
+			following = false;
+			speed = 1.;
+			setStatus({ .state = LocalState::Away });
 		}
 		return;
 	} else if (!data.state.playing) {
@@ -816,6 +939,12 @@ void MusicEngine::Private::playerUpdated() {
 	if (!following) {
 		following = true;
 		corrector.reset();
+	}
+	if (endedHere(*item)) {
+		// The track was played to its end and plays again from the start
+		// ahead of the server (the room repeats it): it is not sent back
+		// to the end by the old state, the new one comes in a moment.
+		return;
 	}
 	const auto serverNow = room->now();
 	if (serverNow + int64(corrector.lead()) < data.state.anchor) {
@@ -923,19 +1052,135 @@ bool MusicEngine::Private::tryUpload(const PendingDocument &pending) {
 }
 
 void MusicEngine::Private::checkPending(not_null<DocumentData*> document) {
+	auto freed = false;
 	for (auto i = begin(pending); i != end(pending);) {
 		if (i->document != document) {
 			++i;
 		} else if (tryUpload(*i)) {
 			i = pending.erase(i);
+			freed = true;
 		} else if (!document->loading()) {
 			Toast(
 				i->show,
 				tr::lng_oblivion_rmusic_download_failed(tr::now));
 			i = pending.erase(i);
+			freed = true;
 		} else {
 			++i;
 		}
+	}
+	if (freed) {
+		scheduleFeed();
+	}
+}
+
+// The line of «Добавить все» moves on from the event loop, never from
+// inside the walk over the list above or a change of the room.
+void MusicEngine::Private::scheduleFeed() {
+	if (backlog.empty() || feedScheduled) {
+		return;
+	}
+	feedScheduled = true;
+	crl::on_main(owner, [=] {
+		feedScheduled = false;
+		feedBacklog();
+	});
+}
+
+// The file of a music message of Telegram goes to the room: at once if it
+// is here, after the download from Telegram otherwise.
+MusicEngine::Private::Added MusicEngine::Private::start(
+		not_null<DocumentData*> document,
+		FullMsgId origin,
+		std::shared_ptr<Ui::Show> show) {
+	if (documents.contains(document)) {
+		return Added::Skipped;
+	}
+	auto entry = PendingDocument{
+		.document = document,
+		.media = document->createMediaView(),
+		.origin = origin,
+		.show = std::move(show),
+	};
+	entry.media->thumbnailWanted(origin);
+	if (tryUpload(entry)) {
+		return Added::Sent;
+	} else if (ranges::contains(
+			pending,
+			document,
+			&PendingDocument::document)) {
+		return Added::Skipped;
+	} else if (int(pending.size()) >= kPendingLimit) {
+		return Added::Busy;
+	}
+	if (!document->loading()) {
+		// Into memory if the file is small enough, FileLoader asserts on
+		// larger ones without a target file: those go to the temp folder
+		// of the room.
+		auto target = QString();
+		if (document->size >= Storage::kMaxFileInMemory) {
+			const auto folder = cWorkingDir()
+				+ u"tdata/oblivion/rooms/"_q
+				+ QString::number(room->selfId())
+				+ '_'
+				+ room->code()
+				+ '/';
+			if (!QDir().mkpath(folder)) {
+				return Added::Failed;
+			}
+			target = folder
+				+ u"tg_"_q
+				+ QString::number(document->id)
+				+ u".audio"_q;
+		}
+		document->save(origin, target);
+		if (!document->loading()) {
+			return tryUpload(entry) ? Added::Sent : Added::Failed;
+		}
+	}
+	pending.push_back(std::move(entry));
+	return Added::Loading;
+}
+
+// «Добавить все»: the messages that wait in line go on while there is
+// room for them, so that only a few files are downloaded from Telegram
+// and kept for the relay at once.
+void MusicEngine::Private::feedBacklog() {
+	if (feeding || backlog.empty()) {
+		return;
+	}
+	feeding = true;
+	const auto guard = gsl::finally([&] { feeding = false; });
+	const auto session = room->session();
+	if (!session
+		|| room->state().gone != Gone::No
+		|| !room->can(Right::Add)) {
+		backlog.clear();
+		backlogShow = nullptr;
+		return;
+	}
+	const auto uploads = [&] {
+		return int(ranges::count(room->uploads(), Kind::Music, &Upload::kind));
+	};
+	while (!backlog.empty()
+		&& int(pending.size()) < kPendingLimit
+		&& uploads() < kPendingLimit) {
+		const auto id = backlog.front();
+		backlog.erase(begin(backlog));
+		const auto item = session->data().message(id);
+		const auto document = item ? MusicDocument(item) : nullptr;
+		if (!document || item->forbidsSaving()) {
+			continue;
+		}
+		const auto result = start(document, id, backlogShow);
+		if (result == Added::Failed) {
+			Toast(
+				backlogShow,
+				tr::lng_oblivion_rmusic_download_failed(tr::now));
+		}
+	}
+	if (backlog.empty()) {
+		backlogShow = nullptr;
 	}
 }
 
@@ -977,7 +1222,7 @@ rpl::producer<LocalStatus> MusicEngine::statusValue() const {
 void MusicEngine::rejoin() {
 	const auto p = _private.get();
 	p->following = true;
-	p->startAttempts = 0;
+	p->retryFailed();
 	p->corrector.reset();
 	p->sync();
 }
@@ -993,62 +1238,71 @@ void MusicEngine::addDocument(
 	} else if (!room->can(Right::Add)) {
 		Toast(show, tr::lng_oblivion_rmusic_no_add(tr::now));
 		return;
-	} else if (p->documents.contains(document)) {
-		return;
 	}
-	auto pending = Private::PendingDocument{
-		.document = document,
-		.media = document->createMediaView(),
-		.origin = origin,
-		.show = show,
-	};
-	pending.media->thumbnailWanted(origin);
-	if (p->tryUpload(pending)) {
+	using Added = Private::Added;
+	switch (p->start(document, origin, show)) {
+	case Added::Sent:
 		Toast(show, tr::lng_oblivion_rmusic_added_toast(tr::now));
-		return;
-	} else if (ranges::contains(
-			p->pending,
-			document,
-			&Private::PendingDocument::document)) {
-		return;
-	} else if (int(p->pending.size()) >= kPendingLimit) {
+		break;
+	case Added::Loading:
+		Toast(show, tr::lng_oblivion_rmusic_downloading(tr::now));
+		break;
+	case Added::Failed:
+		Toast(show, tr::lng_oblivion_rmusic_download_failed(tr::now));
+		break;
+	case Added::Busy:
 		Toast(show, tr::lng_oblivion_rmusic_wait(tr::now));
-		return;
+		break;
+	case Added::Skipped:
+		break;
 	}
-	if (!document->loading()) {
-		// Into memory if the file is small enough, FileLoader asserts on
-		// larger ones without a target file: those go to the temp folder
-		// of the room.
-		auto target = QString();
-		if (document->size >= Storage::kMaxFileInMemory) {
-			const auto folder = cWorkingDir()
-				+ u"tdata/oblivion/rooms/"_q
-				+ QString::number(room->selfId())
-				+ '_'
-				+ room->code()
-				+ '/';
-			if (!QDir().mkpath(folder)) {
-				Toast(
-					show,
-					tr::lng_oblivion_rmusic_download_failed(tr::now));
-				return;
-			}
-			target = folder
-				+ u"tg_"_q
-				+ QString::number(document->id)
-				+ u".audio"_q;
-		}
-		document->save(origin, target);
-		if (!document->loading() && !p->tryUpload(pending)) {
-			Toast(show, tr::lng_oblivion_rmusic_download_failed(tr::now));
-			return;
-		} else if (!document->loading()) {
-			Toast(show, tr::lng_oblivion_rmusic_added_toast(tr::now));
-			return;
+}
+
+int MusicEngine::addMessages(
+		const std::vector<FullMsgId> &ids,
+		std::shared_ptr<Ui::Show> show) {
+	const auto p = _private.get();
+	const auto room = p->room;
+	if (room->state().gone != Gone::No || !room->session()) {
+		return 0;
+	} else if (!room->can(Right::Add)) {
+		Toast(show, tr::lng_oblivion_rmusic_no_add(tr::now));
+		return 0;
+	}
+	auto taken = 0;
+	for (const auto &id : ids) {
+		if (int(p->backlog.size()) >= kBatchLimit) {
+			break;
+		} else if (!ranges::contains(p->backlog, id)) {
+			p->backlog.push_back(id);
+			++taken;
 		}
 	}
-	Toast(show, tr::lng_oblivion_rmusic_downloading(tr::now));
-	p->pending.push_back(std::move(pending));
+	if (taken) {
+		p->backlogShow = std::move(show);
+		p->feedBacklog();
+	}
+	return taken;
+}
+
+bool MusicEngine::usesFile(const QString &path) const {
+	const auto p = _private.get();
+	const auto playing = p->entries.find(p->playingItem);
+	if (playing != end(p->entries) && playing->second.path == path) {
+		return true;
+	}
+	const auto player = Media::Player::instance();
+	const auto document = player->current(SongType::Song).audio();
+	const auto i = document
+		? p->documents.find(not_null(document))
+		: end(p->documents);
+	if (i == end(p->documents) || i->second != path) {
+		return false;
+	}
+	// The document of that file is in the player: it holds the file
+	// while it plays or is on pause.
+	const auto state = player->getState(SongType::Song);
+	return state.id && !Media::Player::IsStopped(state.state);
 }
 
 bool MusicEngine::drives(const AudioMsgId &current) const {
@@ -1084,6 +1338,7 @@ bool MusicEngine::move(int delta, bool autonext) {
 	const auto &data = room->player(Kind::Music);
 	const auto current = data.current();
 	p->endedRev = data.state.rev;
+	p->endedItem = p->playingItem;
 	if (!p->following
 		|| !data.state.playing
 		|| !current
@@ -1197,6 +1452,154 @@ namespace {
 	return result;
 }
 
+// The title of what plays now: «Ночной эфир» and «Тишина» write it
+// bigger.
+[[nodiscard]] const style::font &NowTitleFont() {
+	const auto big = [](int size) {
+		return style::font(
+			Scaled(size),
+			st::semiboldFont->flags(),
+			st::semiboldFont->family());
+	};
+	switch (Look::Current()) {
+	case Look::kNightAir: {
+		static const auto result = big(kAirTitle);
+		return result;
+	}
+	case Look::kSilence: {
+		static const auto result = big(kSilenceTitle);
+		return result;
+	}
+	}
+	return TitleFont();
+}
+
+// «Тишина» says «сейчас играет» in small capitals over the title, the
+// line takes this much.
+[[nodiscard]] int NowLabelHeight() {
+	return Look::Is(Look::kSilence)
+		? (st::semiboldFont->height + Scaled(2))
+		: 0;
+}
+
+// The seek bar of somebody who can't control the player (and of an empty
+// player) is still a whole bar: the default disabled colours leave only
+// the played part of it, in the colour of the unplayed one.
+[[nodiscard]] const style::MediaSlider &SeekStyle() {
+	static const auto result = [] {
+		auto copy = st::mediaPlayerPanelPlayback;
+		copy.activeFgDisabled = st::mediaPlayerActiveFg;
+		copy.inactiveFgDisabled = st::mediaPlayerInactiveFg;
+		return copy;
+	}();
+	return result;
+}
+
+// With a look on the tab paints the seek and the volume bars by itself
+// (the sliders only take the mouse then): a thicker bar with the gradient
+// in «Ночной эфир», a hairline in «Тишина».
+struct LookSlider {
+	QColor active;
+	QColor inactive;
+	QColor marker;
+	int width = 0; // The thickness of the bar.
+	int markerSize = 0;
+	bool gradient = false;
+};
+
+[[nodiscard]] LookSlider LookSliderFor(bool seek) {
+	using Role = Look::Role;
+	const auto look = Look::Current();
+	const auto silence = (look == Look::kSilence);
+	const auto dark = Look::Dark();
+	// «Тишина»: the acid accent on black, the colour of the text on paper.
+	const auto loud = silence
+		? Look::Color(dark ? Role::Highlight : Role::Text)
+		: Look::Color(Role::AccentFill);
+	// The marker never leaves the rect of the slider: a slider repaints
+	// only itself when its value changes.
+	const auto markerMax = st::mediaPlayerPanelPlayback.seekSize.height();
+	auto result = LookSlider();
+	result.inactive = Look::Color(silence ? Role::Divider : Role::Pill);
+	if (!seek) {
+		result.active = Look::Color(Role::SubText);
+		result.marker = Look::Color(Role::Text);
+		result.width = Scaled(silence ? 2 : 4);
+		result.markerSize = std::min(Scaled(7), markerMax);
+		return result;
+	}
+	result.active = loud;
+	result.gradient = (look == Look::kNightAir);
+	result.marker = silence
+		? loud
+		: (look == Look::kNightAir)
+		? Look::Color(Role::Inverse)
+		: dark
+		? QColor(255, 255, 255)
+		: loud;
+	result.width = std::min(
+		Scaled(silence ? 2 : result.gradient ? 6 : 4),
+		markerMax);
+	result.markerSize = markerMax;
+	return result;
+}
+
+// Where the played part of a bar ends, from its left edge: the same place
+// Ui::MediaSlider puts its marker to, so the mouse and the picture agree.
+// seekSize: the width that slider keeps for the marker, 0 when it shows
+// none (then the bar is filled from edge to edge).
+[[nodiscard]] int SliderFill(float64 value, int length, int seekSize) {
+	const auto clamped = std::clamp(value, 0., 1.);
+	return (seekSize > 0 && length > seekSize)
+		? qRound(seekSize / 2. + clamped * (length - seekSize))
+		: qRound(clamped * std::max(length, 0));
+}
+
+void PaintLookSlider(
+		QPainter &p,
+		QRect geometry,
+		float64 value,
+		bool seek,
+		bool keepsMarker,
+		bool showsMarker) {
+	if (geometry.isEmpty()) {
+		return;
+	}
+	const auto colors = LookSliderFor(seek);
+	const auto seekSize = st::mediaPlayerPanelPlayback.seekSize.width();
+	const auto fill = SliderFill(
+		value,
+		geometry.width(),
+		keepsMarker ? seekSize : 0);
+	const auto radius = colors.width / 2.;
+	const auto bar = QRectF(
+		geometry.x(),
+		geometry.y() + (geometry.height() - colors.width) / 2.,
+		geometry.width(),
+		colors.width);
+	p.setPen(Qt::NoPen);
+	p.setBrush(colors.inactive);
+	p.drawRoundedRect(bar, radius, radius);
+	if (fill > 0) {
+		const auto played = QRectF(bar.x(), bar.y(), fill, bar.height());
+		if (colors.gradient) {
+			p.setBrush(Look::AccentBrush(played));
+		} else {
+			p.setBrush(colors.active);
+		}
+		p.drawRoundedRect(played, radius, radius);
+	}
+	if (showsMarker) {
+		const auto size = colors.markerSize;
+		p.setBrush(colors.marker);
+		p.drawEllipse(QRectF(
+			geometry.x() + fill - size / 2.,
+			geometry.y() + (geometry.height() - size) / 2.,
+			size,
+			size));
+	}
+}
+
 // The uploads of the other players of the room are shown in their tabs.
 [[nodiscard]] std::vector<Upload> MusicUploads(not_null<Room*> room) {
 	auto result = std::vector<Upload>();
@@ -1228,6 +1631,172 @@ void AddItemDocument(
 	engine->addDocument(document, id, show);
 }
 
+// A row of the boxes with playlists and their tracks, made like a row
+// of the queue: a cover, two lines and something short at the right.
+struct PickRowArgs {
+	QString seed; // The colours of the cover.
+	QString title;
+	QString about;
+	QString aside; // At the right: the duration of a track.
+	bool faded = false; // Can't be chosen now.
+	bool failed = false; // «about» says what is wrong.
+};
+
+class PickRow final : public Ui::AbstractButton {
+public:
+	PickRow(QWidget *parent, PickRowArgs &&args);
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+	void paintEvent(QPaintEvent *e) override;
+	void onStateChanged(State was, StateChangeSource source) override;
+
+private:
+	const PickRowArgs _args;
+
+};
+
+PickRow::PickRow(QWidget *parent, PickRowArgs &&args)
+: AbstractButton(parent)
+, _args(std::move(args)) {
+	setAccessibleName(_args.title);
+	if (_args.faded) {
+		setAttribute(Qt::WA_TransparentForMouseEvents);
+	}
+}
+
+int PickRow::resizeGetHeight(int newWidth) {
+	return Scaled(54);
+}
+
+void PickRow::onStateChanged(State was, StateChangeSource source) {
+	update();
+}
+
+void PickRow::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+	const auto pad = st::boxRowPadding.left();
+	if (isOver() || isDown()) {
+		// The row is in a box: the colours of the window, the radius of
+		// the look («Тема Oblivion»).
+		const auto inset = pad - Scaled(10);
+		const auto radius = Look::RowRadius(Scaled(10));
+		p.setPen(Qt::NoPen);
+		p.setBrush(isDown() ? st::windowBgRipple : st::windowBgOver);
+		p.drawRoundedRect(
+			QRectF(rect()).marginsRemoved(QMarginsF(inset, 1, inset, 1)),
+			radius,
+			radius);
+	}
+	const auto cover = Scaled(38);
+	p.setOpacity(_args.faded ? 0.45 : 1.);
+	PaintCover(
+		p,
+		QRect(pad, (height() - cover) / 2, cover, cover),
+		QImage(),
+		_args.seed,
+		Scaled(8));
+	p.setOpacity(1.);
+	const auto left = pad + cover + Scaled(12);
+	auto right = width() - st::boxRowPadding.right();
+	if (!_args.aside.isEmpty()) {
+		const auto asideWidth = st::normalFont->width(_args.aside);
+		p.setFont(st::normalFont);
+		p.setPen(st::windowSubTextFg);
+		p.drawText(
+			right - asideWidth,
+			(height() - st::normalFont->height) / 2 + st::normalFont->ascent,
+			_args.aside);
+		right -= asideWidth + Scaled(10);
+	}
+	const auto textWidth = std::max(right - left, Scaled(40));
+	const auto single = _args.about.isEmpty();
+	p.setFont(st::semiboldFont);
+	p.setPen(_args.faded ? st::windowSubTextFg : st::windowFg);
+	p.drawText(
+		left,
+		(single ? ((height() - st::semiboldFont->height) / 2) : Scaled(9))
+			+ st::semiboldFont->ascent,
+		st::semiboldFont->elided(_args.title, textWidth));
+	if (!single) {
+		p.setFont(st::normalFont);
+		p.setPen(_args.failed ? st::boxTextFgError : st::windowSubTextFg);
+		p.drawText(
+			left,
+			Scaled(29) + st::normalFont->ascent,
+			st::normalFont->elided(_args.about, textWidth));
+	}
+}
+
+// «У вас пока нет плейлистов», «в плейлисте нет треков».
+[[nodiscard]] const style::FlatLabel &PickEmptyLabelStyle() {
+	static const auto result = [] {
+		auto copy = st::boxDividerLabel;
+		copy.align = style::al_top;
+		return copy;
+	}();
+	return result;
+}
+
+void AddPickEmptyLabel(
+		not_null<Ui::VerticalLayout*> container,
+		rpl::producer<QString> text) {
+	container->add(
+		object_ptr<Ui::FlatLabel>(
+			container,
+			std::move(text),
+			PickEmptyLabelStyle()),
+		st::boxRowPadding + QMargins(
+			0,
+			st::boxMediumSkip,
+			0,
+			st::boxMediumSkip),
+		style::al_top);
+}
+
+// chosen may be null: the rows are only shown then.
+void FillPlaylistTracks(
+		not_null<Ui::VerticalLayout*> container,
+		const std::vector<RoomPlaylistTrack> &tracks,
+		Fn<void(FullMsgId)> chosen) {
+	if (tracks.empty()) {
+		AddPickEmptyLabel(container, tr::lng_oblivion_rmusic_playlist_empty());
+	}
+	for (const auto &track : tracks) {
+		const auto title = track.title.isEmpty()
+			? track.fileName
+			: track.title;
+		const auto state = track.ready
+			? QString()
+			: track.failed
+			? tr::lng_oblivion_rmusic_playlist_gone(tr::now)
+			: tr::lng_oblivion_rmusic_playlist_wait(tr::now);
+		const auto button = container->add(object_ptr<PickRow>(
+			container,
+			PickRowArgs{
+				.seed = track.performer + title,
+				.title = title,
+				.about = state.isEmpty()
+					? track.performer
+					: track.performer.isEmpty()
+					? state
+					: (track.performer + u" · "_q + state),
+				.aside = (track.duration > 0)
+					? FormatDuration(int64(track.duration) * 1000)
+					: QString(),
+				.faded = !track.ready,
+				.failed = !track.ready && track.failed,
+			}));
+		if (track.ready && chosen) {
+			const auto id = track.id;
+			button->setClickedCallback([=] {
+				chosen(id);
+			});
+		}
+	}
+}
+
 void PlaylistTracksBox(
 		not_null<Ui::GenericBox*> box,
 		base::weak_ptr<Room> weak,
@@ -1244,46 +1813,14 @@ void PlaylistTracksBox(
 		if (!session) {
 			return;
 		}
-		const auto tracks = RoomPlaylistTracks(session, playlistId);
-		if (tracks.empty()) {
-			container->add(
-				object_ptr<Ui::FlatLabel>(
-					container,
-					tr::lng_oblivion_rmusic_playlist_empty(),
-					st::boxDividerLabel),
-				st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
-		}
-		for (const auto &track : tracks) {
-			const auto line = track.performer.isEmpty()
-				? (track.title.isEmpty() ? track.fileName : track.title)
-				: (track.performer + u" — "_q + track.title);
-			const auto text = track.ready
-				? line
-				: track.failed
-				? tr::lng_oblivion_rmusic_playlist_unavailable(
-					tr::now,
-					lt_track,
-					line)
-				: tr::lng_oblivion_rmusic_playlist_loading(
-					tr::now,
-					lt_track,
-					line);
-			const auto button = container->add(
-				object_ptr<Ui::SettingsButton>(
-					container,
-					rpl::single(text),
-					st::settingsButtonNoIcon));
-			if (!track.ready) {
-				button->setAttribute(Qt::WA_TransparentForMouseEvents);
-				continue;
-			}
-			const auto id = track.id;
-			button->setClickedCallback([=] {
+		FillPlaylistTracks(
+			container,
+			RoomPlaylistTracks(session, playlistId),
+			[=](FullMsgId id) {
 				if (const auto room = weak.get()) {
 					AddItemDocument(room, id, show);
 				}
 			});
-		}
 		container->resizeToWidth(box->width());
 	};
 	fill();
@@ -1301,15 +1838,29 @@ void PlaylistTracksBox(
 			box->closeBox();
 			return;
 		}
-		auto added = 0;
+		// Only what can really go: the message is here, it has a music
+		// file and its chat lets the file be saved. The tracks wait in
+		// line inside the engine, none is dropped because the others are
+		// still being downloaded, and the toast says how many were taken.
+		const auto engine = room->music();
+		auto ids = std::vector<FullMsgId>();
 		for (const auto &track : RoomPlaylistTracks(session, playlistId)) {
-			if (track.ready && added < kBatchLimit) {
-				AddItemDocument(room, track.id, nullptr);
-				++added;
+			const auto item = track.ready
+				? session->data().message(track.id)
+				: nullptr;
+			if (item
+				&& MusicDocument(item)
+				&& !item->forbidsSaving()
+				&& int(ids.size()) < kBatchLimit) {
+				ids.push_back(track.id);
 			}
 		}
-		if (added) {
-			Toast(show, tr::lng_oblivion_rmusic_added_toast(tr::now));
+		const auto added = engine ? engine->addMessages(ids, show) : 0;
+		if (added > 0) {
+			Toast(show, tr::lng_oblivion_rmusic_batch_toast(
+				tr::now,
+				lt_count,
+				added));
 		}
 		box->closeBox();
 	});
@@ -1325,27 +1876,23 @@ void PlaylistsBox(
 	box->setWidth(st::boxWideWidth);
 	const auto container = box->verticalLayout();
 	if (list.empty()) {
-		container->add(
-			object_ptr<Ui::FlatLabel>(
-				container,
-				tr::lng_oblivion_rmusic_playlists_empty(),
-				st::boxDividerLabel),
-			st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
+		AddPickEmptyLabel(
+			container,
+			tr::lng_oblivion_rmusic_playlists_empty());
 	}
 	for (const auto &playlist : list) {
 		const auto id = playlist.id;
 		const auto name = playlist.name;
-		const auto text = name
-			+ u" · "_q
-			+ tr::lng_oblivion_playlists_tracks_count(
-				tr::now,
-				lt_count,
-				playlist.count);
-		const auto button = container->add(
-			object_ptr<Ui::SettingsButton>(
-				container,
-				rpl::single(text),
-				st::settingsButtonNoIcon));
+		const auto button = container->add(object_ptr<PickRow>(
+			container,
+			PickRowArgs{
+				.seed = u"playlist"_q + QString::number(id) + name,
+				.title = name,
+				.about = tr::lng_oblivion_playlists_tracks_count(
+					tr::now,
+					lt_count,
+					playlist.count),
+			}));
 		button->setClickedCallback([=] {
 			if (show && show->valid()) {
 				show->showBox(Box(PlaylistTracksBox, weak, id, name, show));
@@ -1408,7 +1955,7 @@ QueueList::QueueList(QWidget *parent, not_null<Room*> room)
 }
 
 int QueueList::uploadHeight() const {
-	return Scaled(46);
+	return rowHeight(); // The same rhythm as the tracks under them.
 }
 
 int QueueList::rowHeight() const {
@@ -1516,10 +2063,34 @@ void QueueList::paintEvent(QPaintEvent *e) {
 	const auto clip = e->rect();
 	const auto uploads = MusicUploads(_room);
 	const auto &data = _room->player(Kind::Music);
-	const auto left = Scaled(20);
-	const auto right = Scaled(16);
+	// The looks («Тема Oblivion»). With cards the list lies in the card of
+	// the queue and is narrower than the tab by its margins; the track
+	// that plays is the selected row of the look; «Тишина» rules the rows
+	// with hairlines.
+	const auto look = Look::Current();
+	const auto left = RoomContentPadding() - RoomCardMargin();
+	const auto right = left;
+	const auto coverSize = Scaled(38);
+	const auto coverRadius = CoverRadius(Scaled(8));
+	const auto selects = (look == Look::kNative)
+		|| (look == Look::kNightAir);
+	const auto lined = (look == Look::kSilence);
+	const auto underline = [&](const QRect &row) {
+		if (lined) {
+			Look::PaintDivider(
+				p,
+				QRectF(
+					left,
+					row.y() + row.height() - st::lineWidth,
+					width() - left - right,
+					st::lineWidth),
+				st::shadowFg->c);
+		}
+	};
 	auto top = 0;
 
+	// A file on its way to the room is a row like a track: in the place
+	// of the cover there is a ring that fills up as it is sent.
 	for (auto i = 0, count = int(uploads.size()); i != count; ++i) {
 		const auto &upload = uploads[i];
 		const auto height = uploadHeight();
@@ -1528,55 +2099,76 @@ void QueueList::paintEvent(QPaintEvent *e) {
 		if (!rect.intersects(clip)) {
 			continue;
 		}
-		const auto textWidth = width() - left - right - Scaled(40);
-		p.setFont(st::semiboldFont);
-		p.setPen(st::windowFg);
-		p.drawText(
-			left,
-			rect.y() + Scaled(8) + st::semiboldFont->ascent,
-			st::semiboldFont->elided(upload.title, textWidth));
+		const auto failed = upload.failed && !upload.error.isEmpty();
 		const auto percent = (upload.total > 0)
 			? int(std::clamp(
 				upload.ready * 100 / upload.total,
 				int64(0),
 				int64(100)))
 			: -1;
-		p.setFont(st::normalFont);
-		p.setPen(st::windowSubTextFg);
-		p.drawText(
+		const auto cover = QRect(
 			left,
-			rect.y() + Scaled(26) + st::normalFont->ascent,
-			(percent < 0)
-				? tr::lng_oblivion_rmusic_preparing(tr::now)
-				: tr::lng_oblivion_rmusic_uploading(
-					tr::now,
-					lt_percent,
-					QString::number(percent)));
-		const auto line = QRectF(
-			left,
-			rect.y() + height - Scaled(3),
-			textWidth,
-			Scaled(2));
+			rect.y() + (height - coverSize) / 2,
+			coverSize,
+			coverSize);
+		underline(rect);
 		p.setPen(Qt::NoPen);
-		p.setBrush(st::windowBgRipple);
-		p.drawRoundedRect(line, line.height() / 2., line.height() / 2.);
-		if (percent > 0) {
-			p.setBrush(st::windowBgActive);
-			p.drawRoundedRect(
-				QRectF(
-					line.x(),
-					line.y(),
-					line.width() * percent / 100.,
-					line.height()),
-				line.height() / 2.,
-				line.height() / 2.);
+		p.setBrush(RoomHoverColor());
+		p.drawRoundedRect(cover, coverRadius, coverRadius);
+		const auto ring = QRectF(cover).marginsRemoved(QMarginsF(
+			Scaled(10),
+			Scaled(10),
+			Scaled(10),
+			Scaled(10)));
+		if (failed) {
+			PaintGlyph(p, Glyph::Cross, ring, st::boxTextFgError->c);
+		} else {
+			auto track = st::windowSubTextFg->c;
+			track.setAlphaF(0.3);
+			auto pen = QPen(track, Scaled(2));
+			pen.setCapStyle(Qt::RoundCap);
+			p.setBrush(Qt::NoBrush);
+			p.setPen(pen);
+			p.drawEllipse(ring);
+			pen.setColor(st::windowBgActive->c);
+			p.setPen(pen);
+			// From the top, clockwise; a quarter while nothing is known.
+			p.drawArc(
+				ring,
+				90 * 16,
+				-((percent < 0) ? 90 : (percent * 360 / 100)) * 16);
 		}
+		const auto textLeft = cover.x() + coverSize + Scaled(12);
+		const auto textWidth = std::max(
+			width() - right - Scaled(30) - textLeft,
+			Scaled(40));
+		p.setFont(st::semiboldFont);
+		p.setPen(st::windowFg);
+		p.drawText(
+			textLeft,
+			rect.y() + Scaled(9) + st::semiboldFont->ascent,
+			st::semiboldFont->elided(upload.title, textWidth));
+		p.setFont(st::normalFont);
+		p.setPen(failed ? st::boxTextFgError : st::windowSubTextFg);
+		p.drawText(
+			textLeft,
+			rect.y() + Scaled(29) + st::normalFont->ascent,
+			st::normalFont->elided(
+				failed
+					? upload.error
+					: (percent < 0)
+					? tr::lng_oblivion_rmusic_preparing(tr::now)
+					: tr::lng_oblivion_rmusic_uploading(
+						tr::now,
+						lt_percent,
+						QString::number(percent)),
+				textWidth));
 		const auto over = (_over.upload == i) && _over.control;
 		PaintGlyph(
 			p,
 			Glyph::Cross,
 			QRectF(
-				width() - right - Scaled(26),
+				width() - right - Scaled(16),
 				rect.y() + (height - Scaled(20)) / 2.,
 				Scaled(20),
 				Scaled(20)),
@@ -1594,16 +2186,14 @@ void QueueList::paintEvent(QPaintEvent *e) {
 		}
 		const auto current = (item.id == currentId);
 		const auto over = (_over.row == i);
-		if (over || current) {
-			p.setPen(Qt::NoPen);
-			p.setBrush(st::windowBgOver);
-			p.drawRoundedRect(
-				QRectF(rect).marginsRemoved(
-					QMarginsF(Scaled(8), 1, Scaled(8), 1)),
-				Scaled(10),
-				Scaled(10));
+		const auto back = QRectF(rect).marginsRemoved(
+			QMarginsF(Scaled(8), 1, Scaled(8), 1));
+		if (current && selects) {
+			Look::PaintSelected(p, back, st::windowBgOver->c, Scaled(10));
+		} else if (over || (current && !lined)) {
+			PaintRoomHover(p, back);
 		}
-		const auto coverSize = Scaled(38);
+		underline(rect);
 		const auto cover = QRect(
 			left,
 			rect.y() + (height - coverSize) / 2,
@@ -1614,37 +2204,78 @@ void QueueList::paintEvent(QPaintEvent *e) {
 			cover,
 			item.cover.isEmpty() ? QImage() : _room->cover(item.cover),
 			item.media,
-			Scaled(8));
+			coverRadius);
 		if (current) {
+			// Over the picture of the cover, whatever the theme is.
 			p.setPen(Qt::NoPen);
 			p.setBrush(QColor(0, 0, 0, 110));
-			p.drawRoundedRect(cover, Scaled(8), Scaled(8));
-			PaintGlyph(
-				p,
-				_playing ? Glyph::Volume : Glyph::Pause,
-				QRectF(cover).marginsRemoved(QMarginsF(
-					Scaled(9),
-					Scaled(9),
-					Scaled(9),
-					Scaled(9))),
-				Qt::white);
+			p.drawRoundedRect(cover, coverRadius, coverRadius);
+			if (_playing) {
+				// The bars of an equaliser: «this one is on air».
+				const auto bar = double(Scaled(3));
+				const auto skip = double(Scaled(2));
+				const auto full = double(Scaled(14));
+				const auto barsLeft = cover.x()
+					+ (coverSize - 3 * bar - 2 * skip) / 2.;
+				const auto barsBottom = cover.y() + (coverSize + full) / 2.;
+				auto index = 0;
+				p.setBrush(Qt::white);
+				for (const auto part : { 0.55, 1., 0.75 }) {
+					p.drawRoundedRect(
+						QRectF(
+							barsLeft + index * (bar + skip),
+							barsBottom - full * part,
+							bar,
+							full * part),
+						bar / 2.,
+						bar / 2.);
+					++index;
+				}
+			} else {
+				PaintGlyph(
+					p,
+					Glyph::Pause,
+					QRectF(cover).marginsRemoved(QMarginsF(
+						Scaled(10),
+						Scaled(10),
+						Scaled(10),
+						Scaled(10))),
+					Qt::white);
+			}
 		}
 		const auto duration = FormatDuration(item.duration);
 		const auto durationWidth = st::normalFont->width(duration);
 		const auto dots = over;
+		const auto adder = _room->state().member(item.addedBy);
+		// Who has put the track on: a small userpic in a column of its
+		// own before the duration (while that member is in the room).
+		const auto who = Scaled(20);
+		const auto durationRight = width() - right - (dots ? Scaled(26) : 0);
+		const auto whoLeft = durationRight
+			- std::max(durationWidth, st::normalFont->width(u"00:00"_q))
+			- Scaled(8)
+			- who;
 		const auto textLeft = cover.x() + coverSize + Scaled(12);
-		const auto textRight = width()
-			- right
-			- durationWidth
-			- Scaled(dots ? 40 : 8);
+		const auto textRight = (adder
+			? whoLeft
+			: (durationRight - durationWidth)) - Scaled(8);
 		const auto textWidth = std::max(textRight - textLeft, Scaled(40));
+		if (adder) {
+			PaintUserpic(
+				p,
+				QRect(whoLeft, rect.y() + (height - who) / 2, who, who),
+				adder->id,
+				adder->name);
+		}
+		// «Ночной эфир» and «Тишина» mark the track that plays by its row
+		// and its cover, the title keeps the colour of the text.
+		const auto accented = current && !Look::CapsLabels();
 		p.setFont(st::semiboldFont);
-		p.setPen(current ? st::windowActiveTextFg : st::windowFg);
+		p.setPen(accented ? st::windowActiveTextFg : st::windowFg);
 		p.drawText(
 			textLeft,
 			rect.y() + Scaled(9) + st::semiboldFont->ascent,
 			st::semiboldFont->elided(item.title, textWidth));
-		const auto adder = _room->state().member(item.addedBy);
 		const auto sub = !item.performer.isEmpty()
 			? item.performer
 			: (adder && !adder->name.isEmpty())
@@ -1660,7 +2291,7 @@ void QueueList::paintEvent(QPaintEvent *e) {
 			rect.y() + Scaled(29) + st::normalFont->ascent,
 			st::normalFont->elided(sub, textWidth));
 		p.drawText(
-			width() - right - durationWidth - (dots ? Scaled(32) : 0),
+			durationRight - durationWidth,
 			rect.y() + (height - st::normalFont->height) / 2
 				+ st::normalFont->ascent,
 			duration);
@@ -1669,7 +2300,7 @@ void QueueList::paintEvent(QPaintEvent *e) {
 				p,
 				Glyph::More,
 				QRectF(
-					width() - right - Scaled(24),
+					width() - right - Scaled(18),
 					rect.y() + (height - Scaled(22)) / 2.,
 					Scaled(22),
 					Scaled(22)),
@@ -1694,8 +2325,11 @@ private:
 	void refreshControls();
 	void refreshPosition();
 	void updateLayout();
+	void applyLook();
 	[[nodiscard]] LocalStatus localStatus() const;
 	[[nodiscard]] QString statusText(const LocalStatus &status) const;
+	[[nodiscard]] int textsTop() const;
+	[[nodiscard]] int titleTop() const;
 	[[nodiscard]] bool checkControl();
 	void showAddMenu();
 	void showRowMenu(const QString &itemId);
@@ -1704,6 +2338,7 @@ private:
 	void addFiles();
 	void togglePlay();
 	void cycleRepeat();
+	void saveVolume(float64 value);
 
 	const not_null<Room*> _room;
 	const std::shared_ptr<Ui::Show> _show;
@@ -1719,14 +2354,19 @@ private:
 	QPointer<QueueList> _list;
 	base::unique_qptr<Ui::PopupMenu> _menu;
 	base::Timer _timer;
+	base::Timer _volumeTimer;
 	QRect _cover;
 	QRect _texts;
 	QRect _times;
 	QRect _queueHeader;
 	QRect _volumeIcon;
+	QRect _playerCard; // The cards of a look, see RoomHasCards().
+	QRect _queueCard;
 	float64 _seeking = -1.;
 	float64 _pendingSeek = -1.;
 	crl::time _pendingSeekTill = 0;
+	float64 _volumeWanted = -1.;
+	bool _rejoinRetries = false; // «Повторить загрузку», not «В эфир».
 
 };
 
@@ -1737,7 +2377,7 @@ MusicTab::MusicTab(
 : RpWidget(parent)
 , _room(room)
 , _show(std::move(show))
-, _seek(Ui::CreateChild<Ui::MediaSlider>(this, st::mediaPlayerPanelPlayback))
+, _seek(Ui::CreateChild<Ui::MediaSlider>(this, SeekStyle()))
 , _volume(Ui::CreateChild<Ui::MediaSlider>(
 	this,
 	st::mediaPlayerPanelPlayback))
@@ -1754,10 +2394,16 @@ MusicTab::MusicTab(
 	tr::lng_oblivion_rmusic_rejoin(),
 	st::defaultLightButton))
 , _scroll(Ui::CreateChild<Ui::ScrollArea>(this, st::boxScroll))
-, _timer([=] { refreshPosition(); }) {
+, _timer([=] { refreshPosition(); })
+, _volumeTimer([=] {
+	if (_volumeWanted >= 0.) {
+		saveVolume(base::take(_volumeWanted));
+	}
+}) {
 	_list = _scroll->setOwnedWidget(object_ptr<QueueList>(this, room));
 	_add->setFullRadius(true);
 	_rejoin->hide();
+	_play->setPrimary(true);
 
 	_seek->setAlwaysDisplayMarker(true);
 	_seek->setChangeProgressCallback([=](float64 value) {
@@ -1783,13 +2429,20 @@ MusicTab::MusicTab(
 	_volume->setAlwaysDisplayMarker(true);
 	_volume->setMoveByWheel(true);
 	_volume->setValue(Oblivion::Get().roomMusicVolume() / 100.);
-	const auto applyVolume = [=](float64 value) {
-		Oblivion::Get().setRoomMusicVolume(
-			int(base::SafeRound(std::clamp(value, 0., 1.) * 100.)));
-		update(_volumeIcon);
-	};
-	_volume->setChangeProgressCallback(applyVolume);
-	_volume->setChangeFinishedCallback(applyVolume);
+	// Every change of the setting writes the settings file: while the
+	// slider is dragged that is done a few times a second, not on every
+	// step, and once more when it is dropped.
+	_volume->setChangeProgressCallback([=](float64 value) {
+		_volumeWanted = value;
+		if (!_volumeTimer.isActive()) {
+			_volumeTimer.callOnce(kVolumeSaveDelay);
+		}
+	});
+	_volume->setChangeFinishedCallback([=](float64 value) {
+		_volumeTimer.cancel();
+		_volumeWanted = -1.;
+		saveVolume(value);
+	});
 
 	_play->setClickedCallback([=] { togglePlay(); });
 	_previous->setClickedCallback([=] {
@@ -1856,7 +2509,22 @@ MusicTab::MusicTab(
 		updateLayout();
 	}, lifetime());
 
+	// A look («Тема Oblivion») has its own cover, cards and bars.
+	Look::Updates(
+	) | rpl::on_next([=] {
+		applyLook();
+		refreshAll();
+	}, lifetime());
+	applyLook();
+
 	refreshAll();
+}
+
+void MusicTab::applyLook() {
+	// With a look on the tab paints both bars, see PaintLookSlider().
+	const auto own = !Look::Is(Look::kPlain);
+	_seek->disablePaint(own);
+	_volume->disablePaint(own);
 }
 
 LocalStatus MusicTab::localStatus() const {
@@ -1908,6 +2576,32 @@ QString MusicTab::statusText(const LocalStatus &status) const {
 	return QString();
 }
 
+// The lines next to the cover (the title, who plays it, the state or the
+// button that stands in its place) are centred against the cover: one
+// line of an empty player does not hang at its top.
+int MusicTab::textsTop() const {
+	const auto status = localStatus();
+	const auto button = (status.state == LocalState::Away)
+		|| (status.state == LocalState::Failed);
+	const auto line = !button && !statusText(status).isEmpty();
+	const auto block = NowLabelHeight()
+		+ NowTitleFont()->height
+		+ (_room->player(Kind::Music).current()
+			? (Scaled(4) + st::normalFont->height)
+			: 0)
+		+ (button
+			? (Scaled(2) + _rejoin->height())
+			: line
+			? (Scaled(6) + st::normalFont->height)
+			: 0);
+	return _cover.y() + std::max((_cover.height() - block) / 2, Scaled(2));
+}
+
+// Under the «сейчас играет» of «Тишина», when it is there.
+int MusicTab::titleTop() const {
+	return textsTop() + NowLabelHeight();
+}
+
 bool MusicTab::checkControl() {
 	if (_room->can(Right::Control)) {
 		return true;
@@ -1927,6 +2621,12 @@ void MusicTab::togglePlay() {
 	} else {
 		_room->play(Kind::Music);
 	}
+}
+
+void MusicTab::saveVolume(float64 value) {
+	Oblivion::Get().setRoomMusicVolume(
+		int(base::SafeRound(std::clamp(value, 0., 1.) * 100.)));
+	update(_volumeIcon);
 }
 
 void MusicTab::cycleRepeat() {
@@ -1965,10 +2665,23 @@ void MusicTab::refreshControls() {
 		: Glyph::Repeat);
 	_repeat->setHighlighted(data.state.repeat != Repeat::Off);
 	_seek->setDisabled(!control || !data.current());
+	// No track: a clean empty bar, without the stub that the place of
+	// the marker leaves at its start.
+	_seek->setAlwaysDisplayMarker(data.current() != nullptr);
 	_add->setVisible(_room->can(Right::Add));
+	// The same button brings back to the air and, when the file of the
+	// track could not be brought, asks for it once more.
 	const auto away = (status.state == LocalState::Away);
-	if (_rejoin->isHidden() == away) {
-		_rejoin->setVisible(away);
+	const auto failed = (status.state == LocalState::Failed);
+	if (failed != _rejoinRetries && (failed || away)) {
+		_rejoinRetries = failed;
+		_rejoin->setText(failed
+			? tr::lng_oblivion_rmusic_retry()
+			: tr::lng_oblivion_rmusic_rejoin());
+	}
+	const auto offered = away || failed;
+	if (_rejoin->isHidden() == offered) {
+		_rejoin->setVisible(offered);
 		updateLayout();
 	}
 	if (_list) {
@@ -2003,22 +2716,32 @@ void MusicTab::refreshPosition() {
 }
 
 void MusicTab::updateLayout() {
-	const auto pad = Scaled(20);
+	// The looks («Тема Oblivion»): with cards the player and the queue are
+	// two cards on the page, the content keeps its place inside them.
+	const auto look = Look::Current();
+	const auto cards = RoomHasCards();
+	const auto margin = RoomCardMargin();
+	const auto pad = RoomContentPadding();
 	const auto w = width();
 	if (w <= 0) {
 		return;
 	}
 	const auto narrow = (w < Scaled(480));
-	const auto coverSize = Scaled(narrow ? 76 : 104);
-	_cover = QRect(pad, pad, coverSize, coverSize);
+	// «Ночной эфир» has a round cover in a ring, the ring stands around
+	// the picture; «Тишина» has a bigger square one.
+	const auto ring = (look == Look::kNightAir) ? Scaled(kCoverRing) : 0;
+	const auto coverSize = (look == Look::kSilence)
+		? Scaled(narrow ? kSilenceCover : kSilenceCoverWide)
+		: (Scaled(narrow ? 76 : 104) + 2 * ring);
+	const auto top = cards ? (margin + Scaled(16)) : pad;
+	_cover = QRect(pad, top, coverSize, coverSize);
 	const auto textLeft = _cover.x() + coverSize + Scaled(16);
-	_texts = QRect(textLeft, pad, w - textLeft - pad, coverSize);
+	_texts = QRect(textLeft, top, w - textLeft - pad, coverSize);
 	// «Вернуться в эфир» takes the place of the state line.
 	_rejoin->moveToLeft(
 		textLeft - Scaled(2),
-		pad
-			+ Scaled(4)
-			+ TitleFont()->height
+		titleTop()
+			+ NowTitleFont()->height
 			+ Scaled(4)
 			+ st::normalFont->height
 			+ Scaled(2),
@@ -2033,30 +2756,34 @@ void MusicTab::updateLayout() {
 		w - 2 * pad,
 		st::normalFont->height);
 
+	// «Play» with its two neighbours stands in the middle of the window,
+	// the repeat mode and the volume take the edges. In a narrow window
+	// the middle moves a little to the left, away from the volume.
 	const auto controlsTop = _times.y() + _times.height() + Scaled(6);
 	const auto gap = Scaled(narrow ? 6 : 12);
-	const auto controlsWidth = _repeat->width()
-		+ _previous->width()
-		+ _play->width()
-		+ _next->width()
-		+ 3 * gap;
 	const auto volumeWidth = Scaled(narrow ? 70 : 96);
 	const auto volumeIcon = Scaled(24);
-	const auto centered = (w - controlsWidth) / 2;
 	const auto volumeLeft = w - pad - volumeWidth;
-	auto left = (centered + controlsWidth + Scaled(12)
-		> volumeLeft - volumeIcon - Scaled(6))
-		? pad
-		: centered;
+	const auto half = _play->width() / 2;
+	const auto repeatLeft = pad - Scaled(7); // Its glyph starts at pad.
+	const auto center = std::max(
+		std::min(
+			w / 2,
+			volumeLeft
+				- volumeIcon
+				- Scaled(6)
+				- Scaled(8)
+				- _next->width()
+				- gap
+				- half),
+		repeatLeft + _repeat->width() + _previous->width() + gap + half);
 	const auto middle = controlsTop + _play->height() / 2;
-	const auto place = [&](not_null<GlyphButton*> button) {
-		button->move(left, middle - button->height() / 2);
-		left += button->width() + gap;
-	};
-	place(_repeat);
-	place(_previous);
-	place(_play);
-	place(_next);
+	_repeat->move(repeatLeft, middle - _repeat->height() / 2);
+	_previous->move(
+		center - half - gap - _previous->width(),
+		middle - _previous->height() / 2);
+	_play->move(center - half, middle - _play->height() / 2);
+	_next->move(center + half + gap, middle - _next->height() / 2);
 	_volume->setGeometry(
 		volumeLeft,
 		middle - seekHeight / 2,
@@ -2068,7 +2795,23 @@ void MusicTab::updateLayout() {
 		volumeIcon,
 		volumeIcon);
 
-	const auto headerTop = controlsTop + _play->height() + Scaled(14);
+	const auto playerBottom = controlsTop + _play->height() + Scaled(14);
+	auto headerTop = playerBottom;
+	_playerCard = _queueCard = QRect();
+	if (cards) {
+		const auto queueTop = playerBottom + margin;
+		_playerCard = QRect(
+			margin,
+			margin,
+			w - 2 * margin,
+			playerBottom - margin);
+		_queueCard = QRect(
+			margin,
+			queueTop,
+			w - 2 * margin,
+			std::max(height() - margin - queueTop, 0));
+		headerTop = queueTop + Scaled(8);
+	}
 	const auto headerHeight = std::max(_add->height(), Scaled(34));
 	_queueHeader = QRect(pad, headerTop, w - 2 * pad, headerHeight);
 	_add->moveToRight(
@@ -2076,9 +2819,22 @@ void MusicTab::updateLayout() {
 		headerTop + (headerHeight - _add->height()) / 2,
 		w);
 	const auto scrollTop = headerTop + headerHeight + Scaled(6);
-	_scroll->setGeometry(0, scrollTop, w, std::max(height() - scrollTop, 0));
+	if (cards) {
+		// The list ends before the round corners of its card.
+		_scroll->setGeometry(
+			margin,
+			scrollTop,
+			w - 2 * margin,
+			std::max(height() - margin - Scaled(8) - scrollTop, 0));
+	} else {
+		_scroll->setGeometry(
+			0,
+			scrollTop,
+			w,
+			std::max(height() - scrollTop, 0));
+	}
 	if (_list) {
-		_list->resizeToWidth(w);
+		_list->resizeToWidth(_scroll->width());
 	}
 }
 
@@ -2089,22 +2845,54 @@ void MusicTab::resizeEvent(QResizeEvent *e) {
 void MusicTab::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
-	p.fillRect(e->rect(), st::windowBg);
+	PaintRoomGround(p, this, e->rect());
+
+	// The looks («Тема Oblivion»): the cards under the player and the
+	// queue, or the hairline of «Тишина» between them.
+	const auto look = Look::Current();
+	PaintRoomCard(p, _playerCard);
+	PaintRoomCard(p, _queueCard);
+	if (look == Look::kSilence) {
+		Look::PaintDivider(
+			p,
+			QRectF(
+				_queueHeader.x(),
+				_queueHeader.y() - Scaled(7),
+				_queueHeader.width(),
+				st::lineWidth),
+			st::shadowFg->c);
+	}
 
 	const auto &data = _room->player(Kind::Music);
 	const auto current = data.current();
+	// «Ночной эфир»: a round picture in the gradient ring.
+	const auto ring = (look == Look::kNightAir) ? Scaled(kCoverRing) : 0;
+	const auto picture = _cover.marginsRemoved({ ring, ring, ring, ring });
+	if (ring > 0) {
+		Look::PaintCoverRing(p, QRectF(picture));
+	}
 	PaintCover(
 		p,
-		_cover,
+		picture,
 		(current && !current->cover.isEmpty())
 			? _room->cover(current->cover)
 			: QImage(),
 		current ? current->media : QString(),
-		Scaled(14));
+		(ring > 0) ? (picture.width() / 2) : Scaled(14));
 
 	const auto status = localStatus();
-	const auto &titleFont = TitleFont();
-	auto top = _texts.y() + Scaled(4);
+	const auto &titleFont = NowTitleFont();
+	auto top = textsTop();
+	if (const auto label = NowLabelHeight()) {
+		PaintRoomLabel(
+			p,
+			_texts.x(),
+			top,
+			tr::lng_oblivion_look_room_now_playing(tr::now),
+			_texts.width(),
+			st::windowSubTextFg->c);
+		top += label;
+	}
 	p.setFont(titleFont);
 	p.setPen(st::windowFg);
 	p.drawText(
@@ -2132,10 +2920,14 @@ void MusicTab::paintEvent(QPaintEvent *e) {
 			_texts.x(),
 			top + st::normalFont->ascent,
 			st::normalFont->elided(sub, _texts.width()));
+		top += st::normalFont->height;
 	}
-	top += st::normalFont->height + Scaled(6);
+	top += Scaled(6);
 	const auto text = statusText(status);
-	if (!text.isEmpty() && status.state != LocalState::Away) {
+	// Away and Failed: the button stands in the place of this line.
+	if (!text.isEmpty()
+		&& status.state != LocalState::Away
+		&& status.state != LocalState::Failed) {
 		const auto good = (status.state == LocalState::Synced)
 			|| (status.state == LocalState::Catching);
 		const auto bad = (status.state == LocalState::Failed);
@@ -2152,7 +2944,10 @@ void MusicTab::paintEvent(QPaintEvent *e) {
 			top + (st::normalFont->height - dot) / 2.,
 			dot,
 			dot));
-		p.setPen(color);
+		// «Тишина» keeps the colour for the dot, the line is quiet.
+		p.setPen((good && look == Look::kSilence)
+			? st::windowSubTextFg->c
+			: color);
 		p.drawText(
 			_texts.x() + dot + Scaled(6),
 			top + st::normalFont->ascent,
@@ -2186,23 +2981,44 @@ void MusicTab::paintEvent(QPaintEvent *e) {
 		_volumeIcon,
 		st::windowSubTextFg->c);
 
+	if (look != Look::kPlain) {
+		// The sliders are silent then, see applyLook(). The marker of the
+		// seek bar is shown when Ui::MediaSlider would show it: to
+		// somebody who can move it.
+		const auto movable = current && _room->can(Right::Control);
+		PaintLookSlider(
+			p,
+			_seek->geometry(),
+			_seek->value(),
+			true,
+			(current != nullptr),
+			movable);
+		PaintLookSlider(
+			p,
+			_volume->geometry(),
+			_volume->value(),
+			false,
+			true,
+			true);
+	}
+
 	// The header of the queue.
 	const auto count = int(data.queue.size());
-	p.setFont(st::semiboldFont);
-	p.setPen(st::windowFg);
-	const auto header = tr::lng_oblivion_rmusic_queue(tr::now);
 	const auto headerTop = _queueHeader.y()
-		+ (_queueHeader.height() - st::semiboldFont->height) / 2
-		+ st::semiboldFont->ascent;
-	p.drawText(_queueHeader.x(), headerTop, header);
+		+ (_queueHeader.height() - st::semiboldFont->height) / 2;
+	const auto headerWidth = PaintRoomLabel(
+		p,
+		_queueHeader.x(),
+		headerTop,
+		tr::lng_oblivion_rmusic_queue(tr::now),
+		_queueHeader.width(),
+		st::windowFg->c);
 	if (count > 0) {
 		p.setFont(st::normalFont);
 		p.setPen(st::windowSubTextFg);
 		p.drawText(
-			_queueHeader.x()
-				+ st::semiboldFont->width(header)
-				+ Scaled(8),
-			headerTop,
+			_queueHeader.x() + headerWidth + Scaled(8),
+			headerTop + st::semiboldFont->ascent,
 			QString::number(count));
 	}
 
@@ -2282,15 +3098,18 @@ void MusicTab::showRowMenu(const QString &itemId) {
 		return;
 	}
 	const auto &item = data.queue[index];
-	const auto count = int(data.queue.size());
-	const auto currentIndex = data.indexOf(data.state.itemId);
 	_menu = base::make_unique_q<Ui::PopupMenu>(this, st::popupMenuWithIcons);
 	const auto room = _room;
-	const auto move = [=](int to) {
-		const auto from = room->player(Kind::Music).indexOf(itemId);
-		if (from >= 0) {
-			room->moveItem(Kind::Music, from, to);
-		}
+	// Which actions are offered is decided by the queue as it is now,
+	// where the track goes is counted when the action is clicked: the
+	// queue may change while the menu is open.
+	const auto can = [&](QueueMove how) {
+		return MoveIndexes(data, itemId, how).first >= 0;
+	};
+	const auto move = [=](QueueMove how) {
+		return [=] {
+			room->moveItem(Kind::Music, itemId, how);
+		};
 	};
 	if (_room->can(Right::Control)) {
 		_menu->addAction(
@@ -2299,27 +3118,22 @@ void MusicTab::showRowMenu(const QString &itemId) {
 			&st::menuIconSoundOn);
 	}
 	if (_room->can(Right::Queue)) {
-		if (currentIndex >= 0
-			&& index != currentIndex
-			&& index != currentIndex + 1) {
-			const auto to = (index < currentIndex)
-				? currentIndex
-				: (currentIndex + 1);
+		if (can(QueueMove::Next)) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_next(tr::now),
-				[=] { move(to); },
+				move(QueueMove::Next),
 				&st::menuIconRestore);
 		}
-		if (index > 0) {
+		if (can(QueueMove::Up)) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_up(tr::now),
-				[=] { move(index - 1); },
+				move(QueueMove::Up),
 				&st::menuIconAbove);
 		}
-		if (index + 1 < count) {
+		if (can(QueueMove::Down)) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_down(tr::now),
-				[=] { move(index + 1); },
+				move(QueueMove::Down),
 				&st::menuIconBelow);
 		}
 	}
@@ -2400,6 +3214,95 @@ void MusicTab::addFiles() {
 			}
 		}));
 }
+
+// ---- Snapshot scenes (OBLIVION_SELFTEST=ui): the boxes of «Добавить» →
+// «Из плейлиста Oblivion…». The tab itself is in the scenes of the window.
+
+const auto MusicSnapshotScenes = SelfTest::SceneRegistrar([] {
+	using namespace SelfTest;
+
+	const auto text = [](const char *ru, const char *en) {
+		return QString::fromUtf8(CurrentLanguageIsRussian() ? ru : en);
+	};
+	const auto size = QSize(st::boxWideWidth * 2, 0);
+	RegisterBoxScene(u"room_music_playlists_box"_q, size, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(
+			PlaylistsBox,
+			base::weak_ptr<Room>(),
+			std::vector<RoomPlaylistBrief>{
+				{
+					.id = 1,
+					.name = text("Ночные поездки", "Night rides"),
+					.count = 24,
+				},
+				{
+					.id = 2,
+					.name = text("Русский рок", "Russian rock"),
+					.count = 112,
+				},
+				{
+					.id = 3,
+					.name = text("Для работы", "For work"),
+					.count = 5,
+				},
+			},
+			show);
+	});
+	RegisterBoxScene(u"room_music_playlists_box_empty"_q, size, [](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(
+			PlaylistsBox,
+			base::weak_ptr<Room>(),
+			std::vector<RoomPlaylistBrief>(),
+			show);
+	});
+	// The real box takes the tracks from the session, this one shows the
+	// same rows with every state of a track.
+	RegisterBoxScene(u"room_music_tracks_box"_q, size, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Box([=](not_null<Ui::GenericBox*> box) {
+			box->setTitle(rpl::single(text("Ночные поездки", "Night rides")));
+			box->setWidth(st::boxWideWidth);
+			FillPlaylistTracks(box->verticalLayout(), {
+				{
+					.title = u"Midnight City"_q,
+					.performer = u"M83"_q,
+					.duration = 243,
+					.ready = true,
+				},
+				{
+					.title = text(
+						"Звезда по имени Солнце",
+						"A Star Called Sun"),
+					.performer = text("Кино", "Kino"),
+					.duration = 225,
+					.ready = true,
+				},
+				{
+					.title = text("Запись с репетиции", "Rehearsal take"),
+					.duration = 95,
+					.ready = true,
+				},
+				{
+					.title = u"Instant Crush"_q,
+					.performer = u"Daft Punk"_q,
+					.duration = 337,
+				},
+				{
+					.title = u"Let It Happen"_q,
+					.performer = u"Tame Impala"_q,
+					.duration = 467,
+					.failed = true,
+				},
+			}, nullptr);
+			box->addButton(tr::lng_oblivion_rmusic_playlist_add_all(), [=] {
+				box->closeBox();
+			});
+			box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+		});
+	});
+});
 
 // ---- OBLIVION_SELFTEST=room_sync.
 
@@ -2671,6 +3574,60 @@ void TestCorrector(Checker &check) {
 	}
 }
 
+void TestStops(Checker &check) {
+	// The end of a track: first "stopped at the end", then the player is
+	// cleared and says plainly "stopped" about the same track.
+	check(ClassifyStop(true, false, false) == StopKind::Ended,
+		"the end of a track is the end");
+	check(ClassifyStop(true, false, true) == StopKind::Ended,
+		"the end seen twice is still the end");
+	check(ClassifyStop(false, false, true) == StopKind::AfterEnd,
+		"a plain stop after the end is not the user");
+	// Stop of a media key: a plain stop with no end before it. That one
+	// leaves the air, the engine does not start the track again.
+	check(ClassifyStop(false, false, false) == StopKind::ByUser,
+		"a plain stop out of nowhere is the user's stop");
+	check(ClassifyStop(false, true, false) == StopKind::Failed
+		&& ClassifyStop(false, true, true) == StopKind::Failed,
+		"a player error is never the user's stop");
+
+	// A file that ends a bit before its time by the room: the last
+	// moments belong to the server, nothing is started again.
+	const auto duration = int64(200'000);
+	const auto state = TestState(true, 0, kBase);
+	const auto early = kBase + duration - 900;
+	check(PositionAt(state, duration, early) >= duration - kEndSlack,
+		"a second before the end is within the slack");
+	check(!PlanStart(state, duration, early, 120).over,
+		"and it is not the end by the plan yet");
+	check(PositionAt(state, duration, kBase + 60'000) < duration - kEndSlack,
+		"the middle of a track is not");
+}
+
+// The bars a look paints by itself («Тема Oblivion»): the played part
+// ends where the slider that takes the mouse keeps its marker.
+void TestSlider(Checker &check) {
+	check(SliderFill(0., 300, 9) == 5 && SliderFill(1., 300, 9) == 296,
+		"the marker stays inside the bar at both ends");
+	check(SliderFill(0.5, 300, 9) == 150,
+		"the middle of the bar is the middle");
+	check(SliderFill(0., 300, 0) == 0 && SliderFill(1., 300, 0) == 300,
+		"a bar without a marker is filled from edge to edge");
+	check(SliderFill(-1., 300, 9) == SliderFill(0., 300, 9)
+		&& SliderFill(7., 300, 9) == SliderFill(1., 300, 9),
+		"a value out of range is clamped");
+	auto last = -1;
+	auto monotone = true;
+	for (auto i = 0; i <= 100; ++i) {
+		const auto now = SliderFill(i / 100., 300, 9);
+		monotone = monotone && (now >= last);
+		last = now;
+	}
+	check(monotone, "the played part never goes back as the value grows");
+	check(SliderFill(0.5, 0, 9) == 0 && SliderFill(0.5, 5, 9) == 3,
+		"a bar shorter than the marker does not break");
+}
+
 } // namespace
 
 object_ptr<Ui::RpWidget> CreateMusicTab(
@@ -2688,6 +3645,10 @@ bool RunSyncSelfTest(QStringList &log) {
 	check.section("start plan");
 	TestCorrector(check);
 	check.section("corrector");
+	TestStops(check);
+	check.section("stops and ends");
+	TestSlider(check);
+	check.section("look slider");
 	log.push_back(u"room_sync: %1 checks, %2 failed"_q.arg(
 		QString::number(check.passed() + check.failed()),
 		QString::number(check.failed())));

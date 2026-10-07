@@ -610,6 +610,16 @@ public:
 		apply(_sendWhenOnlineHours, int64(std::clamp(value, 1, 168)));
 	}
 	// Round 5: send online end.
+	// Oblivion looks: core.
+	// «Тема Oblivion» (oblivion_look.h): 0 is the plain Telegram, 1..3
+	// are the looks. A number that is not a look means 0.
+	[[nodiscard]] int look() const {
+		return int(_look);
+	}
+	void setLook(int value) {
+		apply(_look, int64((value >= 0 && value <= 3) ? value : 0));
+	}
+	// Oblivion looks: core end.
 
 	[[nodiscard]] rpl::producer<> changes() const;
 
@@ -707,6 +717,9 @@ private:
 	bool _sendWhenOnline = true;
 	int64 _sendWhenOnlineHours = 24;
 	// Round 5: send online end.
+	// Oblivion looks: core.
+	int64 _look = 0;
+	// Oblivion looks: core end.
 
 	rpl::event_stream<> _changes;
 

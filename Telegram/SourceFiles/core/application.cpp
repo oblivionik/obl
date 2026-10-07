@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/application.h"
 
 #include "oblivion/oblivion_app_icon.h"
+#include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_listen.h"
 #include "oblivion/oblivion_lottie_editor.h"
 #include "oblivion/oblivion_room.h"
@@ -1867,6 +1868,11 @@ bool Application::readyToQuit() {
 	}
 	// Oblivion: the "ended" edit of a hosted listening together session.
 	if (Oblivion::Listen::IsQuitPrevent()) {
+		prevented = true;
+	}
+	// Oblivion: the track told to the audience of Oblivion Cloud
+	// («слушает») is taken back, see Oblivion::Social::IsQuitPrevent().
+	if (Oblivion::Social::IsQuitPrevent()) {
 		prevented = true;
 	}
 	if (_domain->started()) {

@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_selftest.h"
 
 #include "core/launcher.h"
+#include "oblivion/oblivion_app_icon.h"
 #include "oblivion/oblivion_attach_tools.h"
 #include "oblivion/oblivion_audio.h"
 #include "oblivion/oblivion_badge.h"
@@ -18,7 +19,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_cloud_sync.h"
 #include "oblivion/oblivion_deleted_search.h"
 #include "oblivion/oblivion_ghost_button.h"
+#include "oblivion/oblivion_hub.h"
 #include "oblivion/oblivion_listen.h"
+#include "oblivion/oblivion_look.h"
+#include "oblivion/oblivion_look_hooks.h"
 #include "oblivion/oblivion_lottie.h"
 #include "oblivion/oblivion_lottie_doc.h"
 #include "oblivion/oblivion_lottie_editor_masks.h"
@@ -109,6 +113,14 @@ struct Test {
 		{ u"deleted_search"_q, &DeletedSearch::RunSelfTest },
 		{ u"send_online"_q, &SendOnline::RunSelfTest },
 		{ u"stats_export"_q, &StatsExport::RunSelfTest },
+		// Oblivion looks: icons.
+		{ u"app_icon"_q, &RunAppIconSelfTest },
+		// Oblivion looks: core.
+		{ u"look"_q, &Look::RunSelfTest },
+		// Oblivion looks: hub.
+		{ u"hub"_q, &Hub::RunSelfTest },
+		// Oblivion looks: upstream.
+		{ u"look_hooks"_q, &Look::RunHooksSelfTest },
 		{ u"ui"_q, &SelfTest::RunUiSnapshots, true },
 	};
 }

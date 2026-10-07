@@ -103,6 +103,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_domain.h"
 #include "main/main_session.h"
 #include "main/main_session_settings.h"
+#include "oblivion/oblivion_look.h"
 #include "lang/lang_keys.h"
 #include "apiwrap.h"
 #include "api/api_chat_invite.h"
@@ -1583,6 +1584,11 @@ SessionController::SessionController(
 				Theme::CheckChatThemeWallPaper(this);
 			}
 		}
+	}, _lifetime);
+	// Oblivion: the chat background and the bubbles of a look.
+	Oblivion::Look::Updates(
+	) | rpl::on_next([=] {
+		pushDefaultChatBackground();
 	}, _lifetime);
 	if (_isPrimary) {
 		crl::on_main(base::make_weak(this), [=] {
@@ -3647,6 +3653,12 @@ void SessionController::pushDefaultChatBackground() {
 		.isPattern = paper.isPattern(),
 		.tile = background->tile(),
 	});
+	// Oblivion: a look has its own chat background, shown only while
+	// the user has not chosen a wallpaper, see oblivion_look.h.
+	if (auto look = Ui::ChatThemeBackground()
+		; Oblivion::Look::ChatBackground(look)) {
+		_defaultChatTheme->setBackground(std::move(look));
+	}
 	const auto &cloud = background->themeObject().cloud;
 	auto bubbles = Ui::ChatThemeBubblesData();
 	if (!cloud.emoticon.isEmpty()) {
@@ -3656,6 +3668,10 @@ void SessionController::pushDefaultChatBackground() {
 		if (variant) {
 			bubbles = Theme::PrepareBubblesData(cloud, *variant);
 		}
+	}
+	if (bubbles.colors.empty()) {
+		// Oblivion: and the gradient of the outgoing bubbles.
+		bubbles.colors = Oblivion::Look::ChatBubbles();
 	}
 	if (bubbles.colors != _defaultChatThemeBubblesColors) {
 		_defaultChatThemeBubblesColors = bubbles.colors;

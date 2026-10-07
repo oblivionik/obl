@@ -45,7 +45,10 @@ struct Me;
 //    chats and the contacts of the account on this device: no id of a
 //    contact or of a chat is ever sent to the server;
 //  - the activity (GET /v1/activity and the "activity" events): kept in
-//    memory only, forgotten when the connection is lost;
+//    memory only, forgotten when the connection is lost. It is asked again
+//    every few minutes and «слушает» nobody has confirmed for longer than
+//    the server keeps it is dropped, so a chip never outlives what the
+//    server shows by more than that;
 //  - GET /v1/users/{id} is sent only after a click (the list of public
 //    playlists and presets) and only for an id from the cached directory.
 //
@@ -53,7 +56,9 @@ struct Me;
 // chips, the chosen people) belongs to one Telegram account: it is read
 // from Cloud::Account::me() and changed by PATCH /v1/me from a click in
 // the window of that account. A switch flipped in one account publishes
-// nothing about the others.
+// nothing about the others. The switches show what the server holds: an
+// account that is switched off («Отключиться») keeps its badge and its
+// profile on the server, so they are shown as they were left there.
 namespace Oblivion::Social {
 
 // Called by Cloud::SessionStarted() / Cloud::SessionLoggedOut().
@@ -112,13 +117,30 @@ struct Activity {
 
 // A playlist or a preset of an owner: what is public in a profile, or the
 // own ones in the editor of the profile.
+//
+// Two things are kept apart here, because they are seen by different
+// people:
+//  - "shown": listed in the profile of the owner, for the audience of
+//    that profile only;
+//  - "listed" (presets): in the gallery «Общие наборы», where everybody
+//    who uses Oblivion sees the preset together with the name of its
+//    owner, whoever the profile is open to.
+// For a playlist the server has one flag, "public", and it means the
+// profile. For a preset "public" means the gallery. A server that keeps
+// a flag of its own for the profile of a preset says so by a boolean
+// "profile" in the preset: then profileSwitch is true and the two are
+// changed apart. Without it the profile shows exactly the presets of the
+// gallery, "shown" only repeats "listed" and can't be changed by itself:
+// the switch «Показывать в профиле» never publishes a preset.
 struct SharedItem {
 	QString id;
 	bool playlist = false; // false: a preset of effects.
 	QString title;
 	QString kind; // A preset: "photo" or "video".
 	int count = 0; // A playlist: the number of tracks.
-	bool shown = false; // "public": listed in the profile of the owner.
+	bool shown = false;
+	bool listed = false;
+	bool profileSwitch = false;
 
 	friend inline bool operator==(
 		const SharedItem&,
@@ -133,7 +155,9 @@ enum class Status {
 };
 
 // Cheap lookups in what is kept in memory, main thread, nothing is sent.
-// All of them answer "nothing" while the account is not connected.
+// About other people all of them answer "nothing" while the account is
+// not connected. The own badge and the own profile are what the server
+// has, also for an account that is switched off: they stay public there.
 [[nodiscard]] bool BadgeListed(
 	not_null<Main::Session*> session,
 	uint64 userId);
@@ -158,9 +182,16 @@ enum class Status {
 // From a click («Друзья в Oblivion» was opened): the directory and the
 // activity are asked now, not more often than once in several seconds.
 void Refresh(not_null<Main::Session*> session);
+// A profile was opened: the activity is asked again (one request without
+// any id in it, not more often than once a minute), so the chips of the
+// page are what the server shows now.
+void RefreshActivity(not_null<Main::Session*> session);
 
 // The public playlists and presets of a person from the directory, asked
-// after a click. The callbacks may outlive the widget: guard them.
+// after a click. The callbacks may outlive the widget: guard them. One of
+// the two is always called (from the event loop when nothing was sent),
+// unless the account is disconnected while the request is on its way:
+// then nothing comes back, see Cloud::Account.
 void LoadShared(
 	not_null<Main::Session*> session,
 	uint64 userId,
@@ -171,12 +202,69 @@ void LoadOwnShared(
 	not_null<Main::Session*> session,
 	Fn<void(std::vector<SharedItem>)> done,
 	Fn<void(const Cloud::Error&)> fail);
+// «Показывать в профиле». For a preset it is sent only to a server that
+// keeps the profile apart from the gallery (item.profileSwitch): it
+// never touches "public" of a preset. done gets the item as the server
+// has it after the change.
 void SetSharedShown(
 	not_null<Main::Session*> session,
 	const SharedItem &item,
 	bool shown,
-	Fn<void()> done,
+	Fn<void(SharedItem)> done,
 	Fn<void(const Cloud::Error&)> fail);
+// «Показывать всем в «Общих наборах»»: "public" of a preset. Switching
+// it on is a public statement, the UI asks before it.
+void SetPresetListed(
+	not_null<Main::Session*> session,
+	const SharedItem &item,
+	bool listed,
+	Fn<void(SharedItem)> done,
+	Fn<void(const Cloud::Error&)> fail);
+
+// ---- Leaving.
+//
+// The server shows the chips of a device only while that device has an
+// event stream and forgets them by itself a few seconds after the stream
+// is closed (limits.presence_grace_ms of the server, 8 seconds), whatever
+// has closed it: «Отключиться», a logout, the quit, a crash, a lost
+// connection. That alone ends every chip, and for «в Oblivion» and «в
+// комнате» there is nothing else. The track of «слушает» is not left up
+// even for those seconds where a request can still be sent: it is taken
+// back by one PUT /v1/me/activity {"listening": null} before the stream
+// is closed. There are two such places, each with a function of its own
+// that is to be called from exactly one spot:
+//
+//  - StopPublishing(): for the click on «Отключиться», from the
+//    confirmation in Cloud::ToggleFromSettings() (oblivion_cloud_ui.cpp),
+//    in place of Cloud::Account::switchOff(): the account is switched
+//    off from done. done is called once, on the main thread and never
+//    from inside this call: when the server has answered, in 1.2 seconds
+//    at the latest, on the next turn of the event loop when there is
+//    nothing to take back, and at once when the account goes away
+//    before that (a logout or the quit: from Forget() or from the
+//    destructor of the model, the Cloud::Account is still alive then).
+//    Only a session that was logged out before the call gets no done:
+//    it has no account to switch off. done must do nothing but switch
+//    the account off and tell the user;
+//  - IsQuitPrevent(): for Core::Application::readyToQuit(), next to
+//    Oblivion::Listen::IsQuitPrevent(), one call for all the accounts.
+//    The first call sends the stop of every account that has a track
+//    told, and the answer is waited for the way Telegram waits for its
+//    own «не в сети» there: the windows are hidden at once, the call is
+//    true till the answer has come (1.2 seconds at the latest, the app
+//    itself gives a second and a half to everything together), then
+//    Core::App().quitPreventFinished() is called and the call is false
+//    for good. This is the one place where Oblivion Cloud is waited
+//    for on the way out, and only for this one request;
+//  - a logout of Telegram can't wait and sends nothing from here: the key
+//    of the device is revoked right away, see Cloud::SessionLoggedOut().
+//
+// Nothing is sent and nothing waits when no track was told and when the
+// event stream is not open: a server that can't be reached is never
+// waited for, neither by the click nor by the quit (it does not show the
+// track of a device without a stream anyway).
+void StopPublishing(not_null<Main::Session*> session, Fn<void()> done);
+[[nodiscard]] bool IsQuitPrevent();
 
 // ---- What is public about the own account.
 
@@ -186,8 +274,10 @@ enum class Flag {
 	ChipRoom,
 	ChipOnline,
 };
-// What the server has, as this device knows it (false while the account
-// is not connected to Oblivion Cloud).
+// What the server has, as this device knows it. An account that is
+// switched off keeps showing what was left on the server (it is still
+// public there); false only for an account that has never agreed or has
+// deleted its data.
 [[nodiscard]] bool FlagNow(not_null<Main::Session*> session, Flag flag);
 [[nodiscard]] rpl::producer<bool> FlagValue(
 	not_null<Main::Session*> session,
@@ -212,6 +302,11 @@ enum class AudienceKind {
 	not_null<Main::Session*> session,
 	AudienceKind kind);
 [[nodiscard]] rpl::producer<int> ChosenCountValue(
+	not_null<Main::Session*> session);
+// The account is switched off («Отключиться») while the server still
+// shows something of it to other people (the badge, the profile, the
+// chips): Settings > Oblivion says so under the switches.
+[[nodiscard]] rpl::producer<bool> LeftPublicValue(
 	not_null<Main::Session*> session);
 
 // ---- Pure helpers (OBLIVION_SELFTEST=cloud_social checks them).
@@ -270,6 +365,11 @@ void ShowAudienceBox(
 	not_null<Window::SessionController*> controller,
 	AudienceKind kind);
 [[nodiscard]] QString AudienceName(Audience audience);
+// The text under the switches of Settings > Oblivion > «Профиль и
+// видимость»: what they are, and for an account that is switched off
+// while something of it is still public, that it is and how to hide it.
+[[nodiscard]] rpl::producer<QString> SettingsAboutValue(
+	not_null<Main::Session*> session);
 // «Убрать старую метку из «О себе»»: says what the old marker is and,
 // after a confirmation, calls Oblivion::Badge::RemoveOldMarker().
 void ShowRemoveMarker(not_null<Window::SessionController*> controller);
@@ -298,8 +398,10 @@ void AddMainMenuEntry(
 	not_null<Window::SessionController*> controller);
 
 // OBLIVION_SELFTEST=cloud_social, pure logic, no network: the parsers,
-// the cache of the lists, the audience rules, the throttle of the own
-// activity, the texts of the chips, the order of the friends.
+// the cache of the lists, the audience rules, what is sent for the two
+// switches of a shared item, the throttle of the own activity, the book
+// of the activity of the others, the texts of the chips, the order of
+// the friends.
 [[nodiscard]] bool RunSelfTest(QStringList &log);
 
 } // namespace Oblivion::Social

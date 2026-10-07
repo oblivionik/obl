@@ -80,6 +80,8 @@ constexpr auto kPinnedCertificate = "-----BEGIN CERTIFICATE-----\n"
 constexpr auto kUrlVariable = "OBLIVION_CLOUD_URL";
 constexpr auto kInsecureVariable = "OBLIVION_CLOUD_INSECURE";
 constexpr auto kLiveVariable = "OBLIVION_SELFTEST_CLOUD_LIVE";
+constexpr auto kTestKeyVariable = "OBLIVION_SELFTEST_CLOUD_TEST_KEY";
+constexpr auto kTestKeyHeader = "X-Oblivion-Test-Key";
 
 constexpr auto kRoomAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 constexpr auto kRoomCodeLength = 10;
@@ -90,6 +92,10 @@ constexpr auto kRequestTimeout = crl::time(20'000);
 constexpr auto kTransferIdleTimeout = crl::time(60'000);
 constexpr auto kRetryCap = crl::time(8'000);
 constexpr auto kRetryAfterCap = crl::time(10'000);
+constexpr auto kRateRetryMin = crl::time(300);
+constexpr auto kRateRetrySpread = crl::time(250);
+constexpr auto kPatchMeRateRetries = 2;
+constexpr auto kUploadRateRetries = 3;
 constexpr auto kConnectBackoffCap = crl::time(300'000);
 constexpr auto kStreamBackoffCap = crl::time(300'000);
 constexpr auto kStreamBackoffCapInRoom = crl::time(30'000);
@@ -99,6 +105,8 @@ constexpr auto kStreamSilence = crl::time(40'000);
 constexpr auto kHeartbeatCheck = crl::time(5'000);
 constexpr auto kStreamRestartDelay = crl::time(150);
 constexpr auto kStreamReplacedDelay = crl::time(60'000);
+constexpr auto kStreamEarlyRetryEach = crl::time(60'000);
+constexpr auto kStreamMaxFlaps = 20;
 constexpr auto kHelloLifetime = crl::time(3'600'000);
 constexpr auto kAuthRecheckEach = crl::time(60'000);
 constexpr auto kClockResyncEach = crl::time(300'000);
@@ -121,6 +129,9 @@ constexpr auto kMediaCacheLimit = int64(3) << 30;
 constexpr auto kPartLifetime = 3 * 86400;
 constexpr auto kRevokeLifetime = 30 * 86400;
 constexpr auto kMaxRevokes = 16;
+constexpr auto kRevokeRetryDelay = crl::time(60'000);
+constexpr auto kRevokeRetries = 5;
+constexpr auto kTargetBusyRecheck = crl::time(500);
 constexpr auto kPinFailedProperty = "oblivion_pin_failed";
 
 struct Config {
@@ -200,26 +211,57 @@ struct Config {
 		&& (certificate.digest(QCryptographicHash::Sha256) == PinnedDigest());
 }
 
+// What a TLS backend may say about the pinned certificate although it is
+// the right one: it is signed by itself, it is not in the system list of
+// authorities, it names an address and not a host (Apple also calls a
+// certificate that is valid for ten years untrusted). Everything else,
+// like an expired or a revoked certificate, stays an error.
+[[nodiscard]] bool ExpectedPinError(QSslError::SslError code) {
+	switch (code) {
+	case QSslError::SelfSignedCertificate:
+	case QSslError::SelfSignedCertificateInChain:
+	case QSslError::UnableToGetLocalIssuerCertificate:
+	case QSslError::UnableToGetIssuerCertificate:
+	case QSslError::UnableToVerifyFirstCertificate:
+	case QSslError::CertificateUntrusted:
+	case QSslError::HostNameMismatch:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Whether exactly these errors of a handshake may be ignored: the peer
+// shows the pinned certificate and every error is an expected one about
+// that very certificate. The errors are then ignored by their list, never
+// all at once: an error is equal to another one only together with its
+// certificate, so nothing a later handshake with a different certificate
+// reports can pass, whoever is (or is not) listening to it.
 [[nodiscard]] bool PinnedPeer(
 		const QSslCertificate &peer,
 		const QList<QSslError> &errors) {
-	if (!peer.isNull()) {
-		return IsPinned(peer);
-	} else if (errors.isEmpty()) {
+	if (peer.isNull() ? errors.isEmpty() : !IsPinned(peer)) {
 		return false;
 	}
 	for (const auto &error : errors) {
-		if (!IsPinned(error.certificate())) {
+		if (!ExpectedPinError(error.error())
+			|| !IsPinned(error.certificate())) {
 			return false;
 		}
 	}
 	return true;
 }
 
+[[nodiscard]] base::flat_set<int> &PinErrorsSeen() {
+	static const auto result = new base::flat_set<int>();
+	return *result;
+}
+
 // Only the embedded certificate is an anchor, so a certificate of any
 // other issuer fails the handshake before a byte of a request is sent.
 // What the TLS backend may still dislike in the right one (ten years of
-// validity, an address instead of a name) is let through by the digest.
+// validity, an address instead of a name) is let through by the digest
+// and only for that certificate, see PinnedPeer().
 [[nodiscard]] QSslConfiguration PinnedConfiguration() {
 	static const auto result = [] {
 		auto config = QSslConfiguration::defaultConfiguration();
@@ -284,8 +326,25 @@ struct Config {
 	return crl::time(std::llround(base * factor));
 }
 
+// A stream the server has accepted and that ended before it was 40
+// seconds old is a flap. The flaps in a row make the next attempts wait
+// longer (a reader that is too slow for a busy room would otherwise come
+// back every second for the same megabyte), a stream that lived longer
+// ends the row.
+[[nodiscard]] int StreamFlaps(int flaps, crl::time lived) {
+	return (lived > kStreamSilence)
+		? 0
+		: std::min(flaps + 1, kStreamMaxFlaps);
+}
+
 [[nodiscard]] bool SuccessStatus(int status) {
 	return (status >= 200 && status < 300) || (status == 304);
+}
+
+[[nodiscard]] bool ValidHeaderValue(const QByteArray &value) {
+	return !value.isEmpty() && ranges::all_of(value, [](char ch) {
+		return (ch >= 0x20) && (ch < 0x7F);
+	});
 }
 
 [[nodiscard]] Error ParseHttpError(
@@ -325,6 +384,31 @@ struct Config {
 	default:
 		return false;
 	}
+}
+
+// Request::rateRetries. A request the server has answered with 429 was
+// not done, so it may be sent again whatever its method is, after the
+// pause the server asks for. 0: it is not sent again (not a 429, the
+// repeats are used up, or the server asks to wait for too long: then the
+// one who asked decides). The jitter keeps the requests that were refused
+// together from coming back together.
+[[nodiscard]] crl::time RateRetryDelay(
+		const Error &error,
+		int attempt,
+		int allowed,
+		double jitter) {
+	if (error.type != Error::Type::Http
+		|| error.status != 429
+		|| attempt < 0
+		|| attempt >= allowed
+		|| error.retryAfter > kRetryAfterCap) {
+		return 0;
+	}
+	const auto spread = crl::time(std::llround(
+		double(kRateRetrySpread)
+			* (attempt + 1)
+			* std::clamp(jitter, 0., 1.)));
+	return std::max(error.retryAfter, kRateRetryMin) + spread;
 }
 
 [[nodiscard]] QString CleanText(QString text, int maxLength, bool singleLine) {
@@ -539,10 +623,13 @@ void SseParser::reset() {
 // What was delivered already, per source: the user scope and every room
 // have a cursor of their own, because a room joins the stream later with
 // the event id of its snapshot, older than what the stream has seen.
-// After the replay that follows a reconnect is over the events come in
-// one global order, so every one of them moves all the cursors: a later
-// reconnect then asks only for what is really new and the server does
-// not have to resync a busy room.
+// The server sends everything, the replay after a reconnect included, in
+// the order of the ids of all its sources. So every event that arrives,
+// a new one or a repeated one, tells that nothing older is left for any
+// source of this stream and moves all the cursors: a stream that was cut
+// in the middle of a long replay continues from that place and does not
+// ask for the same backlog again, and a later reconnect asks only for
+// what is really new.
 class StreamCursor final {
 public:
 	void setRoomFloor(const QString &code, int64 eventId);
@@ -553,6 +640,9 @@ public:
 		int64 helloEventId,
 		const std::vector<QString> &rooms);
 	[[nodiscard]] bool accept(int64 id, const QString &room);
+	[[nodiscard]] bool replaying() const {
+		return _replaying;
+	}
 	void heartbeat();
 	void reset();
 
@@ -607,18 +697,14 @@ bool StreamCursor::accept(int64 id, const QString &room) {
 		replayDone();
 	}
 	auto &cursor = room.isEmpty() ? _user : _rooms[room];
-	if (id <= cursor) {
-		return false;
+	const auto fresh = (id > cursor);
+	cursor = std::max(cursor, id);
+	_user = std::max(_user, id);
+	for (const auto &code : _streamRooms) {
+		auto &value = _rooms[code];
+		value = std::max(value, id);
 	}
-	cursor = id;
-	if (!_replaying) {
-		_user = std::max(_user, id);
-		for (const auto &code : _streamRooms) {
-			auto &value = _rooms[code];
-			value = std::max(value, id);
-		}
-	}
-	return true;
+	return fresh;
 }
 
 void StreamCursor::heartbeat() {
@@ -780,9 +866,50 @@ struct Identity {
 	int64 consentAt = 0;
 	QString deviceId;
 	QString token;
+
+	// The secret this device has made for its registration and has sent
+	// (or is about to send) with POST /v1/auth/register: the secret part
+	// of the key it will get. It is written to the file before the first
+	// attempt and stays till an answer with a key is stored, so that a
+	// registration whose answer was lost (a broken connection, the app
+	// was closed) is simply sent again, now or at the next launch, and
+	// the server gives the same device instead of «уже привязан к другому
+	// устройству». Kept as carefully as the key: it is a half of one.
+	QString pending;
+
 	QString name;
 	QJsonObject me;
 };
+
+// 256 random bits as base64url without the padding: exactly 43 characters
+// of [A-Za-z0-9_-], the server takes nothing else as "secret".
+constexpr auto kDeviceSecretLength = 43;
+
+[[nodiscard]] bool ValidDeviceSecret(const QString &secret) {
+	if (secret.size() != kDeviceSecretLength) {
+		return false;
+	}
+	for (const auto ch : secret) {
+		const auto code = ch.unicode();
+		const auto fine = (code >= '0' && code <= '9')
+			|| (code >= 'a' && code <= 'z')
+			|| (code >= 'A' && code <= 'Z')
+			|| (code == '-')
+			|| (code == '_');
+		if (!fine) {
+			return false;
+		}
+	}
+	return true;
+}
+
+[[nodiscard]] QString NewDeviceSecret() {
+	const auto result = QString::fromLatin1(RandomBytes(32).toBase64(
+		QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+
+	// Nothing that is not a full-size random secret is ever sent as one.
+	return ValidDeviceSecret(result) ? result : QString();
+}
 
 [[nodiscard]] bool ValidToken(const QString &token) {
 	if (token.size() < 8 || token.size() > 200 || !token.contains('.')) {
@@ -805,6 +932,12 @@ struct Identity {
 
 [[nodiscard]] QByteArray TokenAad(uint64 userId) {
 	return "oblivion-cloud-token:" + QByteArray::number(qulonglong(userId));
+}
+
+// Another one, so that what was sealed as a secret that is only on its
+// way can't be put into the file as the key, or the other way round.
+[[nodiscard]] QByteArray PendingAad(uint64 userId) {
+	return "oblivion-cloud-pending:" + QByteArray::number(qulonglong(userId));
 }
 
 [[nodiscard]] QByteArray SerializeIdentity(
@@ -832,6 +965,21 @@ struct Identity {
 				QString::fromLatin1(sealed.toBase64()));
 		} else {
 			object.insert(u"token"_q, identity.token);
+		}
+	}
+	if (ValidDeviceSecret(identity.pending)) {
+		const auto sealed = (sealKey.size() == 32)
+			? AesGcmSeal(
+				sealKey,
+				identity.pending.toLatin1(),
+				PendingAad(identity.userId))
+			: QByteArray();
+		if (!sealed.isEmpty()) {
+			object.insert(
+				u"pending_sealed"_q,
+				QString::fromLatin1(sealed.toBase64()));
+		} else {
+			object.insert(u"pending"_q, identity.pending);
 		}
 	}
 	if (!identity.me.isEmpty()) {
@@ -874,6 +1022,22 @@ struct Identity {
 	}
 	if (!ValidToken(result.token)) {
 		result.token = QString();
+	}
+	const auto pending = object.value(u"pending_sealed"_q).toString();
+	if (!pending.isEmpty()) {
+		const auto opened = AesGcmOpen(
+			sealKey,
+			QByteArray::fromBase64(pending.toLatin1()),
+			PendingAad(result.userId));
+		if (opened) {
+			result.pending = QString::fromLatin1(*opened);
+		}
+	} else {
+		result.pending = object.value(u"pending"_q).toString();
+	}
+	if (!ValidDeviceSecret(result.pending)) {
+		// A new one is made for the next registration.
+		result.pending = QString();
 	}
 	result.me = object.value(u"me"_q).toObject();
 	return result;
@@ -975,6 +1139,20 @@ void DropReply(QPointer<QNetworkReply> &reply, not_null<QObject*> context) {
 	reply = nullptr;
 }
 
+// The files some account of the app writes right now. The accounts share
+// the media cache, so two of them may want one file at the same moment:
+// the second one waits and then finds the file ready (or loads it itself
+// if the first one gave up).
+[[nodiscard]] base::flat_set<QString> &BusyTargets() {
+	static const auto result = new base::flat_set<QString>();
+	return *result;
+}
+
+[[nodiscard]] QString TargetKey(const QString &path) {
+	const auto clean = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+	return Platform::IsLinux() ? clean : clean.toLower();
+}
+
 // ---- HTTP: requests, uploads and downloads of one account.
 
 class Client final : public base::has_weak_ptr {
@@ -991,6 +1169,7 @@ public:
 
 	void cancelAll();
 	void setFailureHook(Fn<void(const Error &error)> hook);
+	void setSuccessHook(Fn<void()> hook);
 	void failLater(Fail fail, Error error);
 
 	[[nodiscard]] QNetworkRequest prepare(
@@ -1013,6 +1192,7 @@ private:
 		Fail fail;
 		QPointer<QNetworkReply> reply;
 		int attempt = 0;
+		int rateAttempt = 0; // Request::rateRetries.
 	};
 	struct Upload {
 		UploadArgs args;
@@ -1030,8 +1210,19 @@ private:
 		bool restarted = false;
 		bool started = false;
 	};
+	// Everybody who asked for the same file gets it from one transfer:
+	// two of them writing one "<to>.part" would spoil it for both.
+	struct DownloadWaiter {
+		TransferId id = 0;
+		QString to;
+		Fn<void(const QString &path)> done;
+		Fail fail;
+		Progress progress;
+	};
 	struct Download {
 		DownloadArgs args;
+		std::vector<DownloadWaiter> waiters;
+		QString key;
 		QString urlPath;
 		QString part;
 		std::unique_ptr<QFile> file;
@@ -1047,6 +1238,7 @@ private:
 		bool restarted = false;
 		bool started = false;
 		bool verifying = false;
+		bool claimed = false;
 	};
 
 	[[nodiscard]] bool hasToken() const;
@@ -1083,6 +1275,11 @@ private:
 	void downloadVerify(TransferId id);
 	void downloadComplete(TransferId id);
 	void downloadFail(TransferId id, const Error &error);
+	void downloadProgress(TransferId id, int64 ready, int64 total);
+	void downloadFinish(
+		std::unique_ptr<Download> task,
+		Fn<void(const DownloadWaiter &waiter)> notify);
+	[[nodiscard]] bool cancelDownload(TransferId id);
 	std::unique_ptr<Download> takeDownload(TransferId id);
 
 	const Fn<QByteArray()> _token;
@@ -1094,9 +1291,12 @@ private:
 	base::flat_map<RequestId, Pending> _pending;
 	base::flat_map<TransferId, std::unique_ptr<Upload>> _uploads;
 	base::flat_map<TransferId, std::unique_ptr<Download>> _downloads;
+	base::flat_map<QString, TransferId> _downloadTargets;
+	base::flat_map<TransferId, TransferId> _downloadWaiters;
 	std::deque<TransferId> _uploadQueue;
 	std::deque<TransferId> _downloadQueue;
 	Fn<void(const Error &error)> _failureHook;
+	Fn<void()> _successHook;
 	int _activeUploads = 0;
 	int _activeDownloads = 0;
 	int _lastId = 0;
@@ -1135,6 +1335,10 @@ bool Client::hasToken() const {
 
 void Client::setFailureHook(Fn<void(const Error &error)> hook) {
 	_failureHook = std::move(hook);
+}
+
+void Client::setSuccessHook(Fn<void()> hook) {
+	_successHook = std::move(hook);
 }
 
 void Client::failLater(Fail fail, Error error) {
@@ -1197,8 +1401,12 @@ void Client::watch(not_null<QNetworkReply*> reply) const {
 			const QList<QSslError> &errors) {
 		const auto peer = raw->sslConfiguration().peerCertificate();
 		if (PinnedPeer(peer, errors)) {
-			raw->ignoreSslErrors();
+			for (const auto &error : errors) {
+				PinErrorsSeen().emplace(int(error.error()));
+			}
+			raw->ignoreSslErrors(errors);
 		} else {
+			raw->ignoreSslErrors(QList<QSslError>());
 			raw->setProperty(kPinFailedProperty, true);
 		}
 	});
@@ -1296,6 +1504,9 @@ void Client::finished(RequestId id, not_null<QNetworkReply*> reply) {
 		response.etag = response.header("etag");
 		const auto done = std::move(i->second.done);
 		_pending.erase(i);
+		if (_successHook) {
+			_successHook();
+		}
 		if (done) {
 			done(response);
 		}
@@ -1320,15 +1531,33 @@ void Client::finished(RequestId id, not_null<QNetworkReply*> reply) {
 		});
 		return;
 	}
+	const auto rateDelay = RateRetryDelay(
+		error,
+		entry.rateAttempt,
+		entry.request.rateRetries,
+		RandomJitter());
+	if (rateDelay > 0) {
+		// Too often for a route with a bucket of its own: the request was
+		// not done, it waits as long as the server asks and goes again.
+		++entry.rateAttempt;
+		entry.reply = nullptr;
+		base::call_delayed(rateDelay, this, [=] {
+			restart(id);
+		});
+		return;
+	}
+	// The one who asked hears about the failure first: the hook may close
+	// the whole account after it (an old protocol, a banned id), and that
+	// drops every callback that was not called yet.
 	const auto fail = std::move(entry.fail);
 	_pending.erase(i);
 	const auto generation = _generation;
 	const auto weak = base::make_weak(this);
-	if (_failureHook) {
-		_failureHook(error);
-	}
-	if (weak && generation == _generation && fail) {
+	if (fail) {
 		fail(error);
+	}
+	if (weak && generation == _generation && _failureHook) {
+		_failureHook(error);
 	}
 }
 
@@ -1355,8 +1584,13 @@ void Client::cancelAll() {
 	for (auto &[id, task] : _downloads) {
 		task->cancelled->store(true);
 		DropReply(task->reply, _context);
+		if (task->claimed) {
+			BusyTargets().remove(task->key);
+		}
 	}
 	_downloads.clear();
+	_downloadTargets.clear();
+	_downloadWaiters.clear();
 	_uploadQueue.clear();
 	_downloadQueue.clear();
 	_activeUploads = 0;
@@ -1482,6 +1716,11 @@ void Client::uploadCreate(TransferId id) {
 			: task->args.mime);
 	auto request = PostRequest(u"/v1/media/uploads"_q, std::move(body));
 	request.retries = 2;
+
+	// Declaring has a bucket of its own on the server (1200 at once, then
+	// two in a second): "too often" is waited out, a long playlist or a
+	// queue of many files does not stop for that.
+	request.rateRetries = kUploadRateRetries;
 	const auto sent = send(std::move(request), [=](const Response &response) {
 		const auto now = findUpload(id);
 		if (!now) {
@@ -1790,6 +2029,10 @@ std::unique_ptr<Client::Download> Client::takeDownload(TransferId id) {
 	}
 	auto result = std::move(i->second);
 	_downloads.erase(i);
+	_downloadTargets.remove(result->key);
+	if (base::take(result->claimed)) {
+		BusyTargets().remove(result->key);
+	}
 	result->cancelled->store(true);
 	DropReply(result->reply, _context);
 	result->file = nullptr;
@@ -1814,13 +2057,41 @@ TransferId Client::download(DownloadArgs &&args) {
 		failLater(std::move(args.fail), { .type = Error::Type::File });
 		return 0;
 	}
+	const auto key = TargetKey(args.to);
+	const auto existing = _downloadTargets.find(key);
+	const auto shared = (existing != end(_downloadTargets))
+		? findDownload(existing->second)
+		: nullptr;
+	if (shared
+		&& (shared->urlPath != path
+			|| shared->args.auth != args.auth
+			|| shared->args.sha256 != args.sha256)) {
+		failLater(std::move(args.fail), { .type = Error::Type::File });
+		return 0;
+	}
 	const auto id = ++_lastId;
+	auto waiter = DownloadWaiter{
+		.id = id,
+		.to = args.to,
+		.done = std::move(args.done),
+		.fail = std::move(args.fail),
+		.progress = std::move(args.progress),
+	};
+	if (shared) {
+		shared->waiters.push_back(std::move(waiter));
+		_downloadWaiters.emplace(id, existing->second);
+		return id;
+	}
 	auto task = std::make_unique<Download>();
+	task->key = key;
 	task->urlPath = path;
 	task->part = args.to + u".part"_q;
 	task->args = std::move(args);
+	task->waiters.push_back(std::move(waiter));
 	task->cancelled = std::make_shared<std::atomic<bool>>(false);
 	_downloads.emplace(id, std::move(task));
+	_downloadTargets[key] = id;
+	_downloadWaiters.emplace(id, id);
 	_downloadQueue.push_back(id);
 	processQueues();
 	return id;
@@ -1834,7 +2105,7 @@ void Client::startDownload(TransferId id) {
 	task->started = true;
 	if (QFileInfo::exists(task->args.to)) {
 		crl::on_main(this, [=] {
-			const auto taken = takeDownload(id);
+			auto taken = takeDownload(id);
 			if (!taken) {
 				return;
 			}
@@ -1845,15 +2116,21 @@ void Client::startDownload(TransferId id) {
 					QFileDevice::FileModificationTime);
 				file.close();
 			}
-			const auto weak = base::make_weak(this);
-			if (const auto done = taken->args.done) {
-				done(taken->args.to);
-			}
-			if (weak) {
-				processQueues();
-			}
+			downloadFinish(std::move(taken), [](const DownloadWaiter &waiter) {
+				if (waiter.done) {
+					waiter.done(waiter.to);
+				}
+			});
 		});
 		return;
+	} else if (!task->claimed) {
+		if (!BusyTargets().emplace(task->key).second) {
+			base::call_delayed(kTargetBusyRecheck, this, [=] {
+				startDownload(id);
+			});
+			return;
+		}
+		task->claimed = true;
 	}
 	QDir().mkpath(QFileInfo(task->args.to).absolutePath());
 	const auto part = QFileInfo(task->part);
@@ -1955,15 +2232,75 @@ void Client::downloadRead(TransferId id, not_null<QNetworkReply*> reply) {
 	const auto now = crl::now();
 	if (now - task->progressAt >= kProgressEach) {
 		task->progressAt = now;
-		if (const auto progress = task->args.progress) {
-			progress(task->offset, std::max(task->total, task->offset));
+		downloadProgress(
+			id,
+			task->offset,
+			std::max(task->total, task->offset));
+	}
+}
+
+// A progress callback may cancel its own or somebody else's transfer (or
+// switch the whole account off), so the list of the waiters is walked by
+// their ids and looked up again before every call.
+void Client::downloadProgress(TransferId id, int64 ready, int64 total) {
+	const auto task = findDownload(id);
+	if (!task) {
+		return;
+	}
+	auto ids = std::vector<TransferId>();
+	ids.reserve(task->waiters.size());
+	for (const auto &waiter : task->waiters) {
+		if (waiter.progress) {
+			ids.push_back(waiter.id);
+		}
+	}
+	const auto weak = base::make_weak(this);
+	for (const auto waiterId : ids) {
+		const auto now = findDownload(id);
+		if (!now) {
+			return;
+		}
+		const auto i = ranges::find(
+			now->waiters,
+			waiterId,
+			&DownloadWaiter::id);
+		if (i == end(now->waiters)) {
+			continue;
+		}
+		const auto progress = i->progress;
+		progress(ready, total);
+		if (!weak) {
+			return;
 		}
 	}
 }
 
+void Client::downloadFinish(
+		std::unique_ptr<Download> task,
+		Fn<void(const DownloadWaiter &waiter)> notify) {
+	if (!task) {
+		return;
+	}
+	const auto weak = base::make_weak(this);
+	for (const auto &waiter : task->waiters) {
+		if (!_downloadWaiters.remove(waiter.id)) {
+			continue;
+		}
+		notify(waiter);
+		if (!weak) {
+			return;
+		}
+	}
+	processQueues();
+}
+
 void Client::downloadDone(TransferId id, not_null<QNetworkReply*> reply) {
 	reply->deleteLater();
+	const auto weak = base::make_weak(this);
 	downloadRead(id, reply);
+	if (!weak) {
+		return;
+	}
 	const auto task = findDownload(id);
 	if (!task || task->reply != reply.get()) {
 		return;
@@ -1981,8 +2318,11 @@ void Client::downloadDone(TransferId id, not_null<QNetworkReply*> reply) {
 	} else if (status == 416) {
 		auto from = int64(-1);
 		auto total = int64(-1);
-		ParseContentRange(reply->rawHeader("Content-Range"), from, total);
-		if (total > 0 && QFileInfo(task->part).size() == total) {
+		const auto parsed = ParseContentRange(
+			reply->rawHeader("Content-Range"),
+			from,
+			total);
+		if (parsed && total > 0 && QFileInfo(task->part).size() == total) {
 			task->offset = task->total = total;
 			downloadVerify(id);
 		} else {
@@ -2102,31 +2442,49 @@ void Client::downloadComplete(TransferId id) {
 		downloadFail(id, { .type = Error::Type::File });
 		return;
 	}
-	const auto task = takeDownload(id);
+	const auto size = found->offset;
 	const auto weak = base::make_weak(this);
-	if (const auto progress = task->args.progress) {
-		progress(task->offset, task->offset);
-	}
-	if (const auto done = task->args.done) {
-		done(to);
-	}
-	if (weak) {
-		processQueues();
-	}
+	downloadFinish(takeDownload(id), [=](const DownloadWaiter &waiter) {
+		if (waiter.progress) {
+			waiter.progress(size, size);
+		}
+		if (weak && waiter.done) {
+			waiter.done(waiter.to);
+		}
+	});
 }
 
 void Client::downloadFail(TransferId id, const Error &error) {
-	const auto task = takeDownload(id);
+	auto task = takeDownload(id);
 	if (!task) {
 		return;
 	}
-	const auto weak = base::make_weak(this);
-	if (const auto fail = task->args.fail) {
-		fail(error);
+	const auto copy = error;
+	downloadFinish(std::move(task), [=](const DownloadWaiter &waiter) {
+		if (waiter.fail) {
+			waiter.fail(copy);
+		}
+	});
+}
+
+// A cancelled transfer calls nothing. The file keeps loading while
+// somebody else still waits for it.
+bool Client::cancelDownload(TransferId id) {
+	const auto i = _downloadWaiters.find(id);
+	if (i == end(_downloadWaiters)) {
+		return false;
 	}
-	if (weak) {
-		processQueues();
+	const auto taskId = i->second;
+	_downloadWaiters.erase(i);
+	if (const auto task = findDownload(taskId)) {
+		task->waiters.erase(
+			ranges::remove(task->waiters, id, &DownloadWaiter::id),
+			end(task->waiters));
+		if (task->waiters.empty()) {
+			takeDownload(taskId);
+		}
 	}
+	return true;
 }
 
 void Client::cancelTransfer(TransferId id) {
@@ -2138,7 +2496,7 @@ void Client::cancelTransfer(TransferId id) {
 				nullptr);
 		}
 		processQueues();
-	} else if (takeDownload(id)) {
+	} else if (cancelDownload(id)) {
 		processQueues();
 	}
 }
@@ -2148,10 +2506,15 @@ void Client::cancelTransfer(TransferId id) {
 	return *result;
 }
 
-// ---- Keys of accounts that logged out of Telegram: the device is
-// revoked on the server (which frees the id for the next registration
-// when it was the only device), retried at the next launch if the server
-// could not be reached.
+// ---- Keys of accounts that logged out of Telegram. The logout of
+// Telegram logs only this device out of the cloud: its key is revoked on
+// the server (POST /v1/auth/logout) and removed from the disk, so that
+// no working key outlives the Telegram session. Nothing the server keeps
+// about the user is deleted by that, only «Удалить мои данные с сервера»
+// deletes. What a later registration of the same id gets is decided by
+// the server (PROTOCOL.md, "Devices"). If the server can't be reached the
+// revocation is tried again a few times while the app runs and at the
+// next launches, for 30 days.
 
 struct RevokeEntry {
 	QString token;
@@ -2203,6 +2566,19 @@ void WriteRevokes(const std::vector<RevokeEntry> &list) {
 	}
 }
 
+void ProcessRevokes();
+
+void RetryRevokesLater() {
+	static auto Attempts = 0;
+	if (Attempts >= kRevokeRetries) {
+		return;
+	}
+	const auto delay = kRevokeRetryDelay << Attempts++;
+	base::call_delayed(delay, &PublicClient(), [] {
+		ProcessRevokes();
+	});
+}
+
 void ProcessRevokes() {
 	static auto Running = false;
 	if (Running) {
@@ -2227,6 +2603,7 @@ void ProcessRevokes() {
 	const auto finish = [=](bool revoked) {
 		Running = false;
 		if (!revoked) {
+			RetryRevokesLater();
 			return;
 		}
 		auto left = ReadRevokes();
@@ -2831,6 +3208,7 @@ struct Account::Private final : public base::has_weak_ptr {
 	void forgetDevice();
 	void redeem(const QString &code, Fn<void()> done, Fail fail);
 	void deleteData(Fn<void()> done, Fail fail);
+	void deleted();
 
 	void beginConnect();
 	void requestHello(bool refresh);
@@ -2844,6 +3222,7 @@ struct Account::Private final : public base::has_weak_ptr {
 	void closed(State value, const Error &error);
 	void stopAll();
 	void requestFailed(const Error &error);
+	void requestSucceeded();
 	void resetIdentity();
 	void applyMe(const QJsonObject &user);
 
@@ -2883,6 +3262,13 @@ struct Account::Private final : public base::has_weak_ptr {
 	int connectAttempt = 0;
 	bool connecting = false;
 
+	struct DeleteWaiter {
+		Fn<void()> done;
+		Fail fail;
+	};
+	std::vector<DeleteWaiter> deleteWaiters;
+	bool deleting = false;
+
 	QPointer<QNetworkReply> streamReply;
 	SseParser parser;
 	StreamCursor cursor;
@@ -2897,15 +3283,21 @@ struct Account::Private final : public base::has_weak_ptr {
 	crl::time streamBytesAt = 0;
 	crl::time streamOpenedAt = 0;
 	crl::time streamHold = 0;
+	crl::time streamNotBefore = 0;
+	crl::time streamEarlyAt = 0;
 	int streamAttempt = 0;
+	int streamFlaps = 0;
 	int streamStatus = 0;
 	bool streamHello = false;
+	bool streamBye = false;
 	bool streamWithSince = false;
 	bool streamUnauthorized = false;
+	bool streamUnreachable = false;
 
 	QPointer<QNetworkReply> syncReply;
 	std::vector<ClockSample> syncSamples;
 	std::vector<Fn<void(bool)>> syncCallbacks;
+	crl::time syncedAt = 0;
 	int syncIndex = -1;
 
 };
@@ -2925,6 +3317,9 @@ Account::Private::Private(Descriptor &&value)
 	identity.userId = descriptor.userId;
 	client.setFailureHook([=](const Error &error) {
 		requestFailed(error);
+	});
+	client.setSuccessHook([=] {
+		requestSucceeded();
 	});
 }
 
@@ -3029,6 +3424,13 @@ void Account::Private::stopAll() {
 	clockTimer.cancel();
 	closeStream();
 	streamUnauthorized = false;
+	streamUnreachable = false;
+	streamNotBefore = 0;
+	streamHold = 0;
+	streamAttempt = 0;
+	streamFlaps = 0;
+	deleting = false;
+	deleteWaiters.clear();
 	syncFinish(false);
 	client.cancelAll();
 	ready = false;
@@ -3097,8 +3499,30 @@ void Account::Private::requestRegister() {
 	if (!identity.name.isEmpty()) {
 		body.insert(u"name"_q, identity.name);
 	}
+
+	// The secret part of the key is made here and is on the disk before
+	// it is sent: if the answer never arrives, the same registration goes
+	// again (after the backoff, after «Подключить», at the next launch)
+	// with the same secret, and the server gives the same device back
+	// instead of 409. See Identity::pending. A server that does not know
+	// the field ignores it and makes the secret itself, as before.
+	if (!ValidDeviceSecret(identity.pending)) {
+		identity.pending = NewDeviceSecret();
+		save();
+	}
+	if (!identity.pending.isEmpty()) {
+		body.insert(u"secret"_q, identity.pending);
+	}
 	auto request = PostRequest(u"/v1/auth/register"_q, std::move(body));
 	request.auth = false;
+	if (ValidHeaderValue(descriptor.testKey)) {
+		// Only the live self-test has it: the server registers the fake
+		// test ids with its test key and nothing else needs the key.
+		request.headers.push_back({
+			QByteArray(kTestKeyHeader),
+			descriptor.testKey,
+		});
+	}
 	client.send(std::move(request), [=](const Response &response) {
 		if (!applyAuth(response.json)) {
 			connectFailed({ .type = Error::Type::Protocol });
@@ -3146,18 +3570,34 @@ bool Account::Private::applyAuth(const QJsonObject &result) {
 	identity.deviceId = JsonText(result.value(u"device_id"_q), 64);
 	identity.rejected = false;
 	identity.me = user;
+
+	// The key is here (from a registration or from a link code): nothing
+	// is on its way any more, the next registration gets a new secret.
+	identity.pending = QString();
 	me = ParseMe(user);
 	save();
+	streamRetryTimer.cancel();
+	streamUnauthorized = false;
+	closeStream();
 	authed();
 	meUpdates.fire({});
 	return true;
 }
 
+// Called after a new key and after every check of the kept one. A check
+// may happen while the stream is fine (one request was answered 401) or
+// while it waits for its next attempt: the stream is left alone then, a
+// healthy one is not reopened and a waiting one keeps its backoff.
 void Account::Private::authed() {
 	connecting = false;
 	connectAttempt = 0;
 	lastError = Error();
-	if (state.current() != State::Online) {
+	const auto waiting = !streamReply
+		&& !streamUnauthorized
+		&& streamRetryTimer.isActive();
+	if (streamReply && streamHello) {
+		state = State::Online;
+	} else if (!waiting && state.current() != State::Online) {
 		state = State::Connecting;
 	}
 	ready = true;
@@ -3165,7 +3605,7 @@ void Account::Private::authed() {
 		// The key is fine for requests, but the stream was refused with
 		// it a moment ago: try the stream again later, not in a loop.
 		streamRetry({ .type = Error::Type::Http, .status = 401 });
-	} else {
+	} else if (!streamReply && !streamRetryTimer.isActive()) {
 		openStream();
 	}
 }
@@ -3179,9 +3619,15 @@ void Account::Private::connectFailed(const Error &error) {
 		closed(State::Banned, error);
 		return;
 	}
+	// A check of the key that could not get through says nothing about
+	// a stream that works at the same moment: the state follows the
+	// stream then and the check is simply repeated later.
+	const auto healthy = ready.current() && streamReply && streamHello;
 	connecting = false;
-	lastError = error;
-	state = State::Offline;
+	if (!healthy) {
+		lastError = error;
+		state = State::Offline;
+	}
 	++connectAttempt;
 	connectTimer.callOnce(std::max(
 		BackoffDelay(connectAttempt, RandomJitter(), kConnectBackoffCap),
@@ -3286,22 +3732,70 @@ void Account::Private::deleteData(Fn<void()> done, Fail fail) {
 			{ .type = Error::Type::NotConnected });
 		return;
 	}
+	deleteWaiters.push_back({ std::move(done), std::move(fail) });
+	if (deleting) {
+		return;
+	}
+	deleting = true;
 	auto body = QJsonObject();
 	body.insert(u"confirm"_q, u"delete"_q);
 	client.send(
 		PostRequest(u"/v1/me/delete"_q, std::move(body)),
 		[=](const Response &response) {
-			const auto weak = base::make_weak(this);
-			resetIdentity();
-			if (weak && done) {
-				done();
-			}
+			deleted();
 		},
 		[=](const Error &error) {
-			if (fail) {
-				fail(error);
+			deleting = false;
+			const auto waiters = base::take(deleteWaiters);
+			const auto weak = base::make_weak(this);
+			for (const auto &waiter : waiters) {
+				if (waiter.fail) {
+					waiter.fail(error);
+				}
+				if (!weak) {
+					return;
+				}
 			}
 		});
+}
+
+// The account is gone from the server. That is known from the answer to
+// the own request or from the "bye" of the event stream, whichever comes
+// first: the server closes the stream before it answers, and forgetting
+// the key drops every request that waits, the one that asked for the
+// deletion included. So whoever asked is told from here in both cases.
+void Account::Private::deleted() {
+	const auto waiters = base::take(deleteWaiters);
+	const auto weak = base::make_weak(this);
+	resetIdentity();
+	for (const auto &waiter : waiters) {
+		if (!weak) {
+			return;
+		} else if (waiter.done) {
+			waiter.done();
+		}
+	}
+}
+
+// An ordinary request got through while the stream waits for its next
+// attempt after the connection was lost or could not be made: the server
+// is reachable again, so the stream is tried now and not minutes later.
+// Once a minute at most, and never when the server itself has closed or
+// refused the stream (then the wait is what it asked for).
+void Account::Private::requestSucceeded() {
+	if (!streamUnreachable
+		|| streamReply
+		|| !ready.current()
+		|| !streamRetryTimer.isActive()
+		|| streamRetryTimer.remainingTime() <= kStreamRestartDelay) {
+		return;
+	}
+	const auto now = crl::now();
+	if (streamEarlyAt && (now - streamEarlyAt < kStreamEarlyRetryEach)) {
+		return;
+	}
+	streamEarlyAt = now;
+	streamRetryTimer.callOnce(kStreamRestartDelay);
 }
 
 rpl::lifetime Account::Private::subscribe(
@@ -3345,10 +3839,21 @@ std::vector<QString> Account::Private::wantedRooms() const {
 	return std::vector<QString>(begin(roomOrder) + skip, end(roomOrder));
 }
 
+// A room window was opened or closed. The stream is opened again with
+// the new list at once, also when it waits for its next attempt: a click
+// of the user is a reason to try. But not when the list is the same after
+// all, and not before the moment the server asked to wait until (it
+// closed the stream as replaced or answered with Retry-After): the
+// attempt that is scheduled takes the new list by itself.
 void Account::Private::restartStreamIfChanged() {
 	if (!ready.current()) {
 		return;
-	} else if (streamReply && wantedRooms() == streamRooms) {
+	}
+	const auto waiting = streamRetryTimer.isActive();
+	if ((streamReply || waiting) && wantedRooms() == streamRooms) {
+		return;
+	} else if (streamUnauthorized
+		|| (waiting && crl::now() < streamNotBefore)) {
 		return;
 	}
 	openStream();
@@ -3386,6 +3891,7 @@ void Account::Private::openStream() {
 	parser.reset();
 	streamErrorBody.clear();
 	streamHello = false;
+	streamBye = false;
 	streamWithSince = (since > 0);
 	streamStatus = 0;
 	streamBytesAt = streamOpenedAt = crl::now();
@@ -3494,9 +4000,13 @@ void Account::Private::streamRetry(const Error &error) {
 		return;
 	}
 	lastError = error;
-	if (streamHello && (crl::now() - streamOpenedAt > kStreamSilence)) {
-		streamAttempt = 0;
+	const auto now = crl::now();
+	if (base::take(streamHello)) {
+		streamFlaps = StreamFlaps(streamFlaps, now - streamOpenedAt);
 	}
+	streamUnreachable = !base::take(streamBye)
+		&& (error.type == Error::Type::Network
+			|| error.type == Error::Type::Timeout);
 	++streamAttempt;
 	if (state.current() == State::Online
 		|| state.current() == State::Connecting) {
@@ -3505,18 +4015,25 @@ void Account::Private::streamRetry(const Error &error) {
 	const auto cap = roomRefs.empty()
 		? kStreamBackoffCap
 		: kStreamBackoffCapInRoom;
-	const auto delay = std::max({
-		BackoffDelay(streamAttempt, RandomJitter(), cap),
+	const auto asked = std::max(
 		std::min(error.retryAfter, kStreamBackoffCap),
-		base::take(streamHold),
-	});
-	streamRetryTimer.callOnce(delay);
+		base::take(streamHold));
+	streamNotBefore = (asked > 0) ? (now + asked) : 0;
+	streamRetryTimer.callOnce(std::max(
+		BackoffDelay(streamAttempt + streamFlaps, RandomJitter(), cap),
+		asked));
 }
 
 void Account::Private::checkHeartbeat() {
-	if (streamReply && (crl::now() - streamBytesAt > kStreamSilence)) {
+	if (!streamReply) {
+		return;
+	}
+	const auto now = crl::now();
+	if (now - streamBytesAt > kStreamSilence) {
 		closeStream();
 		streamRetry({ .type = Error::Type::Timeout });
+	} else if (streamHello && (now - streamOpenedAt > kStreamSilence)) {
+		streamFlaps = 0;
 	}
 }
 
@@ -3553,9 +4070,12 @@ void Account::Private::handleEvent(Event &&event) {
 			codes("rooms"));
 		streamHello = true;
 		streamAttempt = 0;
+		streamUnreachable = false;
+		streamNotBefore = 0;
 		lastError = Error();
 		state = State::Online;
 		const auto ts = event.ts;
+		hint(ts);
 		events.fire(std::move(event));
 		for (const auto &code : rejected) {
 			if (!weak) {
@@ -3571,6 +4091,7 @@ void Account::Private::handleEvent(Event &&event) {
 		return;
 	} else if (event.type == u"bye"_q) {
 		const auto reason = event.data.value(u"reason"_q).toString();
+		streamBye = true;
 		events.fire(std::move(event));
 		if (weak) {
 			handleBye(reason);
@@ -3582,7 +4103,11 @@ void Account::Private::handleEvent(Event &&event) {
 	} else if (event.id > 0 && !cursor.accept(event.id, event.room)) {
 		return;
 	}
-	hint(event.ts);
+	if (!event.id || !cursor.replaying()) {
+		// A replayed event carries the time it was sent at first, that
+		// says nothing about the clock.
+		hint(event.ts);
+	}
 	if (event.type == u"me.updated"_q) {
 		applyMe(event.data.value(u"user"_q).toObject());
 		if (!weak) {
@@ -3594,7 +4119,7 @@ void Account::Private::handleEvent(Event &&event) {
 
 void Account::Private::handleBye(const QString &reason) {
 	if (reason == u"deleted"_q) {
-		resetIdentity();
+		deleted();
 	} else if (reason == u"revoked"_q) {
 		keyRejected({
 			.type = Error::Type::Http,
@@ -3616,7 +4141,9 @@ void Account::Private::afterStreamHello() {
 	if (state.current() != State::Online) {
 		return;
 	}
-	syncTime(nullptr);
+	if (!syncedAt || (crl::now() - syncedAt > kClockResyncGap)) {
+		syncTime(nullptr);
+	}
 	if (!clockTimer.isActive()) {
 		clockTimer.callEach(kClockResyncEach);
 	}
@@ -3697,6 +4224,7 @@ void Account::Private::syncFinish(bool success) {
 		const auto pick = PickClockSample(syncSamples);
 		if (pick.valid) {
 			ClockApply(pick.offset);
+			syncedAt = crl::now();
 			applied = true;
 		}
 	}
@@ -3812,8 +4340,13 @@ rpl::producer<> Account::meUpdated() const {
 
 void Account::patchMe(QJsonObject patch, Fn<void()> done, Fail fail) {
 	const auto weak = base::make_weak(_private.get());
-	request(PatchRequest(u"/v1/me"_q, std::move(patch)), [=](
-			const Response &response) {
+
+	// The server takes PATCH /v1/me only so often (30 at once, then one
+	// in a second for a device): "too often" is waited out, the switch
+	// the user has clicked is not shown as failed for that.
+	auto prepared = PatchRequest(u"/v1/me"_q, std::move(patch));
+	prepared.rateRetries = kPatchMeRateRetries;
+	request(std::move(prepared), [=](const Response &response) {
 		if (const auto that = weak.get()) {
 			that->applyMe(response.json.value(u"user"_q).toObject());
 		}
@@ -4094,7 +4627,7 @@ void CancelPublicDownload(TransferId id) {
 }
 
 void SessionStarted(not_null<Main::Session*> session) {
-	For(session);
+	(void)For(session);
 	ProcessRevokes();
 	Rooms::Start(session);
 	Social::Start(session);
@@ -4262,11 +4795,62 @@ void TestConfig(Checker &check) {
 		!PinnedPeer(QSslCertificate(), {}),
 		"pin: no peer and no errors is not trusted");
 	if (list.size() == 1) {
-		check(PinnedPeer(list.front(), {}), "pin: the right peer");
+		const auto &pinned = list.front();
+		check(PinnedPeer(pinned, {}), "pin: the right peer");
+		check(
+			PinnedPeer(pinned, {
+				QSslError(QSslError::CertificateUntrusted, pinned),
+				QSslError(QSslError::HostNameMismatch, pinned),
+				QSslError(QSslError::SelfSignedCertificate, pinned),
+			}),
+			"pin: the expected errors of the pinned certificate pass");
+		check(
+			!PinnedPeer(pinned, {
+				QSslError(QSslError::HostNameMismatch, pinned),
+				QSslError(QSslError::CertificateExpired, pinned),
+			}),
+			"pin: an expired pinned certificate is still an error");
+		check(
+			!PinnedPeer(pinned, {
+				QSslError(QSslError::HostNameMismatch, pinned),
+				QSslError(QSslError::SelfSignedCertificate),
+			}),
+			"pin: an error about another certificate is never ignored");
+		check(
+			PinnedPeer(QSslCertificate(), {
+				QSslError(QSslError::CertificateUntrusted, pinned),
+			}),
+			"pin: no peer yet, the error names the pinned certificate");
+		check(
+			QSslError(QSslError::CertificateUntrusted, pinned)
+				!= QSslError(QSslError::CertificateUntrusted),
+			"pin: an ignored error is tied to its certificate");
 	}
 	check(
-		PinnedConfiguration().caCertificates().size() == 1,
-		"pin: the only anchor");
+		!PinnedPeer(QSslCertificate(), {
+			QSslError(QSslError::CertificateUntrusted),
+		}),
+		"pin: no peer and an error without a certificate");
+	check(
+		ExpectedPinError(QSslError::SelfSignedCertificateInChain)
+			&& ExpectedPinError(QSslError::UnableToGetLocalIssuerCertificate)
+			&& ExpectedPinError(QSslError::UnableToVerifyFirstCertificate),
+		"pin: an unknown authority is expected");
+	check(
+		!ExpectedPinError(QSslError::NoError)
+			&& !ExpectedPinError(QSslError::NoPeerCertificate)
+			&& !ExpectedPinError(QSslError::CertificateNotYetValid)
+			&& !ExpectedPinError(QSslError::CertificateRevoked)
+			&& !ExpectedPinError(QSslError::CertificateBlacklisted)
+			&& !ExpectedPinError(QSslError::InvalidPurpose)
+			&& !ExpectedPinError(QSslError::CertificateSignatureFailed)
+			&& !ExpectedPinError(QSslError::UnspecifiedError),
+		"pin: what is never let through");
+	check(
+		PinnedConfiguration().caCertificates().size() == 1
+			&& (PinnedConfiguration().peerVerifyMode()
+				== QSslSocket::VerifyPeer),
+		"pin: the only anchor, the peer is verified");
 }
 
 void TestUrls(Checker &check) {
@@ -4431,6 +5015,30 @@ void TestJson(Checker &check) {
 	check(
 		!RetryableError(ParseHttpError(429, "{}", "60")),
 		"error: a long wait is not retried");
+	check(
+		RateRetryDelay(limited, 0, 0, 0.5) == 0
+			&& RateRetryDelay(limited, 0, 2, 0.) == 1200
+			&& RateRetryDelay(limited, 1, 2, 0.) == 1200
+			&& RateRetryDelay(limited, 2, 2, 0.) == 0
+			&& RateRetryDelay(limited, -1, 2, 0.) == 0,
+		"rate: a refused request is repeated only as often as asked");
+	check(
+		RateRetryDelay(limited, 0, 3, 1.) == 1200 + kRateRetrySpread
+			&& RateRetryDelay(limited, 2, 3, 1.) == 1200 + 3 * kRateRetrySpread
+			&& RateRetryDelay(limited, 0, 3, 9.) == 1200 + kRateRetrySpread,
+		"rate: the repeats are spread");
+	check(
+		RateRetryDelay(ParseHttpError(429, "{}", QByteArray()), 0, 3, 0.)
+			== kRateRetryMin,
+		"rate: never at once");
+	check(
+		RateRetryDelay(ParseHttpError(429, "{}", "60"), 0, 3, 0.) == 0,
+		"rate: a long wait is left to the one who asked");
+	check(
+		RateRetryDelay(ParseHttpError(503, "{}", "1"), 0, 3, 0.) == 0
+			&& RateRetryDelay({ .type = Error::Type::Network }, 0, 3, 0.) == 0
+			&& RateRetryDelay({ .type = Error::Type::Timeout }, 0, 3, 0.) == 0,
+		"rate: only 429, a request that may have been done is not repeated");
 	const auto garbage = ParseHttpError(502, "<html>", QByteArray());
 	check(
 		garbage.code == u"http_502"_q && RetryableError(garbage),
@@ -4533,6 +5141,12 @@ void TestJson(Checker &check) {
 	check(!ValidToken(u"abcdefghijklmnop"_q), "token: no dot");
 	check(!ValidToken(u"abcdefgh.ijkl mnop"_q), "token: a space");
 	check(!ValidToken(u"abcdefgh.ijkl\nmnop"_q), "token: a line break");
+	check(
+		ValidHeaderValue("local-test-key-0123456789abcdef")
+			&& !ValidHeaderValue(QByteArray())
+			&& !ValidHeaderValue("key\r\nX-Other: 1")
+			&& !ValidHeaderValue("\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87"),
+		"header: only one line of printable ASCII is sent as a value");
 
 	auto from = int64(0);
 	auto total = int64(0);
@@ -4765,14 +5379,19 @@ void TestCursor(Checker &check) {
 		"cursor: a room joins with an older snapshot");
 	check(cursor.since({}) == 1001, "cursor: without it nothing changes");
 	cursor.connected(true, 1100, { a });
+	check(cursor.replaying(), "cursor: a stream with since starts by a replay");
 	check(cursor.accept(950, a), "cursor: replay, a room event");
 	check(!cursor.accept(1001, QString()), "cursor: replay, a seen user one");
+	check(
+		cursor.since({ a }) == 1001,
+		"cursor: a replay that was cut continues from where it stopped");
 	check(cursor.accept(1050, QString()), "cursor: replay, a missed user one");
 	check(!cursor.accept(950, a), "cursor: replay, a room duplicate");
 	check(
-		cursor.since({ a }) == 950,
-		"cursor: a reconnect inside the replay asks from the oldest");
+		cursor.since({ a }) == 1050 && cursor.since({}) == 1050,
+		"cursor: a replayed event moves every cursor");
 	check(cursor.accept(1101, a), "cursor: the first live event");
+	check(!cursor.replaying(), "cursor: it ends the replay");
 	check(
 		cursor.since({ a }) == 1101 && cursor.since({}) == 1101,
 		"cursor: a live event moves every cursor");
@@ -4784,7 +5403,12 @@ void TestCursor(Checker &check) {
 	cursor.connected(true, 1200, { a, b });
 	check(
 		cursor.since({ a, b }) == 1090,
-		"cursor: nothing moves before the replay is over");
+		"cursor: nothing moves before the first event of the replay");
+	check(cursor.accept(1095, b), "cursor: replay, the second room");
+	check(!cursor.accept(1101, a), "cursor: replay, a seen one of the first");
+	check(
+		cursor.since({ a, b }) == 1101,
+		"cursor: every source follows the replay");
 	cursor.heartbeat();
 	check(
 		cursor.since({ a, b }) == 1200,
@@ -4805,6 +5429,31 @@ void TestCursor(Checker &check) {
 	alone.setRoomFloor(a, 700);
 	check(alone.since({ a }) == 700, "cursor: the first connect with a room");
 	check(alone.since({ b }) == 0, "cursor: an unknown room");
+
+	// A reader that is too slow for a busy room: the server cuts the
+	// stream in the middle of the backlog, again and again. Every attempt
+	// has to start after what the previous one has delivered.
+	auto slow = StreamCursor();
+	slow.connected(false, 500, {});
+	slow.setRoomFloor(a, 400);
+	auto asked = std::vector<int64>();
+	auto delivered = 0;
+	for (auto attempt = 0; attempt != 3; ++attempt) {
+		const auto since = slow.since({ a });
+		asked.push_back(since);
+		slow.connected(true, 2000, { a });
+		for (auto id = since + 1; id != since + 201; ++id) {
+			if (slow.accept(id, (id % 5) ? a : QString())) {
+				++delivered;
+			}
+		}
+	}
+	check(
+		asked == std::vector<int64>{ 400, 600, 800 },
+		"cursor: a slow reader moves on with every attempt");
+	check(
+		delivered == 580 && slow.since({ a }) == 1000,
+		"cursor: and gets every event once");
 }
 
 void TestTiming(Checker &check) {
@@ -4830,6 +5479,26 @@ void TestTiming(Checker &check) {
 	check(grows, "backoff: never shrinks");
 	const auto jitter = RandomJitter();
 	check(jitter >= 0. && jitter < 1., "backoff: random jitter range");
+
+	check(
+		StreamFlaps(0, 1000) == 1 && StreamFlaps(4, kStreamSilence) == 5,
+		"stream: one that ends early is a flap");
+	check(
+		StreamFlaps(7, kStreamSilence + 1) == 0,
+		"stream: one that lived long ends the row of flaps");
+	check(
+		StreamFlaps(1000, 0) == kStreamMaxFlaps,
+		"stream: the flaps are capped");
+	auto flaps = 0;
+	auto waits = std::vector<crl::time>();
+	for (auto i = 0; i != 7; ++i) {
+		flaps = StreamFlaps(flaps, 2000);
+		waits.push_back(BackoffDelay(1 + flaps, 0.5, kStreamBackoffCapInRoom));
+	}
+	check(
+		waits == std::vector<crl::time>{
+			2000, 4000, 8000, 16'000, 30'000, 30'000, 30'000 },
+		"stream: every flap in a row doubles the wait up to the cap");
 
 	const auto pick = PickClockSample({
 		{ .sent = 1000, .received = 1080, .server = 5040. },
@@ -4950,9 +5619,27 @@ void TestIdentity(Checker &check, const QString &folder) {
 		.consentAt = 1791327935,
 		.deviceId = u"OJolNaPQycz8_qao"_q,
 		.token = u"OJolNaPQycz8_qao.OJdrdQovFM0_RfVm5FKwOxrCT-ioJk3Sx9JP"_q,
+		.pending = u"PnD1ngSecret0_RfVm5FKwOxrCT-ioJk3Sx9JPa1b2C"_q,
 		.name = QString::fromUtf8("\xD0\x9C\xD0\xB8\xD1\x88\xD0\xB0"),
 		.me = ParseObject("{\"id\":9000000000000042,\"name\":\"x\"}"),
 	};
+	check(
+		ValidDeviceSecret(identity.pending)
+			&& !ValidDeviceSecret(identity.pending.left(42))
+			&& !ValidDeviceSecret(identity.pending + QChar('A'))
+			&& !ValidDeviceSecret(identity.pending.left(42) + QChar('+'))
+			&& !ValidDeviceSecret(identity.pending.left(42) + QChar('='))
+			&& !ValidDeviceSecret(identity.pending.left(42) + QChar('.'))
+			&& !ValidDeviceSecret(QString()),
+		"secret: exactly 43 characters of base64url");
+	const auto made = NewDeviceSecret();
+	check(
+		ValidDeviceSecret(made)
+			&& (made != NewDeviceSecret())
+			&& (QByteArray::fromBase64(
+				made.toLatin1(),
+				QByteArray::Base64UrlEncoding).size() == 32),
+		"secret: 256 new random bits every time");
 	check(SaveIdentity(folder, identity, key), "identity: saved");
 	auto file = QFile(IdentityPath(folder));
 	const auto opened = file.open(QIODevice::ReadOnly);
@@ -4961,6 +5648,18 @@ void TestIdentity(Checker &check, const QString &folder) {
 	check(
 		bytes.contains("token_sealed") && !bytes.contains("OJdrdQovFM0"),
 		"identity: the key is not readable in the file");
+	check(
+		bytes.contains("pending_sealed") && !bytes.contains("PnD1ngSecret"),
+		"identity: the secret on its way is not readable in the file");
+	auto swapped = QJsonDocument::fromJson(bytes).object();
+	swapped.insert(u"token_sealed"_q, swapped.value(u"pending_sealed"_q));
+	const auto mixed = ParseIdentity(
+		QJsonDocument(swapped).toJson(QJsonDocument::Compact),
+		userId,
+		key);
+	check(
+		mixed && mixed->token.isEmpty() && mixed->pending == identity.pending,
+		"identity: a sealed secret is not taken for a key");
 	const auto loaded = LoadIdentity(folder, userId, key);
 	check(
 		loaded
@@ -4971,12 +5670,16 @@ void TestIdentity(Checker &check, const QString &folder) {
 			&& loaded->consentAt == identity.consentAt
 			&& loaded->deviceId == identity.deviceId
 			&& loaded->token == identity.token
+			&& loaded->pending == identity.pending
 			&& loaded->name == identity.name
 			&& loaded->me == identity.me,
 		"identity: round trip");
 	const auto wrongKey = LoadIdentity(folder, userId, RandomBytes(32));
 	check(
-		wrongKey && wrongKey->consent && wrongKey->token.isEmpty(),
+		wrongKey
+			&& wrongKey->consent
+			&& wrongKey->token.isEmpty()
+			&& wrongKey->pending.isEmpty(),
 		"identity: a wrong key loses only the key");
 	check(
 		!LoadIdentity(folder, userId + 1, key),
@@ -4984,15 +5687,42 @@ void TestIdentity(Checker &check, const QString &folder) {
 
 	check(SaveIdentity(folder, identity, QByteArray()), "identity: no seal");
 	const auto plain = LoadIdentity(folder, userId, QByteArray());
-	check(plain && plain->token == identity.token, "identity: plain token");
+	check(
+		plain
+			&& plain->token == identity.token
+			&& plain->pending == identity.pending,
+		"identity: plain token");
 
+	// A registration that is on its way: the consent and the secret that
+	// was sent, no key yet. This is what the next launch finds when the
+	// answer was lost, and what it registers with again.
 	identity.token = QString();
+	identity.deviceId = QString();
+	check(SaveIdentity(folder, identity, key), "identity: saved on the way");
+	const auto onTheWay = LoadIdentity(folder, userId, key);
+	check(
+		onTheWay
+			&& onTheWay->consent
+			&& onTheWay->token.isEmpty()
+			&& onTheWay->pending == identity.pending,
+		"identity: the secret of a lost answer is there at the next launch");
+
+	// The answer is stored: nothing is on its way any more.
+	identity.pending = QString();
 	identity.consent = false;
 	check(SaveIdentity(folder, identity, key), "identity: saved again");
 	const auto withdrawn = LoadIdentity(folder, userId, key);
 	check(
-		withdrawn && !withdrawn->consent && withdrawn->token.isEmpty(),
+		withdrawn
+			&& !withdrawn->consent
+			&& withdrawn->token.isEmpty()
+			&& withdrawn->pending.isEmpty(),
 		"identity: no consent, no key");
+	auto after = QFile(IdentityPath(folder));
+	check(
+		after.open(QIODevice::ReadOnly) && !after.readAll().contains("pending"),
+		"identity: nothing about the secret is left in the file");
+	after.close();
 
 	auto corrupt = QFile(IdentityPath(folder));
 	if (corrupt.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -5011,6 +5741,14 @@ void TestIdentity(Checker &check, const QString &folder) {
 	check(
 		badToken && badToken->token.isEmpty(),
 		"identity: a malformed key is dropped");
+	const auto badPending = ParseIdentity(
+		"{\"user_id\":\"9000000000000042\",\"consent\":true,"
+		"\"pending\":\"too-short\"}",
+		userId,
+		key);
+	check(
+		badPending && badPending->consent && badPending->pending.isEmpty(),
+		"identity: a malformed secret is dropped");
 	QFile::remove(IdentityPath(folder));
 }
 
@@ -5117,6 +5855,90 @@ void TestGate(Checker &check, const QString &folder) {
 	unavailable = nullptr;
 }
 
+// Everybody who asks for one file shares one transfer. Nothing is
+// requested here: the file is there already, so the transfer ends from
+// the event loop without a word to the server.
+void TestTransfers(Checker &check, const QString &folder) {
+	const auto target = folder + u"shared/file.bin"_q;
+	QDir().mkpath(folder + u"shared"_q);
+	auto file = QFile(target);
+	const auto written = file.open(QIODevice::WriteOnly)
+		&& (file.write("x") == 1);
+	file.close();
+	check(written, "transfers: a sample file");
+
+	auto client = std::make_unique<Client>(nullptr);
+	auto paths = QStringList();
+	auto failures = 0;
+	auto cancelled = 0;
+	const auto ask = [&](Fn<void(const QString &path)> done) {
+		return client->download({
+			.path = u"/v1/updates/files/selftest"_q,
+			.to = target,
+			.auth = false,
+			.done = std::move(done),
+			.fail = [&](const Error &) { ++failures; },
+		});
+	};
+	const auto keep = [&](const QString &path) {
+		paths.push_back(path);
+	};
+	const auto drop = [&](const QString &path) {
+		++cancelled;
+	};
+	const auto first = ask(keep);
+	const auto second = ask(keep);
+	const auto third = ask(drop);
+	check(
+		first && second && third && (first != second) && (second != third),
+		"transfers: every caller has an id of its own");
+	client->cancelTransfer(third);
+
+	auto refused = Error();
+	const auto other = client->download({
+		.path = u"/v1/updates/files/another"_q,
+		.to = target,
+		.auth = false,
+		.done = drop,
+		.fail = [&](const Error &error) { refused = error; },
+	});
+	const auto finished = WaitFor([&] {
+		return (paths.size() == 2) && (refused.type != Error::Type::None);
+	}, 3000);
+	check(
+		finished && (paths == QStringList{ target, target }),
+		"transfers: two callers of one file are served by one transfer");
+	check(
+		!other && (refused.type == Error::Type::File),
+		"transfers: another source for the same file is refused");
+
+	const auto lone = ask(drop);
+	client->cancelTransfer(lone);
+	const auto again = ask(keep);
+	const auto repeated = WaitFor([&] {
+		return (paths.size() == 3);
+	}, 3000);
+	check(
+		lone && again && repeated,
+		"transfers: the file can be asked for again after a cancel");
+	check(
+		!cancelled && !failures,
+		"transfers: a cancelled caller hears nothing");
+
+	const auto key = TargetKey(target);
+	check(
+		TargetKey(folder + u"shared/../shared/file.bin"_q) == key,
+		"transfers: one file has one key, however its path is spelled");
+	check(
+		BusyTargets().emplace(key).second
+			&& !BusyTargets().emplace(key).second
+			&& BusyTargets().remove(key)
+			&& BusyTargets().emplace(key).second,
+		"transfers: one account at a time writes a file");
+	BusyTargets().remove(key);
+	client = nullptr;
+}
+
 [[nodiscard]] QString DescribeError(const Error &error) {
 	return u"type %1, status %2, code '%3'"_q.arg(
 		QString::number(int(error.type)),
@@ -5132,6 +5954,92 @@ void TestGate(Checker &check, const QString &folder) {
 	});
 }
 
+// The answer to a registration is lost. What the device has then is its
+// consent and the secret it has sent (Identity::pending), and it registers
+// again with them. A server that knows "secret" gives the same device
+// back, an older one refuses with 409 as it always did: the client works
+// with both, the log says which of them this server is.
+void TestLiveReplay(
+		Checker &check,
+		QStringList &log,
+		const QString &folder,
+		uint64 userId,
+		const QByteArray &testKey) {
+	const auto firstFolder = folder + u"replay_first/"_q;
+	const auto againFolder = folder + u"replay_again/"_q;
+	auto first = std::make_unique<Account>(Account::Descriptor{
+		.userId = userId,
+		.folder = firstFolder,
+		.testKey = testKey,
+	});
+	first->agree(QString());
+	const auto registered = WaitFor([&] { return first->ready(); }, 25'000);
+	const auto kept = LoadIdentity(firstFolder, userId, QByteArray());
+	check(
+		registered
+			&& kept
+			&& ValidToken(kept->token)
+			&& kept->pending.isEmpty(),
+		"live: registered, no secret is left on its way");
+	if (!registered || !kept || !ValidToken(kept->token)) {
+		log.push_back(u"live: replay: "_q + DescribeError(first->lastError()));
+		return;
+	}
+	const auto secret = kept->token.mid(kept->token.indexOf(QChar('.')) + 1);
+	auto again = std::unique_ptr<Account>();
+	if (!ValidDeviceSecret(secret)) {
+		log.push_back(u"live: replay: skipped, the key has another form"_q);
+	} else {
+		// The file as it was at the moment the answer got lost.
+		const auto lost = Identity{
+			.userId = userId,
+			.consent = true,
+			.consentAt = kept->consentAt,
+			.pending = secret,
+		};
+		const auto written = SaveIdentity(againFolder, lost, QByteArray());
+		again = std::make_unique<Account>(Account::Descriptor{
+			.userId = userId,
+			.folder = againFolder,
+			.testKey = testKey,
+		});
+		const auto answered = written && WaitFor([&] {
+			return again->ready() || (again->state() == State::NeedsLink);
+		}, 25'000);
+		const auto now = LoadIdentity(againFolder, userId, QByteArray());
+		const auto same = answered
+			&& again->ready()
+			&& now
+			&& (now->token == kept->token)
+			&& now->pending.isEmpty();
+		const auto refused = answered
+			&& !again->ready()
+			&& again->lastError().is("already_registered")
+			&& now
+			&& (now->pending == secret);
+		check(
+			same || refused,
+			"live: a registration sent again: the same device, or 409");
+		log.push_back(same
+			? u"live: replay: the same device again, registration is "_q
+				+ u"idempotent on this server"_q
+			: refused
+			? u"live: replay: 409, this server does not know \"secret\""_q
+			: (u"live: replay: "_q + DescribeError(again->lastError())));
+	}
+
+	// Both objects are one device of one test id: it is deleted once.
+	again = nullptr;
+	auto finished = false;
+	first->deleteData([&] {
+		finished = true;
+	}, [&](const Error &error) {
+		finished = true;
+		log.push_back(u"live: replay: cleanup failed, "_q + DescribeError(error));
+	});
+	WaitFor([&] { return finished; }, 15'000);
+}
+
 // Against the real server, with fake ids from its reserved test range:
 // they live in a world of their own and are erased by the test itself
 // (and by the server two hours later, if the test died on the way).
@@ -5144,14 +6052,29 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 		QString::number(first),
 		QString::number(first + 1)));
 
+	// The key the server wants for its fake test ids comes only from the
+	// environment of the one who runs the test, it is never in the app.
+	const auto testKey = qEnvironmentVariable(
+		kTestKeyVariable).trimmed().toLatin1();
+	log.push_back(testKey.isEmpty()
+		? u"live: no test key, %1 is not set"_q.arg(
+			QString::fromLatin1(kTestKeyVariable))
+		: !ValidHeaderValue(testKey)
+		? u"live: the test key in %1 can't be sent as a header"_q.arg(
+			QString::fromLatin1(kTestKeyVariable))
+		: u"live: registrations carry the test key in %1"_q.arg(
+			QString::fromLatin1(kTestKeyHeader)));
+
 	auto a = std::make_unique<Account>(Account::Descriptor{
 		.userId = first,
 		.folder = folder + u"a/"_q,
 		.sealKey = RandomBytes(32),
+		.testKey = testKey,
 	});
 	auto b = std::make_unique<Account>(Account::Descriptor{
 		.userId = first + 1,
 		.folder = folder + u"b/"_q,
+		.testKey = testKey,
 	});
 	auto c = std::unique_ptr<Account>();
 	const auto nameA = QString::fromUtf8(
@@ -5183,6 +6106,17 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 		log.push_back(u"live: b: "_q + DescribeError(b->lastError()));
 		cleanup();
 		return;
+	}
+	if (!CurrentConfig().insecure) {
+		auto ignored = QStringList();
+		for (const auto code : PinErrorsSeen()) {
+			ignored.push_back(QString::number(code));
+		}
+		log.push_back(ignored.isEmpty()
+			? u"live: tls: the pinned certificate passed without errors"_q
+			: (u"live: tls: errors of the pinned certificate that were "_q
+				+ u"ignored by their list (QSslError codes): "_q
+				+ ignored.join(u", "_q)));
 	}
 	check(
 		a->me().id == first && a->me().test && a->me().name == nameA,
@@ -5421,7 +6355,18 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 		.fail = fail,
 	});
 	WaitFor([&] { return step != 0; }, 30'000);
-	check(step == 1, "live: a file the server has is not sent again");
+	check(step == 1, "live: the same file is taken from another user too");
+	step = 0;
+	a->upload({
+		.bytes = blob,
+		.kind = u"audio"_q,
+		.done = [&](const QString &media, int64 total) {
+			step = (media == sha) ? 1 : -1;
+		},
+		.fail = fail,
+	});
+	WaitFor([&] { return step != 0; }, 30'000);
+	check(step == 1, "live: a file the server has from its owner is known");
 
 	const auto target = folder + u"dl/blob.bin"_q;
 	step = 0;
@@ -5496,6 +6441,7 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 	c = std::make_unique<Account>(Account::Descriptor{
 		.userId = first,
 		.folder = folder + u"c/"_q,
+		.testKey = testKey,
 	});
 	c->agree(QString());
 	const auto bound = WaitFor([&] {
@@ -5537,8 +6483,16 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 	lifetime.destroy();
 	inRoomA.destroy();
 	inRoomB.destroy();
+	// The server says "bye, deleted" in the event stream before it
+	// answers the request, so either of the two may come first here: the
+	// one who asked has to hear "done" in both orders, and only once.
 	step = 0;
-	a->deleteData([&] { step = 1; }, fail);
+	failed = Error();
+	auto deletedA = 0;
+	a->deleteData([&] {
+		++deletedA;
+		step = 1;
+	}, fail);
 	WaitFor([&] { return step != 0; }, 20'000);
 	check(
 		step == 1
@@ -5546,6 +6500,12 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 			&& !a->consented()
 			&& !QFileInfo::exists(IdentityPath(folder + u"a/"_q)),
 		"live: the data is deleted and the key is forgotten");
+	if (step != 1 || a->state() != State::NoConsent) {
+		log.push_back(u"live: delete: step %1, state %2, %3"_q.arg(
+			QString::number(step),
+			QString::number(int(a->state())),
+			DescribeError(failed)));
+	}
 	const auto told = WaitFor([&] {
 		return (c->state() == State::NoConsent)
 			|| (c->state() == State::Disconnected);
@@ -5554,13 +6514,33 @@ void TestLive(Checker &check, QStringList &log, const QString &folder) {
 		told && !c->ready(),
 		"live: the other device learns about the deletion");
 	step = 0;
-	b->deleteData([&] { step = 1; }, fail);
+	failed = Error();
+	auto deletedB = 0;
+	b->deleteData([&] { ++deletedB; }, fail);
+	b->deleteData([&] {
+		++deletedB;
+		step = 1;
+	}, fail);
 	WaitFor([&] { return step != 0; }, 20'000);
 	check(step == 1 && !b->ready(), "live: the second identity is deleted");
+	if (step != 1) {
+		log.push_back(u"live: delete: step %1, state %2, %3"_q.arg(
+			QString::number(step),
+			QString::number(int(b->state())),
+			DescribeError(failed)));
+	}
+	auto ticks = 0;
+	WaitFor([&] { return (++ticks > 20); }, 3000);
+	check(
+		deletedA == 1 && deletedB == 2,
+		"live: everybody who asked for the deletion is told once");
 	cleanup();
 	c = nullptr;
 	b = nullptr;
 	a = nullptr;
+
+	// One more test id, registered and deleted by this check alone.
+	TestLiveReplay(check, log, folder, first + 2, testKey);
 }
 
 } // namespace
@@ -5589,6 +6569,8 @@ bool RunSelfTest(QStringList &log) {
 	check.section("identity file");
 	TestGate(check, folder);
 	check.section("consent gate");
+	TestTransfers(check, folder);
+	check.section("shared transfers");
 	if (qEnvironmentVariable(kLiveVariable).trimmed() == u"1"_q) {
 		TestLive(check, log, folder);
 		check.section("live");

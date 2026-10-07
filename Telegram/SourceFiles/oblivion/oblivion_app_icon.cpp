@@ -65,9 +65,69 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace Oblivion {
 namespace {
 
-constexpr auto kTelegramChoice = "telegram";
-constexpr auto kPreviousChoice = "previous";
 constexpr auto kCustomChoice = "custom";
+
+// The icons that come with the app, in the order of their tiles.
+//
+// Five designs were drawn for Oblivion (design-mockups/icons). The first
+// one, "eclipse", is the bundle icon (design-mockups/src/install_icon.py),
+// so it has no picture here and stays the empty choice that the default has
+// always been. The other four are 512 px pictures (see make_design_icons.sh
+// next to them): enough for a Dock tile on a Retina screen and four times
+// smaller than 1024 px ones, the system scales them.
+//
+// The choice is what is stored in the settings: the values are never
+// renamed or reused, a new icon gets a new one. All the pictures are in
+// mac_icons.qrc, a build without it simply has no such tiles.
+enum class BundledIcon {
+	Eclipse,
+	Portal,
+	Ghost,
+	Shadow,
+	Horizon,
+	Previous, // The Oblivion icon used before the "eclipse" one.
+	Telegram,
+};
+
+struct BundledIconInfo {
+	BundledIcon icon = BundledIcon::Eclipse;
+	const char *choice = "";
+	const char *resource = nullptr; // Null: the bundle icon.
+};
+
+constexpr BundledIconInfo kBundledIcons[] = {
+	{ BundledIcon::Eclipse, "", nullptr },
+	{
+		BundledIcon::Portal,
+		"portal",
+		":/gui/art/oblivion/portal_icon.png",
+	},
+	{
+		BundledIcon::Ghost,
+		"ghost",
+		":/gui/art/oblivion/ghost_icon.png",
+	},
+	{
+		BundledIcon::Shadow,
+		"shadow",
+		":/gui/art/oblivion/shadow_icon.png",
+	},
+	{
+		BundledIcon::Horizon,
+		"horizon",
+		":/gui/art/oblivion/horizon_icon.png",
+	},
+	{
+		BundledIcon::Previous,
+		"previous",
+		":/gui/art/oblivion/previous_icon.png",
+	},
+	{
+		BundledIcon::Telegram,
+		"telegram",
+		":/gui/art/oblivion/telegram_icon.png",
+	},
+};
 
 constexpr auto kIconSize = 1024;
 constexpr auto kBodyMargin = 100;
@@ -85,6 +145,8 @@ constexpr auto kTileBottomSkip = 8;
 constexpr auto kTileRingSkip = 4;
 constexpr auto kTileRadius = 10;
 constexpr auto kTileTextPadding = 4;
+constexpr auto kTileMaxColumns = 4;
+constexpr auto kTileRowSkip = 4;
 
 // Only a QImage here, static QPixmap / QIcon can't outlive QApplication.
 struct Current {
@@ -101,28 +163,87 @@ struct Current {
 	return cWorkingDir() + u"tdata/oblivion_app_icon.png"_q;
 }
 
-[[nodiscard]] QImage TelegramIcon() {
-	return QImage(u":/gui/art/oblivion/telegram_icon.png"_q);
+[[nodiscard]] QString BundledChoice(const BundledIconInfo &info) {
+	return QString::fromLatin1(info.choice);
 }
 
-// The Oblivion icon used before the "eclipse" one became the bundle icon.
-[[nodiscard]] QImage PreviousIcon() {
-	return QImage(u":/gui/art/oblivion/previous_icon.png"_q);
+// Null for the bundle icon and for a picture this build doesn't have.
+[[nodiscard]] QImage BundledPicture(const BundledIconInfo &info) {
+	return info.resource
+		? QImage(QString::fromLatin1(info.resource))
+		: QImage();
+}
+
+[[nodiscard]] rpl::producer<QString> BundledName(BundledIcon icon) {
+	switch (icon) {
+	case BundledIcon::Eclipse: return tr::lng_oblivion_app_icon_eclipse();
+	case BundledIcon::Portal: return tr::lng_oblivion_app_icon_portal();
+	case BundledIcon::Ghost: return tr::lng_oblivion_app_icon_ghost();
+	case BundledIcon::Shadow: return tr::lng_oblivion_app_icon_shadow();
+	case BundledIcon::Horizon: return tr::lng_oblivion_app_icon_horizon();
+	case BundledIcon::Previous: return tr::lng_oblivion_app_icon_previous();
+	case BundledIcon::Telegram: return tr::lng_oblivion_app_icon_telegram();
+	}
+	Unexpected("Icon in Oblivion::BundledName.");
 }
 
 [[nodiscard]] QImage CustomIcon() {
 	return QImage(CustomIconPath());
 }
 
+// Null: the bundle icon is used (the empty choice or an unknown one).
 [[nodiscard]] QImage ChoiceImage(const QString &choice) {
-	if (choice == kTelegramChoice) {
-		return TelegramIcon();
-	} else if (choice == kPreviousChoice) {
-		return PreviousIcon();
-	} else if (choice == kCustomChoice) {
+	if (choice.isEmpty()) {
+		return QImage();
+	} else if (choice == QLatin1String(kCustomChoice)) {
 		return CustomIcon();
 	}
+	for (const auto &info : kBundledIcons) {
+		if (choice == QLatin1String(info.choice)) {
+			return BundledPicture(info);
+		}
+	}
 	return QImage();
+}
+
+// The tiles go in equal rows of up to kTileMaxColumns: eight of them make
+// two rows of four, five would make three and two.
+struct TileGrid {
+	int columns = 0;
+	int rows = 0;
+};
+
+[[nodiscard]] TileGrid TilesGrid(int count) {
+	if (count <= 0) {
+		return {};
+	}
+	const auto rows = (count + kTileMaxColumns - 1) / kTileMaxColumns;
+	return { .columns = (count + rows - 1) / rows, .rows = rows };
+}
+
+[[nodiscard]] int TilesHeight(int count, int tileHeight, int rowSkip) {
+	const auto rows = TilesGrid(count).rows;
+	return rows * tileHeight + std::max(rows - 1, 0) * rowSkip;
+}
+
+// The columns share the whole width, a remainder goes into the tiles and
+// not between them, so that the hover backgrounds stay side by side.
+[[nodiscard]] QRect TileGeometry(
+		int index,
+		int count,
+		int width,
+		int tileHeight,
+		int rowSkip) {
+	const auto columns = std::max(TilesGrid(count).columns, 1);
+	const auto column = index % columns;
+	const auto row = index / columns;
+	const auto left = width * column / columns;
+	const auto right = width * (column + 1) / columns;
+	return QRect(
+		left,
+		row * (tileHeight + rowSkip),
+		right - left,
+		tileHeight);
 }
 
 void RefreshCurrent() {
@@ -479,12 +600,17 @@ void IconTile::paintEvent(QPaintEvent *e) {
 
 // Everything the box shows and the session-bound actions, so that it can
 // be created without a window (see oblivion_ui_snapshots.h).
+struct AppIconOption {
+	QString choice; // As it is stored, empty for the bundle icon.
+	rpl::producer<QString> name;
+	QImage image;
+};
+
 struct AppIconBoxArgs {
-	QImage oblivion; // The bundle icon.
-	QImage previous; // The former Oblivion icon, null: no such tile.
-	QImage telegram;
+	// The icons that come with the app, a tile for each one.
+	std::vector<AppIconOption> options;
 	QImage custom; // Null: the '+' placeholder that opens the picker.
-	// Empty, kPreviousChoice, kTelegramChoice, kCustomChoice.
+	// The choice of one of the options or kCustomChoice.
 	rpl::producer<QString> choice;
 	bool finder = false;
 
@@ -532,44 +658,35 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 			st::boxRowPadding.top(),
 			st::boxRowPadding.right() / 2,
 			st::boxRowPadding.bottom()));
-	row->resize(row->width(), IconTile::ComputeHeight());
 
-	const auto oblivion = Ui::CreateChild<IconTile>(
-		row,
-		tr::lng_oblivion_app_icon_default());
-	// Only where the picture is bundled (mac_icons.qrc).
-	const auto previous = args.previous.isNull()
-		? nullptr
-		: Ui::CreateChild<IconTile>(
+	// The icons of the app and then the custom one, the last tile.
+	struct Tile {
+		QString choice;
+		not_null<IconTile*> widget;
+	};
+	auto tiles = std::vector<Tile>();
+	tiles.reserve(args.options.size() + 1);
+	for (auto &option : args.options) {
+		const auto tile = Ui::CreateChild<IconTile>(
 			row,
-			tr::lng_oblivion_app_icon_previous());
-	const auto telegram = Ui::CreateChild<IconTile>(
-		row,
-		tr::lng_oblivion_app_icon_telegram());
+			std::move(option.name));
+		tile->setImage(std::move(option.image));
+		tiles.push_back({ option.choice, tile });
+	}
 	const auto custom = Ui::CreateChild<IconTile>(
 		row,
 		tr::lng_oblivion_app_icon_custom_short());
-	auto tiles = std::vector<not_null<IconTile*>>{ oblivion };
-	if (previous) {
-		tiles.push_back(previous);
-	}
-	tiles.push_back(telegram);
-	tiles.push_back(custom);
-
-	oblivion->setImage(std::move(args.oblivion));
-	if (previous) {
-		previous->setImage(std::move(args.previous));
-	}
-	telegram->setImage(std::move(args.telegram));
 	custom->setImage(std::move(args.custom));
+	tiles.push_back({ QString::fromLatin1(kCustomChoice), custom });
 
+	const auto count = int(tiles.size());
+	const auto tileHeight = IconTile::ComputeHeight();
+	const auto rowSkip = style::ConvertScale(kTileRowSkip);
+	row->resize(row->width(), TilesHeight(count, tileHeight, rowSkip));
 	row->widthValue() | rpl::on_next([=](int width) {
-		const auto count = int(tiles.size());
-		const auto height = IconTile::ComputeHeight();
 		for (auto i = 0; i != count; ++i) {
-			const auto left = width * i / count;
-			const auto right = width * (i + 1) / count;
-			tiles[i]->setGeometry(left, 0, right - left, height);
+			tiles[i].widget->setGeometry(
+				TileGeometry(i, count, width, tileHeight, rowSkip));
 		}
 	}, row->lifetime());
 
@@ -582,12 +699,9 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 			: anim::type::instant;
 		state->initialized = true;
 		state->choice = choice;
-		oblivion->setSelected(choice.isEmpty(), animated);
-		if (previous) {
-			previous->setSelected(choice == kPreviousChoice, animated);
+		for (const auto &tile : tiles) {
+			tile.widget->setSelected(tile.choice == choice, animated);
 		}
-		telegram->setSelected(choice == kTelegramChoice, animated);
-		custom->setSelected(choice == kCustomChoice, animated);
 	}, box->lifetime());
 
 	const auto choose = [=](const QString &choice) {
@@ -647,17 +761,20 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 			done);
 	};
 
-	oblivion->setClickedCallback([=] { choose(QString()); });
-	if (previous) {
-		previous->setClickedCallback([=] { choose(kPreviousChoice); });
+	for (const auto &tile : tiles) {
+		if (tile.widget.get() == custom) {
+			continue;
+		}
+		tile.widget->setClickedCallback([=, choice = tile.choice] {
+			choose(choice);
+		});
 	}
-	telegram->setClickedCallback([=] { choose(kTelegramChoice); });
 	custom->setClickedCallback([=] {
 		// The '+' placeholder (no readable custom icon) opens the picker.
 		if (!custom->hasImage()) {
 			pickCustom();
 		} else {
-			choose(kCustomChoice);
+			choose(QString::fromLatin1(kCustomChoice));
 		}
 	});
 
@@ -712,6 +829,27 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 	box->addButton(tr::lng_box_done(), [=] { box->closeBox(); });
 }
 
+// The bundle icon always has its tile, the other ones only where their
+// pictures are bundled (mac_icons.qrc).
+[[nodiscard]] std::vector<AppIconOption> BundledOptions() {
+	auto result = std::vector<AppIconOption>();
+	result.reserve(std::size(kBundledIcons));
+	for (const auto &info : kBundledIcons) {
+		auto image = info.resource
+			? BundledPicture(info)
+			: internal::BundleIconImage(kIconSize / 2);
+		if (info.resource && image.isNull()) {
+			continue;
+		}
+		result.push_back(AppIconOption{
+			.choice = BundledChoice(info),
+			.name = BundledName(info.icon),
+			.image = std::move(image),
+		});
+	}
+	return result;
+}
+
 // Scenes for the "ui" self-test mode, see oblivion_ui_snapshots.h.
 [[nodiscard]] object_ptr<Ui::BoxContent> SampleAppIconBox(
 		const QString &choice,
@@ -719,9 +857,7 @@ void AppIconBox(not_null<Ui::GenericBox*> box, AppIconBoxArgs &&args) {
 		bool finder) {
 	const auto current = std::make_shared<rpl::variable<QString>>(choice);
 	return Box(AppIconBox, AppIconBoxArgs{
-		.oblivion = internal::BundleIconImage(kIconSize / 2),
-		.previous = PreviousIcon(),
-		.telegram = TelegramIcon(),
+		.options = BundledOptions(),
 		.custom = std::move(custom),
 		.choice = current->value(),
 		.finder = finder,
@@ -742,12 +878,24 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	constexpr auto kSceneWait = crl::time(600);
 	const auto width = style::ConvertScale(kSceneWidth);
 
-	// First open: the bundle icon is used, no custom picture yet.
+	// First open: the bundle icon is used, no custom picture yet. All the
+	// tiles are seen: five designs, the previous icon, Telegram, the custom.
 	RegisterScene({
 		.name = u"appicon_box"_q,
 		.size = QSize(width, 0),
 		.box = [](std::shared_ptr<Ui::Show>) {
 			return SampleAppIconBox(QString(), QImage(), false);
+		},
+		.wait = kSceneWait,
+	});
+
+	// Another design is chosen: the light one, its body and the selection
+	// ring have to stay seen on the light box background as well.
+	RegisterScene({
+		.name = u"appicon_box_design"_q,
+		.size = QSize(width, 0),
+		.box = [](std::shared_ptr<Ui::Show>) {
+			return SampleAppIconBox(u"shadow"_q, QImage(), false);
 		},
 		.wait = kSceneWait,
 	});
@@ -767,6 +915,158 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 });
 
 } // namespace
+
+bool RunAppIconSelfTest(QStringList &log) {
+	auto passed = 0;
+	auto failed = 0;
+	const auto check = [&](bool condition, const QString &what) {
+		if (condition) {
+			++passed;
+		} else {
+			++failed;
+			log.push_back(u"FAILED: "_q + what);
+		}
+	};
+	auto sectionPassed = 0;
+	auto sectionFailed = 0;
+	const auto section = [&](const char *name) {
+		log.push_back(u"%1: %2 passed, %3 failed"_q.arg(
+			QString::fromLatin1(name),
+			QString::number(passed - sectionPassed),
+			QString::number(failed - sectionFailed)));
+		sectionPassed = passed;
+		sectionFailed = failed;
+	};
+
+	// The stored values keep their meaning from version to version: the
+	// empty one is the bundle icon, the other ones are never renamed.
+	const char *const expected[] = {
+		"",
+		"portal",
+		"ghost",
+		"shadow",
+		"horizon",
+		"previous",
+		"telegram",
+	};
+	check(std::size(kBundledIcons) == std::size(expected),
+		u"the count of the bundled icons"_q);
+	auto seen = QStringList{ QString::fromLatin1(kCustomChoice) };
+	auto index = 0;
+	for (const auto &info : kBundledIcons) {
+		const auto choice = BundledChoice(info);
+		check((index < int(std::size(expected)))
+			&& (choice == QLatin1String(expected[index])),
+			u"the stored value of the icon %1"_q.arg(index));
+		check(!seen.contains(choice), u"a unique value: "_q + choice);
+		check(choice.isEmpty() == !info.resource,
+			u"only the bundle icon has no picture: "_q + choice);
+		seen.push_back(choice);
+		++index;
+	}
+	check(ChoiceImage(QString()).isNull(), u"the empty choice"_q);
+	check(ChoiceImage(u"no_such_icon"_q).isNull(), u"an unknown choice"_q);
+	section("choices");
+
+	// The pictures are ready icons on the same canvas as the bundle one:
+	// transparent margins around the body, so the selection ring of a tile
+	// goes around every one of them the same way.
+	const auto bundled = !ChoiceImage(u"telegram"_q).isNull();
+#if defined Q_OS_MAC && !defined OS_MAC_STORE
+	check(bundled, u"mac_icons.qrc is a part of this build"_q);
+#endif // Q_OS_MAC && !OS_MAC_STORE
+	if (!bundled) {
+		log.push_back(u"pictures: not bundled in this build, skipped"_q);
+	} else {
+		for (const auto &info : kBundledIcons) {
+			if (!info.resource) {
+				continue;
+			}
+			const auto choice = BundledChoice(info);
+			const auto image = ChoiceImage(choice);
+			check(!image.isNull(), u"the picture of "_q + choice);
+			if (image.isNull()) {
+				continue;
+			}
+			const auto side = image.width();
+			check((side == image.height()) && (side >= kIconSize / 2),
+				u"a square picture of 512 px or more: "_q + choice);
+			check(HasTransparentCorners(image),
+				u"transparent corners: "_q + choice);
+			const auto margin = side * kBodyMargin / kIconSize;
+			const auto middle = side / 2;
+			check((qAlpha(image.pixel(margin / 2, middle)) < 64)
+				&& (qAlpha(image.pixel(middle, margin / 2)) < 64),
+				u"transparent margins: "_q + choice);
+			check((qAlpha(image.pixel(margin + side / 64, middle)) > 224)
+				&& (qAlpha(image.pixel(middle, middle)) > 224),
+				u"an opaque body: "_q + choice);
+		}
+		section("pictures");
+	}
+
+	const auto grid = [](int count, int columns, int rows) {
+		const auto result = TilesGrid(count);
+		return (result.columns == columns) && (result.rows == rows);
+	};
+	check(grid(0, 0, 0), u"no tiles"_q);
+	check(grid(1, 1, 1), u"one tile"_q);
+	check(grid(2, 2, 1), u"two tiles"_q);
+	check(grid(4, 4, 1), u"four tiles in a row"_q);
+	check(grid(5, 3, 2), u"five tiles in equal rows"_q);
+	check(grid(8, 4, 2), u"eight tiles in two rows"_q);
+	check(grid(9, 3, 3), u"nine tiles in three rows"_q);
+	// What the box shows: the bundled icons and the custom one.
+	check(grid(int(std::size(kBundledIcons)) + 1, 4, 2),
+		u"the tiles of the box make two full rows"_q);
+	check(TilesHeight(0, 100, 4) == 0, u"no tiles have no height"_q);
+
+	constexpr auto kTestHeight = 100;
+	constexpr auto kTestSkip = 4;
+	for (auto count = 1; count != 13; ++count) {
+		for (const auto width : { 85, 340, 341, 343, 347 }) {
+			const auto size = TilesGrid(count);
+			auto good = (size.columns <= kTileMaxColumns)
+				&& (size.columns * size.rows >= count)
+				&& (size.columns * (size.rows - 1) < count);
+			auto previous = QRect();
+			for (auto i = 0; good && (i != count); ++i) {
+				const auto rect = TileGeometry(
+					i,
+					count,
+					width,
+					kTestHeight,
+					kTestSkip);
+				const auto column = i % size.columns;
+				const auto row = i / size.columns;
+				const auto share = width / size.columns;
+				good = (rect.height() == kTestHeight)
+					&& (rect.top() == row * (kTestHeight + kTestSkip))
+					&& (rect.width() >= share)
+					&& (rect.width() <= share + 1)
+					&& (rect.left() == (column
+						? (previous.left() + previous.width())
+						: 0))
+					&& ((column != size.columns - 1)
+						|| (rect.left() + rect.width() == width));
+				previous = rect;
+			}
+			good = good
+				&& (TilesHeight(count, kTestHeight, kTestSkip)
+					== (size.rows * kTestHeight
+						+ (size.rows - 1) * kTestSkip));
+			check(good, u"the grid of %1 tiles in %2 px"_q.arg(
+				QString::number(count),
+				QString::number(width)));
+		}
+	}
+	section("grid");
+
+	log.push_back(u"app_icon: %1 checks passed, %2 failed"_q.arg(
+		QString::number(passed),
+		QString::number(failed)));
+	return !failed;
+}
 
 QIcon AppIconOverride() {
 	const auto &image = CurrentState().image;
@@ -800,9 +1100,7 @@ void StartAppIcon() {
 void ShowAppIconBox(not_null<Window::SessionController*> controller) {
 	const auto weak = base::make_weak(controller);
 	controller->show(Box(AppIconBox, AppIconBoxArgs{
-		.oblivion = internal::BundleIconImage(kIconSize / 2),
-		.previous = PreviousIcon(),
-		.telegram = TelegramIcon(),
+		.options = BundledOptions(),
 		.custom = CustomIcon(),
 		.choice = rpl::single(
 			rpl::empty

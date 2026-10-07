@@ -34,6 +34,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "lottie/lottie_icon.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_look_hooks.h"
 #include "storage/localstorage.h"
 #include "support/support_helper.h"
 #include "ui/empty_userpic.h"
@@ -484,11 +485,26 @@ void PaintRow(
 	if (swipeTranslation) {
 		p.translate(-swipeTranslation, 0);
 	}
-	p.fillRect(geometry, bg);
+	// Oblivion looks: the chosen and the hovered row as a card of the
+	// look, the usual fill with the plain look.
+	if (!Oblivion::Look::PaintDialogRow(
+			p,
+			geometry,
+			context.currentBg,
+			bg,
+			context.active,
+			context.selected)) {
+		p.fillRect(geometry, bg);
+	}
 	if (!(flags & Flag::TopicJumpRipple)) {
 		auto ripple = context.active
 			? st::dialogsRippleBgActive
 			: st::dialogsRippleBg;
+		// Oblivion looks: the ripple stays inside of the card of the row.
+		const auto card = Oblivion::Look::DialogRippleClip(
+			p,
+			geometry,
+			context.active || context.selected);
 		row->paintRipple(p, 0, 0, context.width, &ripple->c);
 	}
 

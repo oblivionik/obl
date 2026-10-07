@@ -27,6 +27,10 @@ struct StatusInfo {
 	QString name; // The name of the user in Oblivion, may be empty.
 	bool unavailable = false; // An account of the Telegram test server.
 	QString motd; // One line from the admin of the server, or empty.
+	// NeedsLink only: the server keeps the account, but no device is
+	// linked to it any more (after a logout of Telegram on the last one),
+	// so there is no "other device" to get a code from.
+	bool reserved = false;
 };
 
 [[nodiscard]] rpl::producer<StatusInfo> StatusValue(

@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_room_canvas.h"
 
+#include "base/flat_map.h"
 #include "base/platform/base_platform_info.h"
 #include "base/random.h"
 #include "base/timer.h"
@@ -38,6 +39,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_window.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonObject>
 #include <QtCore/QPointer>
@@ -52,12 +54,43 @@ constexpr auto kLiveInterval = crl::time(50);
 constexpr auto kLiveExpire = crl::time(5000);
 constexpr auto kLiveInFlightLimit = 2;
 constexpr auto kMaxLives = 32;
+// What the others draw comes from them as it is: the points of a stroke
+// may be anywhere on the board, and stroking a wide line that goes from
+// edge to edge thousands of times takes seconds. So what is painted on
+// the main thread is limited by its weight (StrokeWeight): the length
+// in canvas units and kPointWeight more for every point.
+constexpr auto kPointWeight = 8;
+// What the others draw right now: a member draws one line at a time (one
+// more may wait for its finished stroke), all the previews together are
+// not heavier than this (the longest line a hand can draw is about a
+// half of it), the width is what the tools give (the eraser of the
+// largest size) and nobody draws one line for ten minutes.
+constexpr auto kMaxLivesOfUser = 3;
+constexpr auto kLiveWeightBudget = int64(240'000);
+constexpr auto kLiveMaxSize = 128;
+constexpr auto kLiveMaxAge = crl::time(600'000);
+// The previews are painted again as a whole only when one of them is
+// gone, and not more often than this. Whatever painting them has taken,
+// four times as long passes before they are painted again.
+constexpr auto kLivesRepaintInterval = crl::time(100);
+constexpr auto kLivesPaceFactor = 4;
+constexpr auto kLivesPaceMax = crl::time(1000);
 constexpr auto kRevealCatchUp = 80.; // Milliseconds to show what has come.
 constexpr auto kRevealMinSpeed = 0.06; // Points per millisecond.
 constexpr auto kMinDistance = 2; // Canvas units between the raw points.
 constexpr auto kRawPointsFactor = 4; // Raw points per stroke, in limits.
-constexpr auto kSyncRebuildNumbers = 40000;
+// Finished strokes heavier than this together (those of the others: the
+// user's own ones were drawn by a hand) and a whole board heavier than
+// this are painted off the main thread.
+constexpr auto kSyncPaintWeight = int64(48'000);
 constexpr auto kResizeRebuildDelay = crl::time(120);
+// The whole board is painted again (a stroke was removed, one came out
+// of order) not more often than this, however fast such events come.
+constexpr auto kRebuildInterval = crl::time(100);
+// Events kept while the board is being loaded.
+constexpr auto kHeldLimit = 1000;
+constexpr auto kReloadDelay = crl::time(3000);
+constexpr auto kReloadDelayMax = crl::time(60'000);
 constexpr auto kErrorToastInterval = crl::time(3000);
 constexpr auto kOwnIdsLimit = 256;
 constexpr auto kMarkerAlpha = 110;
@@ -265,6 +298,261 @@ private:
 		}
 	}
 	return true;
+}
+
+// What one more point adds to the weight of a line (see StrokeWeight):
+// from is its last point so far, if it has any.
+[[nodiscard]] int64 PointWeight(const QPoint *from, QPoint point) {
+	return kPointWeight + (from
+		? (int64(std::abs(point.x() - from->x()))
+			+ int64(std::abs(point.y() - from->y())))
+		: int64(0));
+}
+
+// ---- A line that grows.
+//
+// A line somebody draws right now gets its points one by one. Stroking
+// the whole of it again for every new point costs more and more as it
+// gets longer (and a member who sends previews could make that cost as
+// large as he likes), so a growing line is kept as a picture and only
+// what the new points add is painted into it.
+//
+// Every point is a control point of the smoothing (see StrokePath), the
+// curve goes through the middles between the points: of count points
+// the part up to the middle of the last segment never changes again.
+// The parts are painted with CompositionMode_Source, they replace what
+// is under them, so a translucent line has one alpha where its parts
+// (and its own turns) overlap, as a line stroked at once has.
+
+[[nodiscard]] QPointF Middle(QPoint a, QPoint b) {
+	return (QPointF(a) + QPointF(b)) / 2.;
+}
+
+// Where the part of the line that can't change ends.
+[[nodiscard]] QPointF StableEnd(const std::vector<QPoint> &points, int count) {
+	return (count < 3)
+		? QPointF(points.front())
+		: Middle(points[count - 2], points[count - 1]);
+}
+
+[[nodiscard]] QColor StrokeColor(
+		const CanvasStroke &stroke,
+		const QColor &background) {
+	const auto eraser = (stroke.tool == CanvasTool::Eraser);
+	auto color = eraser ? background : stroke.color;
+	color.setAlpha(eraser ? 255 : std::clamp(stroke.alpha, 1, 255));
+	return color;
+}
+
+[[nodiscard]] QPen StrokePen(
+		const CanvasStroke &stroke,
+		const QColor &background) {
+	auto pen = QPen(
+		StrokeColor(stroke, background),
+		double(std::clamp(stroke.size, 1, 256)));
+	pen.setCapStyle(Qt::RoundCap);
+	pen.setJoinStyle(Qt::RoundJoin);
+	return pen;
+}
+
+// Adds what the points [0, till) define for good beyond what the points
+// [0, from) did. The painter is in canvas units and replaces the pixels.
+void PaintStrokeGrowth(
+		QPainter &p,
+		const CanvasStroke &stroke,
+		const QColor &background,
+		int from,
+		int till) {
+	const auto &points = stroke.points;
+	from = std::max(from, 0);
+	till = std::min(till, int(points.size()));
+	if (till <= from) {
+		return;
+	}
+	if (!from) {
+		// The round start of the line, a dot while it is one point.
+		const auto radius = std::clamp(stroke.size, 1, 256) / 2.;
+		p.setPen(Qt::NoPen);
+		p.setBrush(StrokeColor(stroke, background));
+		p.drawEllipse(QPointF(points.front()), radius, radius);
+	}
+	if (till < 3) {
+		return;
+	}
+	const auto known = std::max(from, 2);
+	auto path = QPainterPath();
+	path.moveTo(StableEnd(points, known));
+	for (auto i = known - 1; i + 1 < till; ++i) {
+		path.quadTo(QPointF(points[i]), Middle(points[i], points[i + 1]));
+	}
+	p.setPen(StrokePen(stroke, background));
+	p.setBrush(Qt::NoBrush);
+	p.drawPath(path);
+}
+
+// The end of the line as count points have it: the next point bends it,
+// so it is painted only where it can be taken back (StrokeEndRect).
+void PaintStrokeEnd(
+		QPainter &p,
+		const CanvasStroke &stroke,
+		const QColor &background,
+		int count) {
+	const auto &points = stroke.points;
+	count = std::min(count, int(points.size()));
+	if (count < 2) {
+		return;
+	}
+	p.setPen(StrokePen(stroke, background));
+	p.setBrush(Qt::NoBrush);
+	p.drawLine(StableEnd(points, count), QPointF(points[count - 1]));
+}
+
+// The pixels PaintStrokeEnd touches in a picture scaled by sx and sy.
+[[nodiscard]] QRect StrokeEndRect(
+		const CanvasStroke &stroke,
+		int count,
+		double sx,
+		double sy,
+		QSize image) {
+	const auto &points = stroke.points;
+	count = std::min(count, int(points.size()));
+	if (count < 2) {
+		return QRect();
+	}
+	const auto a = StableEnd(points, count);
+	const auto b = QPointF(points[count - 1]);
+	const auto half = std::clamp(stroke.size, 1, 256) / 2. + 1.;
+	const auto left = std::min(a.x(), b.x()) - half;
+	const auto top = std::min(a.y(), b.y()) - half;
+	const auto right = std::max(a.x(), b.x()) + half;
+	const auto bottom = std::max(a.y(), b.y()) + half;
+	return QRect(
+		QPoint(
+			int(std::floor(left * sx)) - 2,
+			int(std::floor(top * sy)) - 2),
+		QPoint(
+			int(std::ceil(right * sx)) + 2,
+			int(std::ceil(bottom * sy)) + 2)
+	).intersected(QRect(QPoint(), image));
+}
+
+// The picture of one growing line (the one the user draws), the size of
+// the board in pixels.
+class StrokeLayer final {
+public:
+	void reset() {
+		_image = QImage();
+		_endSaved = QImage();
+		_endRect = QRect();
+		_id = QString();
+		_painted = 0;
+	}
+
+	// false: there is no picture, the line is to be painted as a whole.
+	[[nodiscard]] bool sync(
+			const CanvasStroke &stroke,
+			const QColor &background,
+			QSize canvas,
+			QSize target) {
+		const auto count = int(stroke.points.size());
+		if (target.isEmpty() || canvas.isEmpty() || !count) {
+			reset();
+			return false;
+		}
+		auto fresh = (_id != stroke.id) || (_painted > count);
+		if (_image.size() != target) {
+			_image = QImage(target, QImage::Format_ARGB32_Premultiplied);
+			if (_image.isNull()) {
+				reset();
+				return false;
+			}
+			fresh = true;
+		}
+		if (fresh) {
+			_image.fill(Qt::transparent);
+			_endSaved = QImage();
+			_endRect = QRect();
+			_id = stroke.id;
+			_painted = 0;
+		} else if (_painted == count) {
+			return true;
+		}
+		const auto sx = target.width() / double(canvas.width());
+		const auto sy = target.height() / double(canvas.height());
+		const auto prepare = [&](QPainter &p) {
+			p.setCompositionMode(QPainter::CompositionMode_Source);
+			p.setRenderHint(QPainter::Antialiasing);
+			p.scale(sx, sy);
+		};
+		{
+			auto p = QPainter(&_image);
+			if (!_endRect.isEmpty() && !_endSaved.isNull()) {
+				// The end of the line as it was is taken back.
+				p.setCompositionMode(QPainter::CompositionMode_Source);
+				p.drawImage(_endRect.topLeft(), _endSaved);
+			}
+			prepare(p);
+			PaintStrokeGrowth(p, stroke, background, _painted, count);
+		}
+		_painted = count;
+		_endRect = StrokeEndRect(stroke, count, sx, sy, target);
+		_endSaved = _endRect.isEmpty() ? QImage() : _image.copy(_endRect);
+		if (!_endSaved.isNull()) {
+			auto p = QPainter(&_image);
+			prepare(p);
+			PaintStrokeEnd(p, stroke, background, count);
+		}
+		return true;
+	}
+
+	[[nodiscard]] const QImage &image() const {
+		return _image;
+	}
+
+private:
+	QImage _image;
+	QImage _endSaved; // What was under the end of the line.
+	QRect _endRect;
+	QString _id;
+	int _painted = 0; // Points of the line the picture has.
+
+};
+
+// The picture of the previews, the lines the others draw now: adds what
+// was revealed of them since painted was filled (one number for every
+// preview, in their order). The end of a preview is not painted: it is
+// half a segment behind till the next points come.
+void PaintLivesGrowth(
+		QImage &image,
+		const std::vector<CanvasModel::Live> &lives,
+		std::vector<int> &painted,
+		QSize canvas,
+		const QColor &background) {
+	painted.resize(lives.size(), 0);
+	if (image.isNull() || canvas.isEmpty()) {
+		return;
+	}
+	auto p = std::optional<QPainter>();
+	for (auto i = 0, count = int(lives.size()); i != count; ++i) {
+		const auto &live = lives[i];
+		const auto till = std::clamp(
+			int(std::floor(live.shown)),
+			0,
+			int(live.stroke.points.size()));
+		if (till <= painted[i]) {
+			continue;
+		}
+		if (!p) {
+			p.emplace(&image);
+			p->setCompositionMode(QPainter::CompositionMode_Source);
+			p->setRenderHint(QPainter::Antialiasing);
+			p->scale(
+				image.width() / double(canvas.width()),
+				image.height() / double(canvas.height()));
+		}
+		PaintStrokeGrowth(*p, live.stroke, background, painted[i], till);
+		painted[i] = till;
+	}
 }
 
 } // namespace
@@ -510,6 +798,16 @@ void PaintStroke(
 	p.drawPath(StrokePath(stroke.points, shown));
 }
 
+int64 StrokeWeight(const CanvasStroke &stroke) {
+	auto result = int64(0);
+	auto from = (const QPoint*)nullptr;
+	for (const auto &point : stroke.points) {
+		result += PointWeight(from, point);
+		from = &point;
+	}
+	return result;
+}
+
 void CanvasModel::reset(
 		QSize size,
 		const QColor &background,
@@ -521,12 +819,14 @@ void CanvasModel::reset(
 	ranges::stable_sort(strokes, ranges::less(), &CanvasStroke::seq);
 	_strokes.clear();
 	_numbers = 0;
+	_weight = 0;
 	auto ids = base::flat_set<QString>();
 	for (auto &stroke : strokes) {
 		if (!ids.emplace(stroke.id).second) {
 			continue;
 		}
 		_numbers += int(stroke.points.size()) * 2;
+		_weight += StrokeWeight(stroke);
 		_strokes.push_back(
 			std::make_shared<const CanvasStroke>(std::move(stroke)));
 	}
@@ -536,6 +836,7 @@ void CanvasModel::reset(
 		}),
 		end(_pending));
 	_lives.clear();
+	++_livesGeneration;
 	++_generation;
 }
 
@@ -545,6 +846,20 @@ bool CanvasModel::contains(const QString &id) const {
 	});
 }
 
+bool CanvasModel::waiting(const QString &id) const {
+	return ranges::contains(_pending, id, [](const StrokePtr &stroke) {
+		return stroke->id;
+	});
+}
+
+int64 CanvasModel::liveWeight() const {
+	auto result = int64(0);
+	for (const auto &live : _lives) {
+		result += live.weight;
+	}
+	return result;
+}
+
 bool CanvasModel::add(CanvasStroke &&stroke) {
 	if (contains(stroke.id)) {
 		return false;
@@ -552,6 +867,7 @@ bool CanvasModel::add(CanvasStroke &&stroke) {
 	removePending(stroke.id);
 	dropLive(stroke.id);
 	_numbers += int(stroke.points.size()) * 2;
+	_weight += StrokeWeight(stroke);
 	const auto seq = stroke.seq;
 	auto pointer = std::make_shared<const CanvasStroke>(std::move(stroke));
 	if (_strokes.empty() || _strokes.back()->seq <= seq) {
@@ -569,15 +885,16 @@ bool CanvasModel::add(CanvasStroke &&stroke) {
 }
 
 bool CanvasModel::remove(const QString &id) {
-	const auto waiting = removePending(id);
+	const auto wasWaiting = removePending(id);
 	dropLive(id);
 	const auto i = ranges::find(_strokes, id, [](const StrokePtr &stroke) {
 		return stroke->id;
 	});
 	if (i == end(_strokes)) {
-		return waiting;
+		return wasWaiting;
 	}
 	_numbers = std::max(_numbers - int((*i)->points.size()) * 2, 0);
+	_weight = std::max(_weight - StrokeWeight(**i), int64(0));
 	_strokes.erase(i);
 	++_generation;
 	return true;
@@ -589,6 +906,8 @@ void CanvasModel::clear(const QColor &background) {
 	_pending.clear();
 	_lives.clear();
 	_numbers = 0;
+	_weight = 0;
+	++_livesGeneration;
 	++_generation;
 }
 
@@ -612,11 +931,15 @@ bool CanvasModel::removePending(const QString &id) {
 }
 
 void CanvasModel::dropLive(const QString &id) {
+	const auto was = _lives.size();
 	_lives.erase(
 		ranges::remove_if(_lives, [&](const Live &live) {
 			return (live.stroke.id == id);
 		}),
 		end(_lives));
+	if (_lives.size() != was) {
+		++_livesGeneration;
+	}
 }
 
 bool CanvasModel::addLive(
@@ -627,31 +950,128 @@ bool CanvasModel::addLive(
 		return false;
 	}
 	maxPoints = std::max(maxPoints, 1);
-	const auto i = ranges::find_if(_lives, [&](const Live &live) {
+	const auto userId = part.userId;
+	const auto same = [&](const Live &live) {
 		return (live.stroke.id == part.id)
-			&& (live.stroke.userId == part.userId);
-	});
+			&& (live.stroke.userId == userId);
+	};
+	const auto drop = [&](std::vector<Live>::iterator i) {
+		_lives.erase(i);
+		++_livesGeneration;
+	};
+	// The preview of that member that got its points longest ago, not
+	// the one these points are for.
+	const auto oldestOf = [&](uint64 id) {
+		auto result = end(_lives);
+		for (auto i = begin(_lives); i != end(_lives); ++i) {
+			if (i->stroke.userId == id
+				&& !same(*i)
+				&& (result == end(_lives) || i->updated < result->updated)) {
+				result = i;
+			}
+		}
+		return result;
+	};
+	const auto found = ranges::find_if(_lives, same);
+	const auto known = (found != end(_lives));
+	const auto have = known ? int(found->stroke.points.size()) : 0;
+	auto take = std::min(int(part.points.size()), maxPoints - have);
+	if (take <= 0) {
+		// A full preview takes nothing and does not live longer for it:
+		// it goes away five seconds after the last point it has got.
+		return false;
+	}
+	// What the first points of the part add to the weight of the line,
+	// as many of them as fit into limit.
+	const auto last = known
+		? std::make_optional(found->stroke.points.back())
+		: std::optional<QPoint>();
+	const auto fit = [&](int count, int64 limit) {
+		auto result = std::pair<int, int64>(0, 0);
+		auto from = last ? &*last : nullptr;
+		for (auto i = 0; i != count; ++i) {
+			const auto next = result.second
+				+ PointWeight(from, part.points[i]);
+			if (next > limit) {
+				break;
+			}
+			result = { i + 1, next };
+			from = &part.points[i];
+		}
+		return result;
+	};
+	auto weight = fit(take, std::numeric_limits<int64>::max()).second;
+	if (!known) {
+		// A member draws one line at a time: more previews of one member
+		// push out his own oldest ones, not the lines of the others.
+		auto mine = int(ranges::count(_lives, userId, [](const Live &live) {
+			return live.stroke.userId;
+		}));
+		for (; mine >= kMaxLivesOfUser; --mine) {
+			const auto oldest = oldestOf(userId);
+			if (oldest == end(_lives)) {
+				break;
+			}
+			drop(oldest);
+		}
+		if (int(_lives.size()) >= kMaxLives) {
+			drop(ranges::min_element(_lives, ranges::less(), &Live::updated));
+		}
+	}
+	// All the previews together have a limited weight: they are painted
+	// on the main thread. When there is no room, the member who has the
+	// most gives way, so who floods pushes out himself.
+	while (true) {
+		auto total = int64(0);
+		auto weights = base::flat_map<uint64, int64>();
+		for (const auto &live : _lives) {
+			total += live.weight;
+			weights[live.stroke.userId] += live.weight;
+		}
+		const auto left = kLiveWeightBudget - total;
+		if (weight <= left) {
+			break;
+		}
+		weights[userId] += weight;
+		auto heaviest = userId;
+		auto heaviestWeight = int64(0);
+		for (const auto &[id, value] : weights) {
+			if (value > heaviestWeight) {
+				heaviest = id;
+				heaviestWeight = value;
+			}
+		}
+		const auto victim = oldestOf(heaviest);
+		if (victim == end(_lives)) {
+			// Nothing to drop but the line that grows: it takes what
+			// there is room for and stops growing.
+			const auto fitted = fit(take, left);
+			take = fitted.first;
+			weight = fitted.second;
+			break;
+		}
+		drop(victim);
+	}
+	if (take <= 0) {
+		return false;
+	}
+	const auto i = ranges::find_if(_lives, same);
 	if (i != end(_lives)) {
 		auto &points = i->stroke.points;
-		const auto left = maxPoints - int(points.size());
-		const auto take = std::min(left, int(part.points.size()));
-		if (take > 0) {
-			points.insert(
-				end(points),
-				begin(part.points),
-				begin(part.points) + take);
-		}
+		points.insert(
+			end(points),
+			begin(part.points),
+			begin(part.points) + take);
+		i->weight += weight;
 		i->updated = now;
-		return (take > 0);
+		return true;
 	}
-	if (int(_lives.size()) >= kMaxLives) {
-		_lives.erase(ranges::min_element(_lives, ranges::less(), &Live::updated));
-	}
-	if (int(part.points.size()) > maxPoints) {
-		part.points.resize(maxPoints);
-	}
+	part.points.resize(take);
+	part.size = std::min(part.size, kLiveMaxSize);
 	_lives.push_back({
 		.stroke = std::move(part),
+		.weight = weight,
+		.started = now,
 		.updated = now,
 		.shown = 1.,
 	});
@@ -662,10 +1082,15 @@ bool CanvasModel::expireLive(crl::time now) {
 	const auto was = _lives.size();
 	_lives.erase(
 		ranges::remove_if(_lives, [&](const Live &live) {
-			return (now - live.updated) > kLiveExpire;
+			return ((now - live.updated) > kLiveExpire)
+				|| ((now - live.started) > kLiveMaxAge);
 		}),
 		end(_lives));
-	return (_lives.size() != was);
+	if (_lives.size() == was) {
+		return false;
+	}
+	++_livesGeneration;
+	return true;
 }
 
 bool CanvasModel::advanceLive(crl::time elapsed) {
@@ -780,6 +1205,7 @@ private:
 	[[nodiscard]] QString statusText(bool &error) const;
 	[[nodiscard]] bool disabledOnServer() const;
 	[[nodiscard]] bool canDraw() const;
+	[[nodiscard]] bool toolsActive() const;
 	[[nodiscard]] QPoint toCanvas(QPoint position) const;
 	[[nodiscard]] QRect strokeRect(QPoint a, QPoint b, int size) const;
 	[[nodiscard]] const Target *targetAt(QPoint position) const;
@@ -788,6 +1214,7 @@ private:
 	void loadDone(const QJsonObject &json);
 	void loadFailed();
 	void handle(const Cloud::Event &event);
+	void hold(const Cloud::Event &event);
 	void apply(const Cloud::Event &event);
 	void confirmed(const QString &id);
 
@@ -804,13 +1231,14 @@ private:
 	void toast(const QString &text);
 
 	void syncLayer();
-	void startRebuild(QSize wanted);
+	void startRebuild(QSize wanted, int from);
 	void rebuildDone(
-		int token,
 		int generation,
 		QSize size,
+		int from,
 		int count,
 		QImage &&image);
+	void syncLives();
 	[[nodiscard]] bool revealStep(crl::time now);
 	void livesChanged();
 
@@ -838,23 +1266,33 @@ private:
 
 	QRect _board;
 	QRect _status;
+	bool _cleanShown = false; // The words of a clean board are painted.
+	QString _statusOfLives; // See livesChanged().
 	double _scale = 1.;
 	std::vector<Target> _targets;
 
 	QImage _layer;
 	int _layerGeneration = -1;
 	int _layerStrokes = 0;
-	bool _rebuilding = false;
-	int _rebuildGeneration = -1;
-	QSize _rebuildSize;
-	int _rebuildToken = 0;
+	bool _rebuilding = false; // One at a time, off the main thread.
+	crl::time _rebuiltAt = 0; // When the last full repaint has started.
 	base::Timer _rebuildTimer;
 
+	// The lines the others draw now, painted as they grow.
+	QImage _livesLayer;
+	std::vector<int> _livesPainted;
+	int _livesGeneration = -1;
+	crl::time _livesRepainted = 0;
+	crl::time _livesNotBefore = 0;
+	base::Timer _livesTimer;
+
 	std::optional<CanvasStroke> _current;
+	StrokeLayer _currentLayer;
 	int _liveSent = 0;
 	int _liveInFlight = 0;
 	base::Timer _liveTimer;
-	base::flat_set<QString> _removing;
+	base::flat_set<QString> _removing; // Undos the user has asked for.
+	base::flat_set<QString> _removeSent; // Those the server was asked for.
 	std::vector<QString> _ownIds;
 
 	bool _loading = false;
@@ -862,6 +1300,10 @@ private:
 	bool _failed = false;
 	bool _reloadAgain = false;
 	std::vector<Cloud::Event> _held;
+	int _heldNumbers = 0;
+	bool _heldLost = false; // Too many to keep: the board is asked again.
+	crl::time _reloadDelay = kReloadDelay;
+	base::Timer _reloadTimer;
 
 	base::Timer _expireTimer;
 	Ui::Animations::Basic _reveal;
@@ -883,13 +1325,19 @@ CanvasTab::CanvasTab(QWidget *parent, TabContext context)
 , _undo(Ui::CreateChild<ToolButton>(this, Icon::Undo, Scaled(38)))
 , _more(Ui::CreateChild<GlyphButton>(this, Glyph::More, Scaled(38)))
 , _rebuildTimer([=] { update(); })
+, _livesTimer([=] { update(_board); })
 , _liveTimer([=] { sendLive(); })
+, _reloadTimer([=] { load(); })
 , _expireTimer([=] {
 	if (_model.expireLive(crl::now())) {
 		livesChanged();
 	}
 	if (_model.lives().empty()) {
 		_expireTimer.cancel();
+		_livesTimer.cancel();
+		_livesLayer = QImage();
+		_livesPainted.clear();
+		_livesGeneration = -1;
 	}
 })
 , _reveal([=](crl::time now) { return revealStep(now); }) {
@@ -1015,8 +1463,16 @@ bool CanvasTab::canDraw() const {
 		&& !disabledOnServer();
 }
 
+// How the tools look. A board that is not here yet (or has failed to
+// come) and a room without the connection have nothing to draw on right
+// now: a line can't be started there (startAllowed()), so the tools look
+// switched off as well, not only the line of the state says it.
+bool CanvasTab::toolsActive() const {
+	return canDraw() && _loaded && _room->connected();
+}
+
 void CanvasTab::refreshControls() {
-	const auto can = canDraw();
+	const auto can = toolsActive();
 	_pen->setSelected(_tool == CanvasTool::Pen);
 	_marker->setSelected(_tool == CanvasTool::Marker);
 	_eraser->setSelected(_tool == CanvasTool::Eraser);
@@ -1025,6 +1481,8 @@ void CanvasTab::refreshControls() {
 	}
 	_undo->setDimmed(!can
 		|| _model.lastOwn(_room->selfId(), _removing).isEmpty());
+	// Everything is painted again, the status line too.
+	_statusOfLives = QString();
 	update();
 }
 
@@ -1051,11 +1509,12 @@ void CanvasTab::updateLayout() {
 	}
 	boardWidth = std::max(boardWidth, 1);
 	boardHeight = std::max(boardHeight, 1);
-	// In a tall window the board with its tools hangs a bit above the
-	// middle, in a wide one it takes all the height.
+	// The board starts right under the tabs, like the content of the
+	// other tabs does, and the tools are attached to it: in a tall window
+	// what is left stays empty below them, not as a band above the board.
 	const auto board = QRect(
 		(w - boardWidth) / 2,
-		std::max(pad, (h - boardHeight - controls) / 3),
+		pad,
 		boardWidth,
 		boardHeight);
 	if (_board.size() != board.size() && !_layer.isNull()) {
@@ -1215,8 +1674,19 @@ void CanvasTab::paintBoard(QPainter &p) {
 	syncLayer();
 	const auto radius = double(Scaled(10));
 	const auto background = _model.background();
+	// The edge of the paper is a tint of the theme, not a shadow: a dark
+	// board in a dark theme has the colour of the window and would have
+	// no visible edge at all.
+	const auto edgeBase = st::windowBg->c;
+	const auto edgeTint = st::windowFg->c;
+	const auto mix = [](int a, int b) {
+		return (a * 44 + b * 6) / 50;
+	};
 	p.setPen(Qt::NoPen);
-	p.setBrush(st::shadowFg);
+	p.setBrush(QColor(
+		mix(edgeBase.red(), edgeTint.red()),
+		mix(edgeBase.green(), edgeTint.green()),
+		mix(edgeBase.blue(), edgeTint.blue())));
 	p.drawRoundedRect(
 		QRectF(_board).marginsAdded(QMarginsF(1., 1., 1., 1.)),
 		radius + 1.,
@@ -1225,39 +1695,147 @@ void CanvasTab::paintBoard(QPainter &p) {
 	auto clip = QPainterPath();
 	clip.addRoundedRect(QRectF(_board), radius, radius);
 	p.setClipPath(clip, Qt::IntersectClip);
+	p.setRenderHint(QPainter::SmoothPixmapTransform);
 	if (_layer.isNull()) {
 		p.fillRect(_board, background);
 	} else {
-		p.setRenderHint(QPainter::SmoothPixmapTransform);
 		p.drawImage(QRectF(_board), _layer);
 	}
-	p.translate(_board.topLeft());
-	p.scale(_scale, _scale);
-	for (const auto &stroke : _model.pending()) {
-		PaintStroke(p, *stroke, background);
+	const auto direct = [&](const CanvasStroke &stroke) {
+		p.save();
+		p.translate(_board.topLeft());
+		p.scale(_scale, _scale);
+		PaintStroke(p, stroke, background);
+		p.restore();
+	};
+	if (_rebuilding && _layerGeneration == _model.generation()) {
+		// Heavy strokes of the others are being painted off the main
+		// thread: the user's own ones that came after them do not wait
+		// for that (a stroke just drawn would vanish for a moment).
+		const auto &strokes = _model.strokes();
+		const auto self = _room->selfId();
+		for (auto i = _layerStrokes, n = int(strokes.size()); i < n; ++i) {
+			if (strokes[i]->userId == self) {
+				direct(*strokes[i]);
+			}
+		}
 	}
-	for (const auto &live : _model.lives()) {
-		PaintStroke(p, live.stroke, background, live.shown);
+	for (const auto &stroke : _model.pending()) {
+		direct(*stroke);
+	}
+	// What is being drawn (by the others and by the user) is not stroked
+	// again for every frame: these are pictures only the new points are
+	// added to.
+	syncLives();
+	if (!_livesLayer.isNull() && _livesGeneration >= 0) {
+		p.drawImage(QRectF(_board), _livesLayer);
 	}
 	if (_current) {
-		PaintStroke(p, *_current, background);
+		const auto wanted = _board.size() * style::DevicePixelRatio();
+		const auto ready = _currentLayer.sync(
+			*_current,
+			background,
+			_model.size(),
+			wanted);
+		if (ready) {
+			p.drawImage(QRectF(_board), _currentLayer.image());
+		} else {
+			direct(*_current);
+		}
 	}
 	p.restore();
 	paintTags(p);
 
+	// What is written over the paper has the colour of its ink: the paper
+	// is white or dark whatever the theme is.
+	const auto ink = [&](int onDarkPaper, int onLightPaper) {
+		return DarkColor(background)
+			? QColor(255, 255, 255, onDarkPaper)
+			: QColor(0, 0, 0, onLightPaper);
+	};
+	const auto inner = _board.marginsRemoved(
+		QMargins(Scaled(16), Scaled(16), Scaled(16), Scaled(16)));
+	const auto wrapped = int(Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap);
+	const auto heightOf = [&](const style::font &font, const QString &line) {
+		return QFontMetrics(font->f).boundingRect(
+			QRect(0, 0, std::max(inner.width(), 1), 10000),
+			wrapped,
+			line).height();
+	};
+	const auto clean = _loaded
+		&& _model.strokes().empty()
+		&& _model.pending().empty()
+		&& _model.lives().empty()
+		&& !_current;
+	if (_cleanShown != clean) {
+		// The first line is painted in its own small rectangle only: the
+		// words on the paper have to go (or come) as a whole.
+		_cleanShown = clean;
+		update(_board);
+	}
 	if (!_loaded) {
-		// Nothing of the board is known yet: say so over the paper.
+		// Nothing of the board is known yet: say so over the paper. This is
+		// the only place that says it, the line under the tools is empty.
 		auto error = false;
 		const auto text = statusText(error);
+		const auto retry = error && !_loading;
+		const auto label = tr::lng_oblivion_rcanvas_retry(tr::now);
+		const auto textHeight = heightOf(st::normalFont, text);
+		const auto buttonHeight = Scaled(32);
+		const auto buttonWidth = st::semiboldFont->width(label) + Scaled(40);
+		const auto skip = Scaled(14);
+		const auto full = textHeight + (retry ? (skip + buttonHeight) : 0);
+		const auto top = inner.y() + std::max((inner.height() - full) / 2, 0);
 		p.setFont(st::normalFont);
-		p.setPen(DarkColor(background)
-			? QColor(255, 255, 255, 170)
-			: QColor(0, 0, 0, 130));
+		p.setPen(ink(190, 150));
 		p.drawText(
-			_board.marginsRemoved(
-				QMargins(Scaled(16), Scaled(16), Scaled(16), Scaled(16))),
-			Qt::AlignCenter | Qt::TextWordWrap,
+			QRect(inner.x(), top, inner.width(), textHeight),
+			wrapped,
 			text);
+		if (retry
+			&& buttonWidth <= inner.width()
+			&& full <= inner.height()) {
+			// A click anywhere on the board asks for it again (see
+			// startAllowed()), the button only shows where to click.
+			const auto button = QRectF(
+				inner.x() + (inner.width() - buttonWidth) / 2,
+				top + textHeight + skip,
+				buttonWidth,
+				buttonHeight);
+			p.setPen(Qt::NoPen);
+			p.setBrush(st::activeButtonBg);
+			p.drawRoundedRect(button, buttonHeight / 2., buttonHeight / 2.);
+			p.setFont(st::semiboldFont);
+			p.setPen(st::activeButtonFg);
+			p.drawText(button, Qt::AlignCenter, label);
+		}
+	} else if (clean) {
+		// A clean board says what it is for till the first line.
+		const auto title = tr::lng_oblivion_rcanvas_empty(tr::now);
+		const auto about = tr::lng_oblivion_rcanvas_empty_about(tr::now);
+		const auto titleHeight = heightOf(st::semiboldFont, title);
+		const auto aboutHeight = heightOf(st::normalFont, about);
+		const auto skip = Scaled(6);
+		const auto full = titleHeight + skip + aboutHeight;
+		if (full <= inner.height()) {
+			const auto top = inner.y() + (inner.height() - full) / 2;
+			p.setFont(st::semiboldFont);
+			p.setPen(ink(150, 110));
+			p.drawText(
+				QRect(inner.x(), top, inner.width(), titleHeight),
+				wrapped,
+				title);
+			p.setFont(st::normalFont);
+			p.setPen(ink(110, 80));
+			p.drawText(
+				QRect(
+					inner.x(),
+					top + titleHeight + skip,
+					inner.width(),
+					aboutHeight),
+				wrapped,
+				about);
+		}
 	}
 }
 
@@ -1270,13 +1848,14 @@ void CanvasTab::paintTags(QPainter &p) {
 		if (points.empty() || !member || member->name.isEmpty()) {
 			continue;
 		}
-		const auto index = std::clamp(
-			int(std::ceil(live.shown)) - 1,
-			0,
-			int(points.size()) - 1);
+		// Where the painted part of the line ends (see PaintLivesGrowth).
+		const auto painted = StableEnd(points, std::clamp(
+			int(std::floor(live.shown)),
+			1,
+			int(points.size())));
 		const auto tip = QPoint(
-			_board.x() + int(std::lround(points[index].x() * _scale)),
-			_board.y() + int(std::lround(points[index].y() * _scale)));
+			_board.x() + int(std::lround(painted.x() * _scale)),
+			_board.y() + int(std::lround(painted.y() * _scale)));
 		const auto text = font->elided(member->name, Scaled(96));
 		const auto width = font->width(text) + Scaled(12);
 		const auto height = font->height + Scaled(4);
@@ -1303,7 +1882,7 @@ void CanvasTab::paintTags(QPainter &p) {
 }
 
 void CanvasTab::paintControls(QPainter &p) {
-	const auto can = canDraw();
+	const auto can = toolsActive();
 	const auto eraser = (_tool == CanvasTool::Eraser);
 	for (const auto &target : _targets) {
 		const auto rect = QRectF(target.rect);
@@ -1336,6 +1915,10 @@ void CanvasTab::paintControls(QPainter &p) {
 	}
 	p.setOpacity(1.);
 
+	if (!_loaded) {
+		// "Loading" and "could not load" are written on the board itself.
+		return;
+	}
 	auto error = false;
 	const auto text = statusText(error);
 	p.setFont(st::normalFont);
@@ -1358,6 +1941,9 @@ void CanvasTab::load() {
 	_loading = true;
 	_failed = false;
 	_held.clear();
+	_heldNumbers = 0;
+	_heldLost = false;
+	_reloadTimer.cancel();
 	const auto id = _room->send(
 		Cloud::GetRequest(u"/canvas"_q),
 		crl::guard(this, [=](const Cloud::Response &response) {
@@ -1376,12 +1962,20 @@ void CanvasTab::loadFailed() {
 	_loading = false;
 	_reloadAgain = false;
 	_failed = true;
+	_heldNumbers = 0;
+	const auto lost = base::take(_heldLost);
 	// What was held back is applied to the board there is, the whole
 	// board is asked for again when the connection is back or on a click.
 	for (const auto &event : base::take(_held)) {
 		if (_loaded) {
 			apply(event);
 		}
+	}
+	if (lost && _loaded) {
+		// Some of what has happened meanwhile is not known: one more try,
+		// later and later if it goes on like this.
+		_reloadTimer.callOnce(_reloadDelay);
+		_reloadDelay = std::min(_reloadDelay * 2, kReloadDelayMax);
 	}
 	refreshControls();
 }
@@ -1420,28 +2014,50 @@ void CanvasTab::loadDone(const QJsonObject &json) {
 	_loaded = true;
 	_failed = false;
 	for (auto i = begin(_removing); i != end(_removing);) {
-		const auto known = _model.contains(*i)
-			|| ranges::contains(
-				_model.pending(),
-				*i,
-				[](const CanvasModel::StrokePtr &stroke) {
-					return stroke->id;
-				});
+		const auto known = _model.contains(*i) || _model.waiting(*i);
 		i = known ? (i + 1) : _removing.erase(i);
 	}
+	for (auto i = begin(_removeSent); i != end(_removeSent);) {
+		i = _removing.contains(*i) ? (i + 1) : _removeSent.erase(i);
+	}
+	const auto lost = base::take(_heldLost);
+	_heldNumbers = 0;
 	const auto weak = QPointer<CanvasTab>(this);
 	for (const auto &event : base::take(_held)) {
 		if (!event.id || event.id > eventId) {
 			apply(event);
 		}
 	}
+	if (!weak) {
+		return;
+	}
+	// An undo asked for while the board was coming: if its stroke is on
+	// the board now (the snapshot has brought it), nothing else will say
+	// that it has got its place.
+	auto undone = std::vector<QString>();
+	for (const auto &id : _removing) {
+		if (_model.contains(id) && !_removeSent.contains(id)) {
+			undone.push_back(id);
+		}
+	}
+	for (const auto &id : undone) {
+		sendRemove(id);
+	}
 	if (first && !_current) {
 		_color = DarkColor(_model.background()) ? 1 : 0;
 	}
 	updateLayout();
 	refreshControls();
-	if (weak && base::take(_reloadAgain)) {
+	if (base::take(_reloadAgain)) {
 		load();
+	} else if (lost) {
+		// More has happened while the board was coming than is kept: the
+		// board may be older than that, it is asked for once more (later
+		// and later if it goes on like this).
+		_reloadTimer.callOnce(_reloadDelay);
+		_reloadDelay = std::min(_reloadDelay * 2, kReloadDelayMax);
+	} else {
+		_reloadDelay = kReloadDelay;
 	}
 }
 
@@ -1456,13 +2072,35 @@ void CanvasTab::handle(const Cloud::Event &event) {
 	} else if (_loading) {
 		// Kept till the board comes: those newer than it are applied.
 		if (event.id) {
-			_held.push_back(event);
+			hold(event);
 		}
 		return;
 	} else if (!_loaded) {
 		return;
 	}
 	apply(event);
+}
+
+// What is kept while the board is being loaded is limited: not more
+// events and not more points than a whole board has.
+void CanvasTab::hold(const Cloud::Event &event) {
+	if (_heldLost) {
+		return;
+	}
+	if (event.type == u"room.stroke"_q) {
+		const auto points = event.data.value(
+			u"stroke"_q).toObject().value(u"points"_q).toArray().size();
+		_heldNumbers += int(std::min(
+			int64(points),
+			int64(_limits.canvasNumbers)));
+	}
+	_held.push_back(event);
+	if (int(_held.size()) > kHeldLimit
+		|| _heldNumbers > _limits.canvasNumbers) {
+		_held.clear();
+		_heldNumbers = 0;
+		_heldLost = true;
+	}
 }
 
 void CanvasTab::apply(const Cloud::Event &event) {
@@ -1487,10 +2125,12 @@ void CanvasTab::apply(const Cloud::Event &event) {
 		}
 		_model.remove(id);
 		_removing.remove(id);
+		_removeSent.remove(id);
 	} else if (type == u"room.canvas_cleared"_q) {
 		_model.clear(Cloud::JsonColor(
 			data.value(u"background"_q)).value_or(_model.background()));
 		_removing.clear();
+		_removeSent.clear();
 		if (_current) {
 			cancelStroke();
 		}
@@ -1503,6 +2143,7 @@ void CanvasTab::apply(const Cloud::Event &event) {
 			return;
 		}
 		const auto limit = _limits.strokePoints * kRawPointsFactor;
+		const auto generation = _model.livesGeneration();
 		if (_model.addLive(std::move(*part), crl::now(), limit)) {
 			if (!_reveal.animating()) {
 				_revealLast = crl::now();
@@ -1511,8 +2152,12 @@ void CanvasTab::apply(const Cloud::Event &event) {
 			if (!_expireTimer.isActive()) {
 				_expireTimer.callEach(1000);
 			}
+			livesChanged();
+		} else if (generation != _model.livesGeneration()) {
+			// Nothing was taken, but some previews had to go.
+			livesChanged();
 		}
-		livesChanged();
+		// An event that has changed nothing repaints nothing.
 		return;
 	} else {
 		return;
@@ -1520,8 +2165,16 @@ void CanvasTab::apply(const Cloud::Event &event) {
 	refreshControls();
 }
 
+// The previews have changed: only the board is painted again, and the
+// status line if it names other people now.
 void CanvasTab::livesChanged() {
-	update();
+	update(_board);
+	auto error = false;
+	auto text = statusText(error);
+	if (_statusOfLives != text) {
+		_statusOfLives = std::move(text);
+		update(_status);
+	}
 }
 
 bool CanvasTab::revealStep(crl::time now) {
@@ -1622,12 +2275,10 @@ void CanvasTab::extendStroke(QPoint point) {
 		dirty = dirty.united(
 			strokeRect(_current->points[count - 3], last, size));
 	}
-	if (_current->alpha < 255) {
-		// A translucent line is repainted as a whole.
-		update(_board);
-	} else {
-		update(dirty);
-	}
+	// Only where the new point has changed the line (the picture of the
+	// line being drawn gets only that part, see StrokeLayer), a marker
+	// line too: it is not stroked as a whole for every move of the mouse.
+	update(dirty);
 	if (count >= _limits.strokePoints * kRawPointsFactor) {
 		// A very long line goes on as the next stroke.
 		finishStroke();
@@ -1640,6 +2291,7 @@ void CanvasTab::extendStroke(QPoint point) {
 void CanvasTab::cancelStroke() {
 	_liveTimer.cancel();
 	_current = std::nullopt;
+	_currentLayer.reset();
 	update(_board);
 }
 
@@ -1649,6 +2301,7 @@ void CanvasTab::finishStroke() {
 	}
 	_liveTimer.cancel();
 	auto stroke = *base::take(_current);
+	_currentLayer.reset();
 	stroke.points = SimplifyStroke(stroke.points, _limits.strokePoints);
 	update(_board);
 	if (_room->sample()) {
@@ -1674,8 +2327,13 @@ void CanvasTab::finishStroke() {
 			if (confirmedStroke
 				&& confirmedStroke->id == id
 				&& !_loading
-				&& _model.size() == size) {
-				// The event may have brought it already.
+				&& _model.size() == size
+				&& _model.waiting(id)) {
+				// Only while it still waits here. The event may have
+				// brought it already, and if the board was cleared or
+				// loaded again meanwhile, the events are what says
+				// whether the stroke is on it: an answer that is late
+				// must not bring back a stroke somebody has cleared.
 				if (_model.add(std::move(*confirmedStroke))) {
 					confirmed(id);
 				}
@@ -1698,6 +2356,7 @@ void CanvasTab::strokeFailed(const QString &id, const Cloud::Error &error) {
 	}
 	_model.removePending(id);
 	_removing.remove(id);
+	_removeSent.remove(id);
 	refreshControls();
 	if (error.type == Cloud::Error::Type::Cancelled) {
 		return;
@@ -1763,11 +2422,16 @@ void CanvasTab::undo() {
 }
 
 void CanvasTab::sendRemove(const QString &id) {
+	if (!_removeSent.emplace(id).second) {
+		// The server was asked already.
+		return;
+	}
 	const auto sent = _room->send(
 		Cloud::DeleteRequest(u"/canvas/strokes/"_q + id),
 		nullptr,
 		crl::guard(this, [=](const Cloud::Error &error) {
 			_removing.remove(id);
+			_removeSent.remove(id);
 			refreshControls();
 			if (error.status != 404
 				&& error.type != Cloud::Error::Type::Cancelled) {
@@ -1776,6 +2440,7 @@ void CanvasTab::sendRemove(const QString &id) {
 		}));
 	if (!sent) {
 		_removing.remove(id);
+		_removeSent.remove(id);
 	}
 }
 
@@ -1797,7 +2462,12 @@ void CanvasTab::mousePressEvent(QMouseEvent *e) {
 			}
 		}
 		return;
-	} else if (_status.contains(position) && _failed && !_loading) {
+	} else if ((_status.contains(position)
+			|| (_board.contains(position) && !_loaded))
+		&& _failed
+		&& !_loading) {
+		// The «try again» of a board that has not come is the board itself,
+		// for those who may not draw too.
 		load();
 		return;
 	} else if (!_board.contains(position)) {
@@ -1819,8 +2489,10 @@ void CanvasTab::mouseMoveEvent(QMouseEvent *e) {
 		}
 		return;
 	}
+	// A board that has failed to come is one large "try again" button.
 	const auto pointer = (targetAt(position) && canDraw())
-		|| (_status.contains(position) && _failed && !_loading);
+		|| (_status.contains(position) && _failed && !_loading)
+		|| (_board.contains(position) && _failed && !_loading && !_loaded);
 	setCursor(pointer
 		? style::cur_pointer
 		: (_board.contains(position) && canDraw() && _loaded)
@@ -1856,59 +2528,114 @@ void CanvasTab::syncLayer() {
 		&& (_layerGeneration == _model.generation());
 	if (valid) {
 		const auto count = int(strokes.size());
-		if (_layerStrokes < count) {
-			// New strokes on top: painted over what there is.
-			auto p = QPainter(&_layer);
-			p.setRenderHint(QPainter::Antialiasing);
-			const auto canvas = _model.size();
-			p.scale(
-				wanted.width() / double(canvas.width()),
-				wanted.height() / double(canvas.height()));
-			for (auto i = _layerStrokes; i != count; ++i) {
-				PaintStroke(p, *strokes[i], _model.background());
+		if (_layerStrokes < count && !_rebuilding) {
+			// New strokes on top: painted over what there is. Right here
+			// only the user's own ones (a hand has drawn them) and what
+			// is light enough of the others: a stroke of another member
+			// may take seconds to paint.
+			const auto self = _room->selfId();
+			const auto sample = _room->sample();
+			auto left = kSyncPaintWeight;
+			auto p = std::optional<QPainter>();
+			while (_layerStrokes < count) {
+				const auto &stroke = *strokes[_layerStrokes];
+				if (!sample && stroke.userId != self) {
+					left -= StrokeWeight(stroke);
+					if (left < 0) {
+						break;
+					}
+				}
+				if (!p) {
+					p.emplace(&_layer);
+					p->setRenderHint(QPainter::Antialiasing);
+					const auto canvas = _model.size();
+					p->scale(
+						wanted.width() / double(canvas.width()),
+						wanted.height() / double(canvas.height()));
+				}
+				PaintStroke(*p, stroke, _model.background());
+				++_layerStrokes;
 			}
-			_layerStrokes = count;
+			p.reset();
+			if (_layerStrokes < count) {
+				startRebuild(wanted, _layerStrokes);
+			}
 		}
 		return;
-	} else if (_rebuildTimer.isActive() && !_layer.isNull()) {
+	} else if (_rebuilding) {
+		// One at a time: the board as it is by then is painted when the
+		// picture that is being made is ready (see rebuildDone).
 		return;
+	} else if (!_layer.isNull()) {
+		if (_rebuildTimer.isActive()) {
+			return;
+		}
+		// A member can remove strokes as fast as he likes: the whole
+		// board is not painted again for every one of them, the picture
+		// there is stays for a moment.
+		const auto passed = crl::now() - _rebuiltAt;
+		if (!_room->sample()
+			&& _rebuiltAt
+			&& passed >= 0
+			&& passed < kRebuildInterval) {
+			_rebuildTimer.callOnce(kRebuildInterval - passed);
+			return;
+		}
 	}
-	startRebuild(wanted);
+	startRebuild(wanted, 0);
 }
 
-void CanvasTab::startRebuild(QSize wanted) {
+// from == 0: the whole board is painted again. Otherwise the strokes
+// from that one are painted over the picture there is, off the main
+// thread (they are too heavy for it).
+void CanvasTab::startRebuild(QSize wanted, int from) {
 	const auto generation = _model.generation();
-	if (_rebuilding
-		&& _rebuildGeneration == generation
-		&& _rebuildSize == wanted) {
-		return;
-	}
 	const auto &strokes = _model.strokes();
 	const auto count = int(strokes.size());
 	const auto canvas = _model.size();
 	const auto background = _model.background();
-	const auto token = ++_rebuildToken;
-	if (_model.numbers() <= kSyncRebuildNumbers) {
-		_rebuilding = false;
-		_layer = RenderCanvas(strokes, count, canvas, background, wanted);
-		_layerGeneration = generation;
-		_layerStrokes = count;
-		return;
+	if (!from) {
+		_rebuiltAt = crl::now();
+		if (_room->sample() || _model.weight() <= kSyncPaintWeight) {
+			_layer = RenderCanvas(strokes, count, canvas, background, wanted);
+			_layerGeneration = generation;
+			_layerStrokes = count;
+			// Done right here, on the main thread: the pause before the
+			// next one is counted from its end.
+			_rebuiltAt = crl::now();
+			return;
+		}
 	}
-	// A big board is painted off the main thread, the old picture stays
-	// till the new one is ready.
+	// A heavy board is painted off the main thread, the old picture stays
+	// till the new one is ready. Never two at once: what changes while
+	// one is being made waits for it.
 	_rebuilding = true;
-	_rebuildGeneration = generation;
-	_rebuildSize = wanted;
 	const auto weak = QPointer<CanvasTab>(this);
-	crl::async([=, copy = strokes] {
-		auto image = RenderCanvas(copy, count, canvas, background, wanted);
+	// The pixels are copied where they are painted over, in that thread.
+	auto under = from ? _layer : QImage();
+	crl::async([=, copy = strokes, under = std::move(under)]() mutable {
+		auto image = QImage();
+		if (!from) {
+			image = RenderCanvas(copy, count, canvas, background, wanted);
+		} else if (!under.isNull() && !canvas.isEmpty()) {
+			image = std::move(under);
+			auto p = QPainter(&image);
+			p.setRenderHint(QPainter::Antialiasing);
+			p.scale(
+				image.width() / double(canvas.width()),
+				image.height() / double(canvas.height()));
+			const auto fill = OpaqueOr(background, QColor(255, 255, 255));
+			const auto till = std::min(count, int(copy.size()));
+			for (auto i = from; i < till; ++i) {
+				PaintStroke(p, *copy[i], fill);
+			}
+		}
 		crl::on_main([=, image = std::move(image)]() mutable {
 			if (const auto strong = weak.data()) {
 				strong->rebuildDone(
-					token,
 					generation,
 					wanted,
+					from,
 					count,
 					std::move(image));
 			}
@@ -1917,23 +2644,117 @@ void CanvasTab::startRebuild(QSize wanted) {
 }
 
 void CanvasTab::rebuildDone(
-		int token,
 		int generation,
 		QSize size,
+		int from,
 		int count,
 		QImage &&image) {
-	if (token != _rebuildToken) {
-		return;
-	}
 	_rebuilding = false;
-	if (!image.isNull()
-		&& generation == _model.generation()
-		&& size == _board.size() * style::DevicePixelRatio()) {
+	const auto fits = !image.isNull()
+		&& (size == _board.size() * style::DevicePixelRatio());
+	if (fits && !from) {
+		// Also when the board has changed meanwhile: this picture is
+		// newer than the one on the screen, and the paint that follows
+		// sees that it is not the last one and asks for the next. So the
+		// board goes on changing on the screen however often strokes
+		// are removed.
 		_layer = std::move(image);
 		_layerGeneration = generation;
 		_layerStrokes = count;
+	} else if (fits
+		&& (_layer.size() == size)
+		&& (_layerGeneration == generation)
+		&& (_model.generation() == generation)
+		&& (_layerStrokes == from)) {
+		// The picture there was with more strokes on top.
+		_layer = std::move(image);
+		_layerStrokes = count;
+	} else if (from && image.isNull()) {
+		// No picture came back at all: the board is painted from its
+		// first stroke (not at once, see syncLayer).
+		_layerGeneration = -1;
 	}
 	update(_board);
+}
+
+// ---- The picture of what the others draw now.
+
+void CanvasTab::syncLives() {
+	const auto &lives = _model.lives();
+	const auto wanted = _board.size() * style::DevicePixelRatio();
+	if (lives.empty() || wanted.isEmpty()) {
+		// Nothing of the picture is shown till it is painted again (-1).
+		// Its memory is given back by the timer of the previews: they
+		// come and go too often to do that here.
+		_livesPainted.clear();
+		_livesGeneration = -1;
+		return;
+	}
+	const auto continued = !_livesLayer.isNull()
+		&& (_livesLayer.size() == wanted)
+		&& (_livesGeneration == _model.livesGeneration());
+	const auto now = crl::now();
+	const auto wait = [&](crl::time delay) {
+		// The picture there is stays for a moment.
+		if (!_livesTimer.isActive()) {
+			_livesTimer.callOnce(std::max(delay, crl::time(1)));
+		}
+	};
+	// A snapshot scene is painted once, as it is.
+	const auto paced = !_room->sample();
+	if (paced
+		&& now < _livesNotBefore
+		&& now + kLivesPaceMax >= _livesNotBefore) {
+		// Painting the previews has taken a noticeable time (that needs
+		// a member who sends lines no hand draws): they take only a part
+		// of the time of the main thread, whatever comes.
+		wait(_livesNotBefore - now);
+		return;
+	}
+	if (!continued) {
+		// A preview is gone or the board has another size: the others
+		// are painted from their first points. That is the costly thing
+		// here (up to kLiveWeightBudget), and a member can make previews
+		// come and go as fast as he likes, so it is done not more often
+		// than once in kLivesRepaintInterval.
+		const auto passed = now - _livesRepainted;
+		if (paced
+			&& !_livesLayer.isNull()
+			&& _livesRepainted
+			&& passed >= 0
+			&& passed < kLivesRepaintInterval) {
+			wait(kLivesRepaintInterval - passed);
+			return;
+		}
+		if (_livesLayer.size() != wanted) {
+			_livesLayer = QImage(wanted, QImage::Format_ARGB32_Premultiplied);
+			if (_livesLayer.isNull()) {
+				_livesPainted.clear();
+				_livesGeneration = -1;
+				return;
+			}
+		}
+		_livesLayer.fill(Qt::transparent);
+		_livesPainted.clear();
+		_livesGeneration = _model.livesGeneration();
+	}
+	auto spent = QElapsedTimer();
+	spent.start();
+	PaintLivesGrowth(
+		_livesLayer,
+		lives,
+		_livesPainted,
+		_model.size(),
+		_model.background());
+	const auto finished = crl::now();
+	if (!continued) {
+		// The pause before the next one is counted from its end.
+		_livesRepainted = finished;
+	}
+	// The few new points of lines drawn by hands take no time at all.
+	_livesNotBefore = finished + std::min(
+		crl::time(spent.elapsed()) * kLivesPaceFactor,
+		kLivesPaceMax);
 }
 
 // ---- The menu.
@@ -1994,6 +2815,7 @@ void CanvasTab::sendClear(bool swapBackground) {
 	if (_room->sample()) {
 		_model.clear(background);
 		_removing.clear();
+		_removeSent.clear();
 		refreshControls();
 		return;
 	} else if (!canDraw()) {
@@ -2381,9 +3203,15 @@ void TestModel(Checker &check) {
 	check(model.lastOwn(self, skip) == u"d"_q,
 		"then the newest confirmed own stroke");
 	check(model.lastOwn(999, skip).isEmpty(), "nothing of a stranger");
+	check(model.waiting(u"p1"_q)
+		&& model.waiting(u"p2"_q)
+		&& !model.waiting(u"d"_q)
+		&& !model.waiting(u"zzz"_q),
+		"only the strokes that were sent wait for the server");
 	check(model.add(TestStroke(u"p1"_q, 10, self))
 		&& model.pending().size() == 1
-		&& model.strokes().back()->id == u"p1"_q,
+		&& model.strokes().back()->id == u"p1"_q
+		&& !model.waiting(u"p1"_q),
 		"a confirmed stroke leaves the waiting ones");
 	check(model.removePending(u"p2"_q) && !model.removePending(u"p2"_q),
 		"a failed stroke is dropped once");
@@ -2435,6 +3263,136 @@ void TestModel(Checker &check) {
 	check(model.add(TestStroke(u"l3"_q, 11, other))
 		&& model.lives().empty(), "a finished stroke replaces its preview");
 
+	// The previews are what other members send: they are limited.
+	const auto third = uint64(9);
+	const auto has = [](const CanvasModel &where, const QString &id) {
+		return ranges::contains(
+			where.lives(),
+			id,
+			[](const CanvasModel::Live &live) { return live.stroke.id; });
+	};
+	const auto empty = [] {
+		auto result = CanvasModel();
+		result.reset(QSize(1920, 1080), QColor(255, 255, 255), {});
+		return result;
+	};
+	{
+		auto limited = empty();
+		check(limited.addLive(TestStroke(u"f"_q, 0, other, 10), now, 10)
+			&& !limited.addLive(
+				TestStroke(u"f"_q, 0, other, 5),
+				now + 4900,
+				10)
+			&& limited.expireLive(now + 5001)
+			&& limited.lives().empty(),
+			"a full preview is not kept alive by what it does not take");
+
+		auto wide = TestStroke(u"w"_q, 0, other, 2);
+		wide.size = 256;
+		check(limited.addLive(std::move(wide), now, 10)
+			&& limited.lives()[0].stroke.size == kLiveMaxSize,
+			"a preview is not wider than the tools draw");
+		check(limited.lives()[0].weight == 2 * kPointWeight + 15
+			&& limited.liveWeight() == limited.lives()[0].weight,
+			"the weight of a preview is its points and its length");
+
+		const auto generation = limited.livesGeneration();
+		check(limited.addLive(TestStroke(u"u1"_q, 0, other, 2), now + 1, 10)
+			&& limited.addLive(TestStroke(u"u2"_q, 0, other, 2), now + 2, 10)
+			&& limited.addLive(TestStroke(u"t1"_q, 0, third, 2), now + 3, 10)
+			&& limited.lives().size() == 4
+			&& limited.livesGeneration() == generation,
+			"some previews of two members");
+		check(limited.addLive(TestStroke(u"u3"_q, 0, other, 2), now + 4, 10)
+			&& limited.lives().size() == 4
+			&& !has(limited, u"w"_q)
+			&& has(limited, u"u1"_q)
+			&& has(limited, u"u3"_q)
+			&& has(limited, u"t1"_q)
+			&& limited.livesGeneration() != generation,
+			"more previews of a member push out his own oldest one");
+	}
+	{
+		// A zig-zag from edge to edge: few points, a lot to paint.
+		const auto heavy = [](const QString &id, uint64 user, int points) {
+			auto result = CanvasStroke();
+			result.id = id;
+			result.userId = user;
+			for (auto i = 0; i != points; ++i) {
+				result.points.push_back(QPoint((i % 2) ? 1920 : 0, 500));
+			}
+			return result;
+		};
+		auto flooded = empty();
+		check(flooded.addLive(heavy(u"a1"_q, other, 60), now, 8000)
+			&& flooded.addLive(heavy(u"a2"_q, other, 60), now + 1, 8000)
+			&& flooded.liveWeight() > kLiveWeightBudget * 9 / 10
+			&& flooded.liveWeight() <= kLiveWeightBudget,
+			"two heavy previews fit into the budget");
+		check(flooded.addLive(TestStroke(u"b1"_q, 0, third, 50), now + 2, 8000)
+			&& has(flooded, u"b1"_q)
+			&& flooded.liveWeight() <= kLiveWeightBudget,
+			"a light preview of another member finds room");
+		check(flooded.addLive(heavy(u"a3"_q, other, 60), now + 3, 8000)
+			&& has(flooded, u"a3"_q)
+			&& has(flooded, u"b1"_q)
+			&& has(flooded, u"a2"_q)
+			&& !has(flooded, u"a1"_q)
+			&& flooded.liveWeight() <= kLiveWeightBudget,
+			"who floods pushes out his own oldest preview, not the others");
+
+		auto lone = empty();
+		check(lone.addLive(heavy(u"x"_q, other, 200), now, 8000)
+			&& lone.lives().size() == 1
+			&& lone.lives()[0].stroke.points.size() < 200
+			&& lone.lives()[0].weight == StrokeWeight(lone.lives()[0].stroke)
+			&& lone.liveWeight() <= kLiveWeightBudget
+			&& lone.liveWeight() > kLiveWeightBudget - 2000,
+			"one preview alone takes what fits into the budget");
+		// The next point is at the other edge of the board again.
+		auto more = heavy(u"x"_q, other, 3);
+		more.points.erase(begin(more.points));
+		check(!lone.addLive(std::move(more), now + 1, 8000)
+			&& lone.lives().size() == 1,
+			"and stops growing there");
+		check(lone.addLive(TestStroke(u"y"_q, 0, third, 100), now + 2, 8000)
+			&& has(lone, u"y"_q)
+			&& !has(lone, u"x"_q),
+			"till somebody else needs the room");
+	}
+	{
+		auto slow = empty();
+		auto at = now;
+		auto gone = false;
+		check(slow.addLive(TestStroke(u"s"_q, 0, other, 1), at, 100'000),
+			"a preview that gets a point every few seconds");
+		while (!gone && at < now + kLiveMaxAge + 60'000) {
+			at += 4000;
+			gone = slow.expireLive(at);
+			if (!gone) {
+				slow.addLive(TestStroke(u"s"_q, 0, other, 1), at, 100'000);
+			}
+		}
+		check(gone
+			&& at > now + kLiveMaxAge
+			&& at <= now + kLiveMaxAge + 4000,
+			"nobody draws one line for ten minutes");
+	}
+	{
+		auto weighed = empty();
+		const auto before = weighed.weight();
+		weighed.add(TestStroke(u"k1"_q, 1, other, 3));
+		weighed.add(TestStroke(u"k2"_q, 2, other, 5));
+		check(before == 0
+			&& weighed.weight() == (3 + 5) * kPointWeight + 30 + 60,
+			"the weight of a board is the weight of its strokes");
+		weighed.remove(u"k1"_q);
+		check(weighed.weight() == 5 * kPointWeight + 60,
+			"a removed stroke takes its weight away");
+		weighed.clear(QColor(1, 2, 3));
+		check(weighed.weight() == 0, "a cleared board weighs nothing");
+	}
+
 	// A new snapshot.
 	auto fresh = std::vector<CanvasStroke>();
 	fresh.push_back(TestStroke(u"p3"_q, 20, self));
@@ -2450,6 +3408,9 @@ void TestModel(Checker &check) {
 		&& model.numbers() == 0
 		&& model.background() == QColor(16, 16, 16)
 		&& model.generation() == generation + 1, "the board is cleared");
+	check(!model.waiting(u"p4"_q),
+		"a cleared board does not wait for a stroke: a late answer of the "
+		"server does not bring it back");
 	model.clear(QColor());
 	check(model.background() == QColor(16, 16, 16),
 		"a wrong colour keeps the background");
@@ -2519,6 +3480,253 @@ void TestRender(Checker &check) {
 		&& big.pixelColor(200, 20) == white, "the picture is scaled");
 	check(RenderCanvas(strokes, 99, canvas, white, QSize()).isNull(),
 		"no size: no picture");
+}
+
+// How many pixels of two pictures of one line differ for real: where
+// one has nothing the other has the line, not just another edge.
+[[nodiscard]] int Mismatches(const QImage &a, const QImage &b, int full) {
+	if (a.size() != b.size() || a.isNull()) {
+		return -1;
+	}
+	const auto low = full / 3;
+	auto result = 0;
+	for (auto y = 0; y != a.height(); ++y) {
+		for (auto x = 0; x != a.width(); ++x) {
+			const auto first = qAlpha(a.pixel(x, y));
+			const auto second = qAlpha(b.pixel(x, y));
+			const auto differ = (!first && second > low)
+				|| (!second && first > low)
+				|| (first >= full - 2 && second < full - low)
+				|| (second >= full - 2 && first < full - low);
+			result += differ ? 1 : 0;
+		}
+	}
+	return result;
+}
+
+// The pictures of the lines that grow: what is painted point by point
+// is the line that is painted at once.
+void TestGrowth(Checker &check) {
+	const auto canvas = QSize(400, 300);
+	const auto white = QColor(255, 255, 255);
+	auto line = CanvasStroke();
+	line.id = u"g"_q;
+	line.color = QColor(255, 0, 0);
+	line.size = 24;
+	// To the right, up, back down across the first part, a hairpin.
+	for (auto x = 40; x <= 360; x += 8) {
+		line.points.push_back(QPoint(x, 150));
+	}
+	for (auto y = 141; y >= 60; y -= 9) {
+		line.points.push_back(QPoint(360, y));
+	}
+	for (auto i = 1; i <= 30; ++i) {
+		line.points.push_back(QPoint(360 - i * 8, 60 + i * 6));
+	}
+	line.points.push_back(QPoint(180, 240));
+	line.points.push_back(QPoint(120, 250));
+	const auto count = int(line.points.size());
+
+	const auto blank = [&] {
+		auto result = QImage(canvas, QImage::Format_ARGB32_Premultiplied);
+		result.fill(Qt::transparent);
+		return result;
+	};
+	const auto atOnce = [&](const CanvasStroke &stroke) {
+		auto result = blank();
+		auto p = QPainter(&result);
+		p.setCompositionMode(QPainter::CompositionMode_Source);
+		p.setRenderHint(QPainter::Antialiasing);
+		PaintStrokeGrowth(p, stroke, white, 0, count);
+		PaintStrokeEnd(p, stroke, white, count);
+		p.end();
+		return result;
+	};
+	const auto grown = [&](const CanvasStroke &stroke, int step) {
+		auto layer = StrokeLayer();
+		auto growing = stroke;
+		growing.points.clear();
+		auto good = true;
+		for (auto i = 0; i != count; ++i) {
+			growing.points.push_back(stroke.points[i]);
+			if ((i + 1) % step == 0 || i + 1 == count) {
+				good = layer.sync(growing, white, canvas, canvas) && good;
+			}
+		}
+		return good ? layer.image() : QImage();
+	};
+
+	// An opaque pen.
+	auto usual = blank();
+	{
+		auto p = QPainter(&usual);
+		p.setRenderHint(QPainter::Antialiasing);
+		PaintStroke(p, line, white);
+	}
+	const auto whole = atOnce(line);
+	// (114, 256) is under the round end of the line and nothing else.
+	check(qAlpha(whole.pixel(100, 150)) == 255
+		&& qAlpha(whole.pixel(20, 20)) == 0
+		&& qAlpha(whole.pixel(114, 256)) == 255,
+		"a line painted in parts is there, its end too");
+	check(Mismatches(whole, usual, 255) == 0,
+		"a line painted in parts is the line painted as a stroke");
+	const auto byOne = grown(line, 1);
+	check(Mismatches(byOne, whole, 255) == 0,
+		"a line that grows point by point is the same line");
+	const auto bySeven = grown(line, 7);
+	check(Mismatches(bySeven, whole, 255) == 0,
+		"a line that grows by several points is the same line");
+	// Before the last point came the line ended in (180, 240): that end
+	// was painted, and it is taken back when the line turns there.
+	check(qAlpha(byOne.pixel(186, 240)) == 0
+		&& qAlpha(whole.pixel(186, 240)) == 0,
+		"the end of a line does not stay where the line has turned");
+
+	// A marker: one alpha everywhere, where it crosses itself too.
+	auto marker = line;
+	marker.id = u"m"_q;
+	marker.tool = CanvasTool::Marker;
+	marker.alpha = 128;
+	const auto translucent = grown(marker, 1);
+	const auto plain = qAlpha(translucent.pixel(100, 150));
+	const auto crossing = qAlpha(translucent.pixel(240, 150));
+	check(plain >= 126 && plain <= 130,
+		"a marker line that grows is translucent");
+	check(crossing >= 126 && crossing <= 130,
+		"and not darker where it crosses itself");
+	check(Mismatches(translucent, atOnce(marker), 128) == 0,
+		"a marker line that grows is the same line");
+
+	// The eraser paints the paper.
+	auto eraser = line;
+	eraser.id = u"e"_q;
+	eraser.tool = CanvasTool::Eraser;
+	const auto erased = grown(eraser, 3);
+	check(!erased.isNull()
+		&& erased.pixelColor(100, 150) == white
+		&& qAlpha(erased.pixel(20, 20)) == 0,
+		"the eraser that grows paints the background");
+
+	// The previews: only what was revealed, the end stays behind.
+	auto lives = std::vector<CanvasModel::Live>();
+	lives.push_back({ .stroke = line, .shown = 10. });
+	auto painted = std::vector<int>();
+	auto picture = blank();
+	PaintLivesGrowth(picture, lives, painted, canvas, white);
+	check(painted.size() == 1
+		&& painted[0] == 10
+		&& qAlpha(picture.pixel(60, 150)) == 255
+		&& qAlpha(picture.pixel(200, 150)) == 0,
+		"a preview is painted as far as it is revealed");
+	lives[0].shown = double(count);
+	PaintLivesGrowth(picture, lives, painted, canvas, white);
+	check(painted[0] == count
+		&& qAlpha(picture.pixel(200, 150)) == 255
+		&& qAlpha(picture.pixel(114, 256)) == 0,
+		"then the rest of it is added, up to the middle of the last part");
+	auto all = blank();
+	auto none = std::vector<int>();
+	PaintLivesGrowth(all, lives, none, canvas, white);
+	check(Mismatches(all, picture, 255) == 0,
+		"a preview painted in two steps is the preview painted at once");
+}
+
+// What the main thread may have to paint at once at the worst, with the
+// time it has taken here: a line in the log to look at, the limits are
+// in weight and do not depend on the machine.
+void TestCost(Checker &check, QStringList &log) {
+	const auto canvas = QSize(1920, 1080);
+	const auto white = QColor(255, 255, 255);
+	// The worst a member can send: the widest translucent line from
+	// edge to edge again and again, as many of them as are taken.
+	const auto worst = [](const QString &id, uint64 user, int points) {
+		auto result = CanvasStroke();
+		result.id = id;
+		result.userId = user;
+		result.tool = CanvasTool::Marker;
+		result.color = QColor(0, 122, 255);
+		result.alpha = 128;
+		result.size = 256;
+		for (auto i = 0; i != points; ++i) {
+			result.points.push_back(QPoint(
+				(i % 2) ? 1920 : 0,
+				(i * 37 + int(user) * 101) % 1080));
+		}
+		return result;
+	};
+	auto model = CanvasModel();
+	model.reset(canvas, white, {});
+	auto now = crl::time(1000);
+	for (auto round = 0; round != 4; ++round) {
+		for (auto user = uint64(1); user != 12; ++user) {
+			for (auto i = 0; i != kMaxLivesOfUser + 1; ++i) {
+				model.addLive(
+					worst(u"w%1-%2-%3"_q.arg(round).arg(user).arg(i), user, 200),
+					++now,
+					8000);
+			}
+		}
+	}
+	while (model.advanceLive(250)) {
+	}
+	auto points = 0;
+	auto widest = 0;
+	auto perUser = base::flat_map<uint64, int>();
+	for (const auto &live : model.lives()) {
+		points += int(live.stroke.points.size());
+		widest = std::max(widest, live.stroke.size);
+		++perUser[live.stroke.userId];
+	}
+	auto most = 0;
+	for (const auto &[user, count] : perUser) {
+		most = std::max(most, count);
+	}
+	check(model.liveWeight() <= kLiveWeightBudget
+		&& int(model.lives().size()) <= kMaxLives
+		&& most <= kMaxLivesOfUser
+		&& widest <= kLiveMaxSize,
+		"a flood of previews stays inside the limits");
+
+	auto picture = QImage(canvas, QImage::Format_ARGB32_Premultiplied);
+	picture.fill(Qt::transparent);
+	auto painted = std::vector<int>();
+	auto timer = QElapsedTimer();
+	timer.start();
+	PaintLivesGrowth(picture, model.lives(), painted, canvas, white);
+	const auto previews = timer.nsecsElapsed() / 1000;
+	check(!painted.empty() && previews < 5'000'000,
+		"the heaviest previews there can be are painted");
+
+	// The heaviest finished stroke of another member that is painted
+	// right in the paint event, and the heaviest board painted there.
+	auto strokes = std::vector<CanvasModel::StrokePtr>();
+	auto heavy = worst(u"h"_q, 1, 2);
+	const auto step = int64(kPointWeight + 1920 + 1080);
+	while (StrokeWeight(heavy) + step <= kSyncPaintWeight) {
+		heavy.points.push_back(QPoint(
+			(heavy.points.size() % 2) ? 1920 : 0,
+			int(heavy.points.size() * 37) % 1080));
+	}
+	const auto weight = StrokeWeight(heavy);
+	strokes.push_back(std::make_shared<const CanvasStroke>(std::move(heavy)));
+	timer.restart();
+	const auto board = RenderCanvas(strokes, 1, canvas, white, canvas);
+	const auto stroke = timer.nsecsElapsed() / 1000;
+	check(!board.isNull()
+		&& weight <= kSyncPaintWeight
+		&& weight > kSyncPaintWeight - 4000
+		&& stroke < 5'000'000,
+		"the heaviest stroke the main thread paints is painted");
+	log.push_back(
+		u"worst case at 1920x1080: %1 previews, %2 points, weight %3"_q.arg(
+			QString::number(model.lives().size()),
+			QString::number(points),
+			QString::number(model.liveWeight()))
+		+ u" painted in %1 ms; a stroke of weight %2 painted in %3 ms"_q.arg(
+			QString::number(previews / 1000., 'f', 1),
+			QString::number(weight),
+			QString::number(stroke / 1000., 'f', 1)));
 }
 
 // ---- Snapshot scenes (OBLIVION_SELFTEST=ui).
@@ -2680,17 +3888,21 @@ struct SampleBoard {
 	}
 	add(kSampleThird, CanvasTool::Pen, SwatchColor(9), 14, std::move(heart));
 
-	// A gull, and the eraser has cut the first wave under the boat.
+	// Two gulls. (No eraser line here: a bare cut through the waves looks
+	// like a glitch in a still picture, the self-test checks the eraser.)
 	add(kSampleThird, CanvasTool::Pen, ink, 8, {
-		QPoint(1180, 250),
-		QPoint(1215, 215),
-		QPoint(1250, 250),
-		QPoint(1285, 215),
-		QPoint(1320, 250),
+		QPoint(1090, 250),
+		QPoint(1125, 215),
+		QPoint(1160, 250),
+		QPoint(1195, 215),
+		QPoint(1230, 250),
 	});
-	add(kSampleSelf, CanvasTool::Eraser, ink, 40, {
-		QPoint(860, 868),
-		QPoint(1120, 868),
+	add(kSampleThird, CanvasTool::Pen, ink, 8, {
+		QPoint(640, 170),
+		QPoint(668, 142),
+		QPoint(696, 170),
+		QPoint(724, 142),
+		QPoint(752, 170),
 	});
 
 	// A star is being drawn right now.
@@ -2712,7 +3924,9 @@ struct SampleBoard {
 	scribble.userId = kSampleOwner;
 	scribble.color = ink;
 	scribble.size = 8;
-	scribble.points = arc(QPointF(560, 560), 70, 36, 3.4, 8.4, 20);
+	// An arc that ends at its right side: the name of who draws it hangs
+	// next to the end and does not cover the line.
+	scribble.points = arc(QPointF(560, 560), 70, 36, 2.6, 6.6, 20);
 	result.lives.push_back(std::move(scribble));
 	return result;
 }
@@ -2800,6 +4014,10 @@ bool RunCanvasSelfTest(QStringList &log) {
 	check.section("model and limits");
 	TestRender(check);
 	check.section("render");
+	TestGrowth(check);
+	check.section("lines that grow");
+	TestCost(check, log);
+	check.section("the cost of what the others send");
 	log.push_back(u"room_canvas: %1 checks, %2 failed"_q.arg(
 		QString::number(check.passed() + check.failed()),
 		QString::number(check.failed())));

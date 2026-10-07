@@ -177,6 +177,13 @@ struct Request {
 	bool auth = true;
 	crl::time timeout = 0; // 0: 20 seconds without any transfer.
 	int retries = -1; // -1: 2 for GET / HEAD, 0 for everything else.
+
+	// How many times a request the server has refused with 429 is sent
+	// again after the pause the server asks for (retry_after_ms, when it
+	// is not longer than ten seconds). Unlike retries this is safe for a
+	// POST as well: a refused request was not done. For the routes with a
+	// bucket of their own: the queue of a room, PATCH /v1/me.
+	int rateRetries = 0;
 };
 
 // Shortcuts, so that nobody has to spell the designated initializers:
@@ -273,7 +280,11 @@ enum class State {
 	// revoked or the account deleted from another device). Nothing is
 	// registered again without a click.
 	Disconnected,
-	NeedsLink, // The id belongs to another device: a link code is needed.
+	// The id is taken: by another device of the user, or by an account
+	// that has no device left (the server keeps it reserved after the
+	// last one logged out, lastError().details has "reserved" then). A
+	// link code is needed, from that device or from the admin.
+	NeedsLink,
 	Connecting, // Registering or checking the key, the first hello.
 	Online, // The event stream is open.
 	Offline, // No connection, retried with a backoff by itself.
@@ -320,6 +331,10 @@ public:
 		QString folder; // Ends with a slash, cloud.json is kept there.
 		QByteArray sealKey; // 32 bytes to encrypt the token with, or empty.
 		bool available = true; // false: a Telegram test server account.
+		// Only the live self-test sets it (from the environment): the
+		// server registers the fake test ids only with this key, it is
+		// sent with POST /v1/auth/register and with nothing else.
+		QByteArray testKey;
 	};
 
 	explicit Account(Descriptor &&descriptor);
@@ -351,8 +366,10 @@ public:
 	void redeemLinkCode(const QString &code, Fn<void()> done, Fail fail);
 	void deleteData(Fn<void()> done, Fail fail); // «Удалить мои данные».
 	[[nodiscard]] QString chosenName() const; // What agree() was given.
-	// The logout of Telegram (SessionLoggedOut() calls it): the key of
-	// this device is revoked on the server and removed from the disk.
+	// The logout of Telegram (SessionLoggedOut() calls it): only this
+	// device is logged out of the cloud, its key is revoked on the server
+	// and removed from the disk. The data of the user stays on the server,
+	// deleteData() is the only thing that deletes it.
 	void forgetDevice();
 
 	// The own user object as the server has it (cached on disk).
@@ -378,7 +395,16 @@ public:
 
 	// Transfers go through their own connections and never starve the
 	// requests. At most 4 downloads and 2 uploads run at once, the rest
-	// wait in line. A cancelled transfer calls nothing.
+	// wait in line. A cancelled transfer calls nothing. Downloads of the
+	// same file into the same place share one transfer (every caller has
+	// an id of its own and is told when it is done), so asking twice for
+	// a track that is twice in a queue is fine.
+	//
+	// An upload that has failed (the server is full in the middle of a
+	// file, 507; the connection is gone) leaves what was sent on the
+	// server: only cancelTransfer() removes it there. The same file given
+	// to upload() again goes on from where it stopped, so «Повторить»
+	// after a failure is just another upload().
 	TransferId upload(UploadArgs &&args);
 	TransferId download(DownloadArgs &&args);
 	// A media file into the cache; done at once (from the event loop)
@@ -528,7 +554,11 @@ void SessionLoggedOut(not_null<Main::Session*> session);
 // OBLIVION_SELFTEST=cloud. Pure logic always; with
 // OBLIVION_SELFTEST_CLOUD_LIVE=1 also a round trip against the real
 // server with fake test ids (registers, opens a room, exchanges events,
-// uploads, downloads, links a device, deletes everything).
+// uploads, downloads, links a device, deletes everything). The server
+// registers the fake ids only with its test key: the live part takes it
+// from OBLIVION_SELFTEST_CLOUD_TEST_KEY and sends it in the header
+// X-Oblivion-Test-Key of its registrations, the key is never a part of
+// the app.
 [[nodiscard]] bool RunSelfTest(QStringList &log);
 
 } // namespace Oblivion::Cloud

@@ -972,6 +972,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_app_icon_default" = "Oblivion";
 "lng_oblivion_app_icon_telegram" = "Telegram";
 "lng_oblivion_app_icon_previous" = "Previous";
+"lng_oblivion_app_icon_eclipse" = "Eclipse";
+"lng_oblivion_app_icon_portal" = "Portal";
+"lng_oblivion_app_icon_ghost" = "Ghost";
+"lng_oblivion_app_icon_shadow" = "Shadow";
+"lng_oblivion_app_icon_horizon" = "Horizon";
 "lng_oblivion_app_icon_custom" = "Custom image…";
 "lng_oblivion_app_icon_reset" = "Reset to default";
 "lng_oblivion_app_icon_custom_short" = "Custom";
@@ -3404,11 +3409,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 // Oblivion round 5: cloud.
 "lng_oblivion_cloud_title" = "Oblivion Cloud";
 "lng_oblivion_cloud_soon" = "This part is not ready yet.";
-"lng_oblivion_cloud_consent_about" = "Rooms, shared playlists, the badge and other things you do together with other people work through Oblivion Cloud. It is the own server of the Oblivion developer, not a part of Telegram.";
+"lng_oblivion_cloud_consent_about" = "Rooms, shared playlists, the badge and everything else you do together with other people work through Oblivion Cloud. It is a server of the Oblivion developer, not a part of Telegram.";
 "lng_oblivion_cloud_consent_sent_title" = "What is sent";
-"lng_oblivion_cloud_consent_sent" = "The numeric ID of the Telegram account {name}, the name and the picture you choose for Oblivion, the name of this device and what you do in the cloud yourself: rooms, playlists and presets you share. While Oblivion Cloud is on, the server sees your IP address and that the app is running.";
+"lng_oblivion_cloud_consent_sent" = "The numeric ID of the Telegram account {name}\nThe name and the picture you choose for Oblivion\nThe name of this device\nWhat you do in the cloud yourself: rooms, playlists and presets you share\nWhile Oblivion Cloud is on, the server sees your IP address and that the app is running";
 "lng_oblivion_cloud_consent_not_title" = "What is never sent";
-"lng_oblivion_cloud_consent_not" = "Your messages and chats, your contact list, your phone number, your Telegram password and login keys.";
+"lng_oblivion_cloud_consent_not" = "Your messages and chats\nYour contact list and phone number\nYour Telegram password and login keys";
 "lng_oblivion_cloud_consent_off" = "You can disconnect or delete all your data from the server at any moment: Settings > Oblivion > Oblivion Cloud. Nothing is sent until you agree.";
 "lng_oblivion_cloud_consent_name" = "Name in Oblivion";
 "lng_oblivion_cloud_consent_name_about" = "The other people in a room see this name. You can leave it empty.";
@@ -3420,6 +3425,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_cloud_link_loading" = "Getting a code…";
 "lng_oblivion_cloud_link_expires" = "The code works once and is valid for {time} more.";
 "lng_oblivion_cloud_link_expired" = "The code has expired. Press «New code».";
+"lng_oblivion_cloud_off_title" = "Switch off Oblivion Cloud?";
+"lng_oblivion_cloud_delete_title" = "Delete your data from the server?";
 "lng_oblivion_cloud_link_copy" = "Copy";
 "lng_oblivion_cloud_link_copied" = "The code is copied.";
 "lng_oblivion_cloud_link_new" = "New code";
@@ -3431,7 +3438,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_cloud_code_wrong" = "The code did not fit or has expired. Get a new one and try again.";
 "lng_oblivion_cloud_code_devices" = "Too many devices are linked to this account already.";
 "lng_oblivion_cloud_code_done" = "This device is linked to Oblivion Cloud.";
-"lng_oblivion_cloud_code_lost" = "If you have no device with Oblivion left, ask the developer of Oblivion to reset the link.";
+"lng_oblivion_cloud_code_lost" = "If you have no device with Oblivion left, ask the developer of Oblivion for a one-time code.";
+"lng_oblivion_cloud_code_reserved_about" = "Oblivion Cloud keeps the data of this Telegram account, but no device is linked to it any more: this happens after logging out of Telegram. Ask the developer of Oblivion for a one-time code and enter it here.";
 "lng_oblivion_cloud_error_off" = "Oblivion Cloud is not connected for this account.";
 "lng_oblivion_cloud_error_network" = "Could not reach the Oblivion Cloud server. Please try again later.";
 "lng_oblivion_cloud_error_tls" = "The Oblivion Cloud server could not be verified, so nothing was sent.";
@@ -3453,6 +3461,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_cloud_status_off_about" = "Oblivion Cloud is off for this account, nothing is sent to the server. You can turn it on again at any moment.";
 "lng_oblivion_cloud_status_link" = "A code is needed";
 "lng_oblivion_cloud_status_link_about" = "This Telegram account is already linked to Oblivion Cloud on another device. Get a code there and press «Enter a code from another device».";
+"lng_oblivion_cloud_status_reserved_about" = "Oblivion Cloud keeps the data of this account, but no device is linked to it any more: this happens after logging out of Telegram. Ask the developer of Oblivion for a one-time code and press «Enter a code from another device».";
 "lng_oblivion_cloud_status_connecting" = "Connecting…";
 "lng_oblivion_cloud_status_connecting_about" = "Talking to the Oblivion Cloud server.";
 "lng_oblivion_cloud_status_online" = "Connected";
@@ -3463,10 +3472,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_cloud_status_upgrade" = "Update needed";
 "lng_oblivion_cloud_status_banned" = "Access closed";
 "lng_oblivion_cloud_on_done" = "Oblivion Cloud is connected.";
-"lng_oblivion_cloud_off_sure" = "Switch Oblivion Cloud off for this account? Your data stays on the server and the key of this device stays on this computer, so that you can connect again. To erase everything use «Delete my data from the server».";
+"lng_oblivion_cloud_off_sure" = "Oblivion Cloud will be switched off for this account. Your data stays on the server and the key of this device stays on this computer, so that you can connect again.\n\nTo erase everything use «Delete my data from the server».";
 "lng_oblivion_cloud_off_confirm" = "Switch off";
 "lng_oblivion_cloud_off_done" = "Oblivion Cloud is switched off for this account.";
-"lng_oblivion_cloud_delete_sure" = "Delete everything Oblivion Cloud keeps about this account? Your name and picture, profile, the rooms you own, shared playlists and presets, the copy of your settings and all linked devices will be erased at once. This can't be undone.";
+"lng_oblivion_cloud_delete_sure" = "Everything Oblivion Cloud keeps about this account will be erased at once: your name and picture, profile, the rooms you own, shared playlists and presets, the copy of your settings and all linked devices.\n\nThis can't be undone.";
 "lng_oblivion_cloud_delete_confirm" = "Delete";
 "lng_oblivion_cloud_delete_done" = "Your data is deleted from the server. Oblivion Cloud is off for this account.";
 "lng_oblivion_cloud_delete_need" = "To delete the data Oblivion Cloud has to be connected for this account: the server must make sure it is really you.";
@@ -3476,7 +3485,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_cloud_enter_code" = "Enter a code from another device";
 "lng_oblivion_cloud_delete" = "Delete my data from the server";
 "lng_oblivion_cloud_links" = "Open Oblivion links in the app";
-"lng_oblivion_cloud_section_about" = "Oblivion Cloud is the server of the Oblivion developer for rooms, shared playlists and presets, the badge and profiles. It is switched on separately for every Telegram account and only after you agree.";
+"lng_oblivion_cloud_section_about" = "Oblivion Cloud is the server of the Oblivion developer for rooms, shared playlists and presets, the badge and profiles. It is switched on separately for every Telegram account and only after you agree. Logging out of Telegram on this computer only unlinks this computer from Oblivion Cloud: your data stays on the server until you delete it yourself, and to connect again you will need a code.";
 // Oblivion round 5: rooms.
 "lng_oblivion_room_section" = "Together";
 "lng_oblivion_room_settings" = "Rooms";
@@ -3487,7 +3496,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_room_members_count#one" = "{count} member";
 "lng_oblivion_room_members_count#other" = "{count} members";
 "lng_oblivion_room_header_status" = "{members} · {online} online";
-"lng_oblivion_room_connecting" = "No connection to the server. Reconnecting…";
+"lng_oblivion_room_connecting" = "No connection, reconnecting…";
 "lng_oblivion_room_copy_link" = "Copy link";
 "lng_oblivion_room_copy_code" = "Copy code";
 "lng_oblivion_room_link_copied" = "The room link is copied.";
@@ -3538,6 +3547,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_room_member_transfer" = "Make owner";
 "lng_oblivion_room_member_transfer_sure" = "Make {name} the owner of the room? You will stay a member.";
 "lng_oblivion_room_member_kick" = "Remove";
+"lng_oblivion_room_member_kick_sure" = "Remove {name} from the room? They can come back by the link.";
 "lng_oblivion_room_member_ban" = "Remove and block";
 "lng_oblivion_room_member_ban_sure" = "Remove {name} and never let back in by the link?";
 "lng_oblivion_room_right_control" = "Player";
@@ -3548,11 +3558,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_room_right_invite" = "Invitations";
 "lng_oblivion_room_list_loading" = "Loading…";
 "lng_oblivion_room_list_empty" = "You are not in any room yet. Create your own or join by a link from a friend.";
-"lng_oblivion_room_list_row" = "{title} · {members}";
-"lng_oblivion_room_list_row_owner" = "{title} · your room · {members}";
+"lng_oblivion_room_list_yours" = "Your room";
+"lng_oblivion_room_list_online" = "{online} online";
 "lng_oblivion_room_list_create" = "Create room";
 "lng_oblivion_room_list_join_placeholder" = "Room link or code";
-"lng_oblivion_room_list_join" = "Join by link";
 "lng_oblivion_room_list_bad_code" = "This does not look like a room link or code.";
 "lng_oblivion_room_create_title" = "New room";
 "lng_oblivion_room_create_about" = "A room is where you and your friends listen to music, watch video, draw and chat together. Invite them with a link.";
@@ -3577,7 +3586,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_room_file_failed" = "This file can't be played: its length is unknown.";
 "lng_oblivion_room_file_too_big" = "The file is too big: a room takes up to {size} MB.";
 "lng_oblivion_room_untitled" = "Untitled";
-"lng_oblivion_room_open_as_room" = "Open as room";
+"lng_oblivion_room_open_as_room" = "To a room";
 // Oblivion round 5: room music.
 "lng_oblivion_rmusic_tab" = "Music";
 "lng_oblivion_rmusic_queue" = "Queue";
@@ -3587,8 +3596,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rmusic_add_files" = "Files from the computer…";
 "lng_oblivion_rmusic_add_files_title" = "Choose music";
 "lng_oblivion_rmusic_add_to_room" = "Add to room";
-"lng_oblivion_rmusic_added_by" = "from {name}";
+"lng_oblivion_rmusic_added_by" = "Added by {name}";
 "lng_oblivion_rmusic_added_toast" = "The track is being sent to the room.";
+"lng_oblivion_rmusic_batch_toast#one" = "{count} track is being sent to the room.";
+"lng_oblivion_rmusic_batch_toast#other" = "{count} tracks are being sent to the room.";
 "lng_oblivion_rmusic_clear" = "Clear queue";
 "lng_oblivion_rmusic_clear_sure" = "Remove all tracks from the queue of the room?";
 "lng_oblivion_rmusic_downloading" = "The track is being downloaded from Telegram, then it goes to the room.";
@@ -3606,12 +3617,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rmusic_playlists_empty" = "You have no Oblivion playlists yet.";
 "lng_oblivion_rmusic_playlist_add_all" = "Add all";
 "lng_oblivion_rmusic_playlist_empty" = "This playlist has no tracks yet.";
-"lng_oblivion_rmusic_playlist_loading" = "{track} — loading…";
-"lng_oblivion_rmusic_playlist_unavailable" = "{track} — unavailable";
+"lng_oblivion_rmusic_playlist_wait" = "loading…";
+"lng_oblivion_rmusic_playlist_gone" = "unavailable";
 "lng_oblivion_rmusic_preparing" = "Preparing…";
 "lng_oblivion_rmusic_uploading" = "Sending to the room… {percent}%";
 "lng_oblivion_rmusic_too_many" = "Not more than 20 tracks are added at once.";
 "lng_oblivion_rmusic_rejoin" = "Back to the air";
+"lng_oblivion_rmusic_retry" = "Retry loading";
 "lng_oblivion_rmusic_row_play" = "Play now";
 "lng_oblivion_rmusic_row_next" = "Play next";
 "lng_oblivion_rmusic_row_up" = "Move up";
@@ -3651,6 +3663,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rvideo_state_loading" = "Loading the video… {percent}%";
 "lng_oblivion_rvideo_state_buffering" = "Buffering… {percent}%";
 "lng_oblivion_rvideo_state_failed" = "Could not load the video";
+"lng_oblivion_rvideo_state_no_space" = "Not enough disk space for this video";
 "lng_oblivion_rvideo_state_unplayable" = "This video can't be played here";
 "lng_oblivion_rvideo_state_paused" = "Paused";
 "lng_oblivion_rvideo_state_paused_by" = "Paused · {name}";
@@ -3668,7 +3681,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 // Oblivion round 5: room canvas.
 "lng_oblivion_rcanvas_tab" = "Canvas";
 "lng_oblivion_rcanvas_status_loading" = "Loading the canvas…";
-"lng_oblivion_rcanvas_status_failed" = "Could not load the canvas. Click here to try again.";
+"lng_oblivion_rcanvas_status_failed" = "Could not load the canvas.";
+"lng_oblivion_rcanvas_retry" = "Try again";
+"lng_oblivion_rcanvas_empty" = "The canvas is clean";
+"lng_oblivion_rcanvas_empty_about" = "Whatever is drawn here, everyone in the room sees at once.";
 "lng_oblivion_rcanvas_status_offline" = "No connection to the server. Drawing is paused.";
 "lng_oblivion_rcanvas_status_no_right" = "The room owner has not allowed you to draw.";
 "lng_oblivion_rcanvas_status_full" = "The canvas is full. Clear it to keep drawing.";
@@ -3698,7 +3714,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rextra_voice_attach" = "Attach a group…";
 "lng_oblivion_rextra_voice_detach" = "Detach the voice chat";
 "lng_oblivion_rextra_voice_create_title" = "Voice chat for the room";
-"lng_oblivion_rextra_voice_create_about" = "Oblivion will create a private group «{title}» in your Telegram account, get an invite link to it and show a voice chat button (the microphone at the top of the window) to everyone in this room.\n\nThen Telegram will start a video chat in that group and you will join it with the microphone off. Other people get into the group only when they press that button themselves and confirm joining in Telegram.\n\nYou can delete the group in Telegram at any time.";
+"lng_oblivion_rextra_voice_create_about" = "Oblivion will create a private group «{title}» in your Telegram account and start a video chat in it. You will join with the microphone off.\n\nEveryone in the room gets a microphone button at the top of the window. Only those who press it themselves and confirm joining in Telegram get into the group.\n\nYou can delete the group at any time.";
 "lng_oblivion_rextra_voice_create_button" = "Create the group";
 "lng_oblivion_rextra_voice_group_title" = "Voice · {title}";
 "lng_oblivion_rextra_voice_group_about" = "The voice chat of an Oblivion room.";
@@ -3708,8 +3724,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rextra_voice_attached" = "The voice chat is attached. Everyone in the room now has the microphone button.";
 "lng_oblivion_rextra_voice_busy" = "The voice chat is being set up, one moment…";
 "lng_oblivion_rextra_voice_attach_title" = "Attach a group";
-"lng_oblivion_rextra_voice_attach_about" = "Choose a group of yours with a video chat. Everyone in the room will get an invite link to it behind the microphone button.";
-"lng_oblivion_rextra_voice_attach_empty" = "Your chat list has no groups where you may create invite links.";
+"lng_oblivion_rextra_voice_attach_about" = "Choose a group of yours with a video chat. Everyone in the room will be able to join it with the microphone button.";
+"lng_oblivion_rextra_voice_attach_empty" = "You have no groups where you can invite people by a link.\n\nChoose «Create a voice chat…» in the room menu instead: Oblivion will make a new group for it.";
 "lng_oblivion_rextra_voice_attach_public" = "Public group";
 "lng_oblivion_rextra_voice_attach_sure" = "Attach the group «{title}»? Oblivion will create a separate invite link in it and show it to everyone in the room.";
 "lng_oblivion_rextra_voice_attach_sure_public" = "Attach the group «{title}»? Everyone in the room will get its public link.";
@@ -3720,6 +3736,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_rextra_voice_no_call_member" = "There is no video chat in «{title}» right now. Ask the room owner to start it.";
 "lng_oblivion_rextra_voice_no_window" = "Open the Telegram window of this account first.";
 "lng_oblivion_rextra_voice_appeared" = "This room has a voice chat now: press the microphone at the top of the window.";
+"lng_oblivion_rextra_voice_not_group" = "The voice chat link of this room does not lead to a Telegram group, so it was not opened.";
 // Oblivion round 5: social.
 "lng_oblivion_social_section" = "Profile and visibility";
 "lng_oblivion_social_friends" = "Friends in Oblivion";
@@ -3738,7 +3755,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_social_audience_chosen" = "Chosen people";
 "lng_oblivion_social_audience_everyone" = "Everyone in Oblivion";
 "lng_oblivion_social_settings_about" = "All of this is off until you turn it on yourself, and it is set for the current account only. The badge is public: everyone who uses Oblivion sees it next to your name. The profile and the activity are seen by the audience you choose. Your contact list is never sent anywhere: the lists are downloaded and compared on this device.";
-"lng_oblivion_social_badge_confirm" = "The badge will appear next to your name for everyone who uses Oblivion: by it people can tell that this account uses Oblivion too. It is not a Telegram verification, and nothing changes in regular Telegram apps. Your bio is no longer changed for the badge.";
+"lng_oblivion_social_badge_confirm" = "The badge will appear next to your name for everyone who uses Oblivion: by it people can tell that this account uses Oblivion too.\n\nIt is not a Telegram verification, and nothing changes in regular Telegram apps. Your bio is no longer changed for the badge.";
 "lng_oblivion_social_badge_confirm_enable" = "Turn on";
 "lng_oblivion_social_badge_on" = "The Oblivion badge is on for this account.";
 "lng_oblivion_social_badge_off" = "The Oblivion badge is off for this account.";
@@ -3748,7 +3765,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_social_marker_later" = "The old mark will be removed from your bio the next time Oblivion starts with this account.";
 "lng_oblivion_social_marker_wait" = "Telegram asks to wait before your profile is changed again. Oblivion will remove the old mark from your bio when it starts with this account after that wait.";
 "lng_oblivion_social_marker_stuck" = "Oblivion could not remove its old mark from your bio after several tries. To remove it yourself, change the text of your bio in Settings: the mark goes away when the bio is saved.";
-"lng_oblivion_social_marker_about" = "An earlier version of Oblivion kept the badge as an invisible mark at the end of your bio. It is no longer needed and is still in the bio of this account.";
+"lng_oblivion_social_marker_about" = "An earlier version of Oblivion kept the badge as an invisible mark at the end of your bio. The mark is no longer needed, but it is still in the bio of this account. Remove it?";
 "lng_oblivion_social_chip_hint_nobody" = "Turned on. Right now nobody sees your activity: choose the audience in «Who sees my activity».";
 "lng_oblivion_social_chosen_hint" = "Nobody is in «Chosen people» yet. Add people there.";
 "lng_oblivion_social_chip_text_listening" = "listening to {text}";
@@ -3773,12 +3790,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_social_shared_photo" = "photo";
 "lng_oblivion_social_shared_video" = "video";
 "lng_oblivion_social_editor_preview" = "How other people see it";
+"lng_oblivion_social_editor_preview_empty" = "Add a status, and this block will appear in your profile.";
 "lng_oblivion_social_editor_name" = "Name in Oblivion";
 "lng_oblivion_social_editor_status" = "Status";
 "lng_oblivion_social_editor_emoji" = "Status emoji";
-"lng_oblivion_social_editor_accent" = "Accent colour";
+"lng_oblivion_social_editor_accent" = "Profile colour";
+"lng_oblivion_social_editor_accent_about" = "This colour marks your activity («listening to», «in the room») and the mark of the Oblivion block in your profile.";
 "lng_oblivion_social_editor_shared" = "Shown in the profile";
-"lng_oblivion_social_editor_shared_about" = "Playlists and effect presets you have shared. The ones turned on are listed in your profile for those who see it.";
+"lng_oblivion_social_editor_shared_about" = "What is turned on here is listed in your profile, only for those who see the profile.";
 "lng_oblivion_social_editor_shared_empty" = "You have not shared any playlists or effect presets yet.";
 "lng_oblivion_social_editor_photo" = "Photo in Oblivion";
 "lng_oblivion_social_editor_photo_set" = "Use my Telegram photo";
@@ -3794,7 +3813,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_social_friends_offline_empty" = "The Oblivion server can't be reached right now. Please try again later.";
 "lng_oblivion_social_friends_empty_title" = "Nobody here yet";
 "lng_oblivion_social_friends_empty" = "People from your chats and contacts who use Oblivion and have opened their profile to you will appear here. Your contact list is not sent anywhere: the lists are compared on this device.";
-"lng_oblivion_social_friends_hidden" = "Your own profile is hidden from everyone now. To let friends find you, choose who sees it.";
+"lng_oblivion_social_friends_hidden" = "Your own profile is hidden from everyone now. To let friends find you, choose the audience in Settings > Oblivion > «Who sees my profile».";
 "lng_oblivion_social_friends_plain" = "uses Oblivion";
 "lng_oblivion_social_chosen_about" = "People you pick by hand. With «Chosen people» selected only they see your profile or activity. The list is kept on the Oblivion server for this account. Your contact list is never sent.";
 "lng_oblivion_social_chosen_empty" = "Nobody is chosen yet.";
@@ -3803,6 +3822,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_social_chosen_unknown" = "User {name}";
 "lng_oblivion_social_chosen_full" = "The list of chosen people is full.";
 "lng_oblivion_social_chosen_add_title" = "Add to chosen people";
+"lng_oblivion_social_editor_gallery" = "Show to everyone in «Shared presets»";
+"lng_oblivion_social_editor_gallery_about" = "A preset turned on here is seen in «Shared presets» by everyone who uses Oblivion, together with your name in Oblivion, whoever your profile is open to. It is also listed in your profile. Turn it off to remove the preset from both; its link keeps working.";
+"lng_oblivion_social_editor_gallery_apart" = "A preset turned on here is seen in «Shared presets» by everyone who uses Oblivion, together with your name in Oblivion, whoever your profile is open to. Turn it off to remove the preset from there; its link keeps working.";
+"lng_oblivion_social_gallery_confirm_title" = "Show to everyone?";
+"lng_oblivion_social_gallery_confirm" = "The preset «{title}» will appear in «Shared presets» for everyone who uses Oblivion, with your name in Oblivion next to it. This does not depend on who sees your profile.";
+"lng_oblivion_social_gallery_confirm_yes" = "Show to everyone";
+"lng_oblivion_social_settings_left" = "Oblivion Cloud is turned off for this account, but the server still keeps what is shown above, and other people still see it. To hide or change something, click it: Oblivion will offer to connect again and then change it on the server.";
 // Oblivion round 5: share.
 "lng_oblivion_share_playlist_menu" = "Share…";
 "lng_oblivion_share_library" = "Shared playlists";
@@ -3810,8 +3836,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_share_library_empty" = "Nothing here yet.";
 "lng_oblivion_share_library_loading" = "Loading the list…";
 "lng_oblivion_share_playlist_empty" = "This playlist has no tracks yet.";
-"lng_oblivion_share_playlist_sure" = "Upload the playlist {name} to Oblivion Cloud? Its music ({tracks}) will be sent to the server of the Oblivion developer. Anyone who has the link will be able to listen to it.";
-"lng_oblivion_share_playlist_new_sure" = "The playlist {name} is shared already. Upload what is new in it ({tracks})?";
+"lng_oblivion_share_playlist_sure" = "Upload the playlist «{name}» to Oblivion Cloud? Its music ({tracks}) will be sent to the server of the Oblivion developer. Anyone who has the link will be able to listen to it.";
+"lng_oblivion_share_playlist_new_sure" = "The playlist «{name}» is shared already. Upload what is new in it ({tracks})?";
 "lng_oblivion_share_playlist_upload" = "Upload";
 "lng_oblivion_share_upload_title" = "Uploading the playlist";
 "lng_oblivion_share_upload_track" = "Track {index} of {total}";
@@ -3835,8 +3861,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_share_error_quota" = "Your space for shared playlists on the server ({size}) is full. Delete old shared playlists or tracks and try again.";
 "lng_oblivion_share_error_tracks" = "A shared playlist can't have more than {limit} tracks.";
 "lng_oblivion_share_error_playlists" = "You can't share more than {limit} playlists. Delete the ones you don't need from the server.";
-"lng_oblivion_share_error_daily" = "The daily upload limit ({size}) is reached. Go on tomorrow.";
+"lng_oblivion_share_error_daily" = "The daily upload limit is reached: {size} a day for one account, and there is a common limit for everybody on the same network. Go on tomorrow.";
 "lng_oblivion_share_error_uploads" = "Too many unfinished uploads. Try again a bit later.";
+"lng_oblivion_share_error_user_tracks" = "You have added too many tracks to shared playlists: there is a limit for one account. Remove the tracks you don't need from your shared playlists and try again.";
 "lng_oblivion_share_error_gone" = "This playlist is not on the server any more.";
 "lng_oblivion_share_view_title" = "Shared playlist";
 "lng_oblivion_share_view_by" = "by {name}";
@@ -3848,8 +3875,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_share_view_unkeep" = "Remove from mine";
 "lng_oblivion_share_view_kept" = "The playlist is added to «Shared playlists», its tracks are being saved to this device.";
 "lng_oblivion_share_view_unkept" = "The playlist is removed from yours.";
-"lng_oblivion_share_view_keeping" = "saved {ready} of {total}";
-"lng_oblivion_share_view_kept_all" = "on this device";
+"lng_oblivion_share_view_keeping" = "downloaded {ready} of {total}";
+"lng_oblivion_share_view_kept_all" = "downloaded";
 "lng_oblivion_share_view_collab" = "Others may add tracks";
 "lng_oblivion_share_view_add_files" = "Add tracks from files…";
 "lng_oblivion_share_view_delete" = "Delete from the server";
@@ -3920,7 +3947,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sync_settings" = "Settings sync";
 "lng_oblivion_sync_settings_auto" = "Sync the settings automatically";
 "lng_oblivion_sync_title" = "Settings sync";
-"lng_oblivion_sync_about" = "The settings of Oblivion and your saved presets are encrypted on this device with your sync password and only then sent. The server keeps a file it can't read. A forgotten password can't be restored: send the settings again with a new one.";
+"lng_oblivion_sync_about" = "The settings of Oblivion and your saved presets are encrypted on this device with your sync password and only then sent: the server keeps a file it can't read. A forgotten password can't be restored — send the settings again with a new one.";
 "lng_oblivion_sync_state_loading" = "Checking the server…";
 "lng_oblivion_sync_state_error" = "Could not check the server";
 "lng_oblivion_sync_state_none" = "No copy on the server yet";
@@ -3932,10 +3959,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sync_conflict_about" = "The server has a newer copy from another device, and the settings of this device have changed too. Nothing was replaced. «Send» keeps the settings of this device, «Get» takes the ones from the server.";
 "lng_oblivion_sync_auto_on" = "Automatic sync is on.";
 "lng_oblivion_sync_auto_needs" = "Automatic sync starts after the first «Send» or «Get» with the password.";
+"lng_oblivion_sync_auto_paused" = "There is no copy on the server, so nothing is sent by itself. Automatic sync goes on after you press «Send the settings to the server».";
 "lng_oblivion_sync_password" = "Sync password";
-"lng_oblivion_sync_password_same" = "Password (remembered on this device)";
+"lng_oblivion_sync_password_same" = "Password (already remembered)";
 "lng_oblivion_sync_password_hint" = "Use the same password on all your devices, at least 6 characters. Don't use your Telegram password.";
-"lng_oblivion_sync_password_kept" = "The password is remembered on this device, you can leave the field empty.";
+"lng_oblivion_sync_password_kept" = "You can leave the field empty. Enter a password only to change it, or if the copy on the server was made with another one.";
 "lng_oblivion_sync_password_short" = "The password must have at least 6 characters.";
 "lng_oblivion_sync_password_wrong" = "This password does not open the copy of the server. Check it, or send the settings again with a new password.";
 "lng_oblivion_sync_password_needed" = "Enter the sync password: the copy of the server was made with another one.";
@@ -3948,6 +3976,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sync_sent" = "The settings are sent.";
 "lng_oblivion_sync_receive_sure#one" = "{count} setting of Oblivion on this device will be replaced with the copy of {date} from the device «{device}». The app icon, the volumes and the Oblivion Cloud connection stay as they are.";
 "lng_oblivion_sync_receive_sure#other" = "{count} settings of Oblivion on this device will be replaced with the copy of {date} from the device «{device}». The app icon, the volumes and the Oblivion Cloud connection stay as they are.";
+"lng_oblivion_sync_receive_presets#one" = "{count} saved preset of the editors was deleted on another device and will be deleted from this one too.";
+"lng_oblivion_sync_receive_presets#other" = "{count} saved presets of the editors were deleted on another device and will be deleted from this one too.";
 "lng_oblivion_sync_receive_confirm" = "Replace";
 "lng_oblivion_sync_received" = "The settings are received.";
 "lng_oblivion_sync_received_same" = "The settings are the same already.";
@@ -3959,25 +3989,28 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sync_forget" = "Forget the password on this device";
 "lng_oblivion_sync_forgot" = "The password is forgotten on this device. Automatic sync is paused.";
 "lng_oblivion_sync_erase" = "Delete the copy from the server";
-"lng_oblivion_sync_erase_sure" = "Delete the copy of the settings from the server? The settings on your devices stay as they are.";
+"lng_oblivion_sync_erase_sure" = "Delete the copy of the settings from the server? The settings on your devices stay as they are. Automatic sync will be switched off on this device. A new copy appears on the server only when you press «Send the settings to the server».";
 "lng_oblivion_sync_erased" = "The copy is deleted from the server.";
-"lng_oblivion_sync_not_synced" = "Not synced: the app icon, the volumes, the local transcription, the status polling and everything about the Oblivion Cloud connection. These stay separate on every device.";
+"lng_oblivion_sync_erased_auto" = "The copy is deleted from the server. Automatic sync is switched off.";
+"lng_oblivion_sync_not_synced" = "Not synced: the app icon, the volumes, the local transcription, the status polling and the Oblivion Cloud connection. These stay separate on every device.";
 // Oblivion round 5: update.
 "lng_oblivion_update_settings_check" = "Check for updates";
 "lng_oblivion_update_settings_auto" = "Check for updates once a day";
 "lng_oblivion_update_settings_about" = "The settings are encrypted on this device with your sync password before they are sent, the server can't read them. The automatic check asks the Oblivion Cloud server for the newest version once a day, and only while Oblivion Cloud is connected for some account. Nothing is installed by itself.";
 "lng_oblivion_update_title" = "A new version is available";
+"lng_oblivion_update_title_loading" = "Downloading the update";
+"lng_oblivion_update_title_ready" = "The update is downloaded";
 "lng_oblivion_update_version" = "Oblivion {version}";
 "lng_oblivion_update_current" = "you have {version}";
 "lng_oblivion_update_required" = "This update is needed for Oblivion Cloud: the version you have will soon stop connecting.";
-"lng_oblivion_update_no_notes" = "The developer has not written what is new.";
+"lng_oblivion_update_no_notes" = "There are no release notes for this version.";
 "lng_oblivion_update_file" = "{name}, {size}. The file is saved to the Downloads folder, you install it yourself.";
 "lng_oblivion_update_no_file" = "The build for your system is not published yet. Check again later.";
 "lng_oblivion_update_download" = "Download";
 "lng_oblivion_update_later" = "Later";
 "lng_oblivion_update_retry" = "Try again";
 "lng_oblivion_update_progress" = "Downloaded {ready} of {total}";
-"lng_oblivion_update_saved" = "Saved and checked: {path}";
+"lng_oblivion_update_saved" = "The file is saved and checked:\n{path}";
 "lng_oblivion_update_install_mac" = "Quit Oblivion, unpack the archive and replace the app in «Applications» with the new one.";
 "lng_oblivion_update_install_win" = "Quit Oblivion and run the downloaded file.";
 "lng_oblivion_update_show" = "Show in folder";
@@ -3989,15 +4022,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_dsearch_title" = "Search in saved messages";
 "lng_oblivion_dsearch_placeholder" = "Words, a name or a file";
 "lng_oblivion_dsearch_chat_all" = "All chats";
+"lng_oblivion_dsearch_chat_this" = "This chat";
 "lng_oblivion_dsearch_period_all" = "All time";
 "lng_oblivion_dsearch_period_today" = "Today";
 "lng_oblivion_dsearch_period_week" = "Last 7 days";
 "lng_oblivion_dsearch_period_month" = "Last 30 days";
 "lng_oblivion_dsearch_period_year" = "Last year";
 "lng_oblivion_dsearch_period_day" = "Choose a day…";
-"lng_oblivion_dsearch_kind_all" = "Deleted and edited";
-"lng_oblivion_dsearch_kind_deleted" = "Deleted only";
-"lng_oblivion_dsearch_kind_edited" = "Edited only";
+"lng_oblivion_dsearch_kind_all" = "All records";
+"lng_oblivion_dsearch_kind_deleted" = "Deleted";
+"lng_oblivion_dsearch_kind_edited" = "Edited";
 "lng_oblivion_dsearch_badge_deleted" = "deleted";
 "lng_oblivion_dsearch_badge_edited" = "edited";
 "lng_oblivion_dsearch_empty" = "Nothing found";
@@ -4008,7 +4042,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_dsearch_unknown_chat" = "Unknown chat";
 "lng_oblivion_dsearch_record_title" = "Deleted message";
 "lng_oblivion_dsearch_versions_title" = "Edit history";
-"lng_oblivion_dsearch_version_was" = "Before {date}";
+"lng_oblivion_dsearch_version_was" = "Until {date}";
 "lng_oblivion_dsearch_version_now" = "Now";
 "lng_oblivion_dsearch_jump" = "Go to message";
 "lng_oblivion_dsearch_gone" = "This record is no longer saved.";
@@ -4021,7 +4055,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sendonline_hours#other" = "{count} hours";
 "lng_oblivion_sendonline_days#one" = "{count} day";
 "lng_oblivion_sendonline_days#other" = "{count} days";
-"lng_oblivion_sendonline_settings_about" = "The message waits on this device and is sent when the person comes online (or writes to you, if they hide the last seen time), while Oblivion is running. After the time limit it is not sent: you are asked what to do. The Telegram variant that waits on the server stays in the «Schedule message» window.";
+"lng_oblivion_sendonline_settings_about" = "The message waits on this device and is sent when the person comes online (or writes to you, if they hide the last seen time), while Oblivion is running. After the time limit it is not sent: you are asked what to do. If you delete the chat or block the person, what waits for them is not sent either. The Telegram variant that waits on the server stays in the «Schedule message» window.";
 "lng_oblivion_sendonline_menu" = "Send when online";
 "lng_oblivion_sendonline_queued" = "The message will be sent when {name} comes online.";
 "lng_oblivion_sendonline_queued_hidden" = "{name} hides the last seen time: the message will be sent when they write to you.";
@@ -4039,21 +4073,28 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_sendonline_reason_unavailable" = "This chat is not available any more";
 "lng_oblivion_sendonline_reason_paid" = "Messages to this person are paid now";
 "lng_oblivion_sendonline_reason_server" = "Telegram did not accept the message ({error})";
+"lng_oblivion_sendonline_reason_chat_deleted" = "The chat was deleted";
+"lng_oblivion_sendonline_reason_blocked" = "You blocked this person";
+"lng_oblivion_sendonline_gone" = "This message is not waiting any more: it has been sent or removed.";
+"lng_oblivion_sendonline_busy" = "This message is being sent right now, it is too late to change or remove it.";
+"lng_oblivion_sendonline_not_saved" = "Could not write to the disk of this device, so the message does not wait. Nothing was sent.";
+"lng_oblivion_sendonline_not_loaded" = "This chat is not loaded yet. Open it and try again.";
 "lng_oblivion_sendonline_list_empty" = "No messages are waiting.";
 "lng_oblivion_sendonline_list_empty_about" = "Right-click the send button in a private chat and choose «Send when online».";
-"lng_oblivion_sendonline_status_waiting" = "Waits until {date}";
+"lng_oblivion_sendonline_status_waiting" = "Waits for them to be online · until {date}";
 "lng_oblivion_sendonline_status_retry" = "Will be tried again when they are online";
 "lng_oblivion_sendonline_action_edit" = "Edit";
 "lng_oblivion_sendonline_action_cancel" = "Remove";
 "lng_oblivion_sendonline_action_send" = "Send now";
 "lng_oblivion_sendonline_action_wait" = "Wait more";
 "lng_oblivion_sendonline_edit_title" = "Waiting message";
+"lng_oblivion_sendonline_edit_placeholder" = "Message text";
 "lng_oblivion_sendonline_cancel_sure" = "Remove this message from the waiting ones? It will not be sent.";
 "lng_oblivion_sendonline_send_sure" = "Send this message now, without waiting for {name} to come online?";
 "lng_oblivion_sendonline_unconfirmed_sure" = "This message may have been sent already. Check the chat first and send it again only if it is not there.";
 "lng_oblivion_sendonline_ask_title" = "Messages were not sent";
-"lng_oblivion_sendonline_ask_text#one" = "{count} waiting message was not sent: the waiting time is over or the sending failed.";
-"lng_oblivion_sendonline_ask_text#other" = "{count} waiting messages were not sent: the waiting time is over or the sending failed.";
+"lng_oblivion_sendonline_ask_text#one" = "{count} waiting message was not sent. Open the list to see why and to decide what to do with it.";
+"lng_oblivion_sendonline_ask_text#other" = "{count} waiting messages were not sent. Open the list to see why and to decide what to do with them.";
 "lng_oblivion_sendonline_ask_open" = "Open the list";
 "lng_oblivion_sendonline_ask_later" = "Later";
 // Oblivion round 5: stats export.
@@ -4075,6 +4116,96 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_oblivion_statsexp_page_day" = "Day";
 "lng_oblivion_statsexp_page_calendar_note" = "The last twelve months, one square is one day.";
 // Oblivion round 5 end.
+// Oblivion looks.
+// Oblivion looks: core.
+"lng_oblivion_look_title" = "Oblivion theme";
+"lng_oblivion_look_plain" = "Plain Telegram";
+"lng_oblivion_look_native" = "Native, but better";
+"lng_oblivion_look_night_air" = "Night Air";
+"lng_oblivion_look_silence" = "Silence";
+"lng_oblivion_look_plain_about" = "Everything as in Telegram, with your own theme.";
+"lng_oblivion_look_native_about" = "The same Telegram, only tidier: cards and pills.";
+"lng_oblivion_look_night_air_about" = "A violet night, a glow and one bright gradient.";
+"lng_oblivion_look_silence_about" = "Calm minimalism and one acid accent.";
+"lng_oblivion_look_note" = "An Oblivion theme changes the colors of the whole app and the look of the Oblivion screens: the profile block, rooms, friends and tools. The layout of the usual Telegram screens stays the same.\n\nYour Telegram theme and chat wallpaper are not changed: choose «Plain Telegram» and everything is back. «Night Air» and «Silence» show their own chat background only until you choose a wallpaper yourself.";
+"lng_oblivion_look_paused" = "While you edit a Telegram theme the Oblivion theme is paused, it returns when the editor is closed.";
+// Oblivion looks: own screens.
+"lng_oblivion_look_room_now_playing" = "Now playing";
+// Oblivion looks: upstream.
+// Oblivion looks: hub.
+"lng_oblivion_hub_menu" = "Oblivion tools";
+"lng_oblivion_hub_title" = "Tools";
+"lng_oblivion_hub_about" = "Everything plain Telegram lacks, in one place";
+"lng_oblivion_hub_search" = "Find a tool";
+"lng_oblivion_hub_empty" = "No tool with such a name. Try another word.";
+"lng_oblivion_hub_settings_about" = "Every Oblivion tool on one screen. The same screen opens from the main menu.";
+"lng_oblivion_hub_group_create" = "Create";
+"lng_oblivion_hub_group_together" = "Together";
+"lng_oblivion_hub_group_know" = "Know";
+"lng_oblivion_hub_group_app" = "App";
+"lng_oblivion_hub_new" = "new";
+"lng_oblivion_hub_footer#one" = "{count} tool";
+"lng_oblivion_hub_footer#other" = "{count} tools";
+"lng_oblivion_hub_live" = "Room is live now";
+"lng_oblivion_hub_live_join" = "Join";
+"lng_oblivion_hub_live_untitled" = "Room";
+"lng_oblivion_hub_live_silence" = "Nothing is playing now";
+"lng_oblivion_hub_t_sticker_studio" = "Sticker studio";
+"lng_oblivion_hub_t_sticker_batch" = "Stickers in bulk";
+"lng_oblivion_hub_t_lottie" = "Lottie editor";
+"lng_oblivion_hub_t_voice" = "Voice changer";
+"lng_oblivion_hub_t_round" = "Video to round";
+"lng_oblivion_hub_t_ocr" = "Text from a picture";
+"lng_oblivion_hub_t_cutout" = "Cut out background";
+"lng_oblivion_hub_t_listen" = "Listen together";
+"lng_oblivion_hub_t_send_online" = "When they are online";
+"lng_oblivion_hub_t_chat_stats" = "Chat statistics";
+"lng_oblivion_hub_t_online" = "Online journal";
+"lng_oblivion_hub_t_profile_history" = "Profile history";
+"lng_oblivion_hub_t_ghost" = "Ghost mode";
+"lng_oblivion_hub_t_updates" = "Updates";
+"lng_oblivion_hub_t_settings" = "Oblivion settings";
+"lng_oblivion_hub_s_photo_editor" = "layers, effects, drawing";
+"lng_oblivion_hub_s_collage" = "several photos in one grid";
+"lng_oblivion_hub_s_video_editor" = "trim, effects, tracking";
+"lng_oblivion_hub_s_sticker_studio" = "recolor an animated sticker";
+"lng_oblivion_hub_s_sticker_packs" = "create and fill your packs";
+"lng_oblivion_hub_s_sticker_converter" = "a photo or a video into a sticker";
+"lng_oblivion_hub_s_sticker_batch" = "many stickers or emoji at once";
+"lng_oblivion_hub_s_lottie" = "animation frame by frame";
+"lng_oblivion_hub_s_music_editor" = "trim, tempo, pitch";
+"lng_oblivion_hub_s_voice" = "voice messages with effects";
+"lng_oblivion_hub_s_round" = "any video as a round one";
+"lng_oblivion_hub_s_ocr" = "recognize and copy";
+"lng_oblivion_hub_s_cutout" = "an object without the background";
+"lng_oblivion_hub_s_rooms" = "music, video, canvas";
+"lng_oblivion_hub_s_listen" = "right in a chat";
+"lng_oblivion_hub_s_friends" = "who listens to what";
+"lng_oblivion_hub_s_my_profile" = "status, color, what others see";
+"lng_oblivion_hub_s_playlists" = "your music in lists";
+"lng_oblivion_hub_s_shared_playlists" = "share by a link";
+"lng_oblivion_hub_s_presets" = "effects by a link";
+"lng_oblivion_hub_s_send_online" = "the message will wait";
+"lng_oblivion_hub_s_chat_stats" = "who, when, how much";
+"lng_oblivion_hub_s_deleted" = "search the saved ones";
+"lng_oblivion_hub_s_online" = "who was online and when";
+"lng_oblivion_hub_s_profile_history" = "names, photos, bio";
+"lng_oblivion_hub_s_gift_catalog" = "models and backdrops";
+"lng_oblivion_hub_s_ghost" = "read unnoticed";
+"lng_oblivion_hub_s_look" = "three looks and plain Telegram";
+"lng_oblivion_hub_s_app_icon" = "Oblivion, Telegram, your own";
+"lng_oblivion_hub_s_cloud" = "badge, sync, connection";
+"lng_oblivion_hub_s_updates" = "check for a new version";
+"lng_oblivion_hub_s_settings" = "all the switches";
+"lng_oblivion_hub_h_round" = "Open the chat you want to send a round video to and choose this tool again.";
+"lng_oblivion_hub_h_ocr" = "Copy a picture and choose this tool again. Or right-click a photo in a chat: «Copy text from photo».";
+"lng_oblivion_hub_h_cutout" = "Copy a picture and choose this tool again. Or right-click a photo in a chat: «Cut out object».";
+"lng_oblivion_hub_h_listen" = "Right-click a music file in a chat: «Listen together in this chat».";
+"lng_oblivion_hub_h_chat_stats" = "Open a chat and choose this tool again. It is also in the chat menu: «Chat statistics».";
+"lng_oblivion_hub_h_online" = "Open a chat with a person and choose this tool again. It is also in the chat menu: «Online journal».";
+"lng_oblivion_hub_h_profile_history" = "Open a chat and choose this tool again. It is also in the chat menu: «Profile history».";
+"lng_oblivion_hub_h_rooms_off" = "Rooms are switched off. Turn them on in Settings > Oblivion > Together.";
+// Oblivion looks end.
 
 "lng_settings_stickers_emoji" = "Stickers and emoji";
 "lng_settings_messages" = "Messages";

@@ -916,22 +916,25 @@ struct DoneArgs {
 
 void DoneBox(not_null<Ui::GenericBox*> box, DoneArgs &&args) {
 	box->setTitle(tr::lng_oblivion_statsexp_done_title());
+
+	// Three buttons don't fit in a box of the usual width: the left one
+	// was drawn over the next one.
+	box->setWidth(st::boxWideWidth);
+
+	// The name of the file, under it where the file is and how large.
 	const auto info = QFileInfo(args.path);
-	auto name = tr::bold(info.fileName());
-	if (args.size > 0) {
-		name.append(u" · "_q + Ui::FormatSizeText(args.size));
-	}
 	const auto nameLabel = box->addRow(object_ptr<Ui::FlatLabel>(
 		box,
-		rpl::single(name),
+		rpl::single(tr::bold(info.fileName())),
 		st::boxLabel));
 	nameLabel->setBreakEverywhere(true);
+	auto place = QDir::toNativeSeparators(info.absolutePath());
+	if (args.size > 0) {
+		place = Ui::FormatSizeText(args.size) + u" · "_q + place;
+	}
 	const auto folderLabel = box->addRow(
-		object_ptr<Ui::FlatLabel>(
-			box,
-			QDir::toNativeSeparators(info.absolutePath()),
-			st::boxDividerLabel),
-		st::boxRowPadding + QMargins(0, st::boxLittleSkip, 0, 0));
+		object_ptr<Ui::FlatLabel>(box, place, st::boxDividerLabel),
+		st::boxRowPadding + QMargins(0, st::boxLittleSkip / 2, 0, 0));
 	folderLabel->setBreakEverywhere(true);
 	folderLabel->setSelectable(true);
 	box->addRow(
@@ -941,6 +944,8 @@ void DoneBox(not_null<Ui::GenericBox*> box, DoneArgs &&args) {
 			st::boxLabel),
 		st::boxRowPadding + QMargins(0, st::boxMediumSkip, 0, 0));
 
+	// The main action and the way out are on the right, as in every box,
+	// the additional action is on the left.
 	const auto open = args.open;
 	const auto folder = args.folder;
 	box->addButton(tr::lng_oblivion_statsexp_done_open(), [=] {
@@ -949,12 +954,12 @@ void DoneBox(not_null<Ui::GenericBox*> box, DoneArgs &&args) {
 		}
 		box->closeBox();
 	});
-	box->addButton(tr::lng_oblivion_statsexp_done_folder(), [=] {
+	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+	box->addLeftButton(tr::lng_oblivion_statsexp_done_folder(), [=] {
 		if (folder) {
 			folder();
 		}
 	});
-	box->addLeftButton(tr::lng_close(), [=] { box->closeBox(); });
 }
 
 void SavePage(

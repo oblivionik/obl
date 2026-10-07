@@ -52,7 +52,11 @@ class SessionController;
 //  - media: Room::addMedia() uploads a file through the relay and puts it
 //    into a queue (progress in uploads()), Room::download() brings a file
 //    of a queue item into the temp folder of the room (removed when the
-//    room is left), Room::localFile() tells where it is;
+//    room is left, or half an hour after its window was closed),
+//    Room::localFile() tells where it is. The file of an item is deleted
+//    about half a minute after the item has left both queues: a player
+//    lets a file go as soon as its item is gone (the music engine is
+//    asked, MusicEngine::usesFile()), and cancels its download;
 //  - a module that needs an object living as long as the room is open
 //    keeps it in Room::lifetime().
 //
@@ -235,9 +239,8 @@ struct ChatMessage {
 };
 
 struct Voice {
-	QString link; // Only "https://t.me/..." survives the parsing.
+	QString link; // Only what Rooms::ParseVoiceLink() takes survives.
 	QString title;
-	QString chatId;
 	uint64 setBy = 0;
 	int64 setAt = 0;
 
@@ -392,6 +395,29 @@ using Changes = base::flags<Change>;
 	int from,
 	int to);
 
+// What a row menu of a queue does with an item. The indexes are counted
+// by the queue as it is at the moment of the click, not when the menu was
+// opened: somebody else may have changed the queue meanwhile.
+enum class QueueMove {
+	Up,
+	Down,
+	Next, // Right after the current item.
+};
+// from and to for MoveTarget(), { -1, -1 } if there is nothing to move.
+[[nodiscard]] std::pair<int, int> MoveIndexes(
+	const Player &player,
+	const QString &itemId,
+	QueueMove move);
+
+// The body of a PATCH that changes one right and leaves the others as the
+// server has them: { "<right>": value }.
+[[nodiscard]] QJsonObject SerializeRight(Right right, bool value);
+
+// The pause before the snapshot of a room is asked for once more after
+// a failure (attempt counts from 0), 0: no more attempts till the stream
+// reconnects or sends "resync" again.
+[[nodiscard]] crl::time ReloadRetryDelay(int attempt);
+
 // A room code from what the user has typed or pasted: a code or a link.
 [[nodiscard]] QString ExtractCode(const QString &typed);
 
@@ -511,6 +537,8 @@ public:
 	// The queues.
 	void removeItem(Kind kind, const QString &itemId);
 	void moveItem(Kind kind, int from, int to);
+	// For a row menu: the place is counted when the action is clicked.
+	void moveItem(Kind kind, const QString &itemId, QueueMove move);
 	void clearQueue(Kind kind);
 	// Uploads the file (and its cover) and adds it to the queue. Returns
 	// the id of the row in uploads(), the row goes away when it is done.
@@ -530,7 +558,12 @@ public:
 		bool ready,
 		int buffered);
 
-	// Members (the owner only).
+	// Members (the owner only). setRight() and setDefaultRight() send
+	// only the right that was clicked, so two quick clicks on different
+	// rights never undo each other; setRights() and setDefaults() write
+	// all six at once (the presets).
+	void setRight(uint64 userId, Right right, bool value);
+	void setDefaultRight(Right right, bool value);
 	void setRights(uint64 userId, const Rights &rights);
 	void setDefaults(const Rights &rights, bool applyToAll);
 	void kick(uint64 userId, bool ban);
@@ -538,8 +571,10 @@ public:
 	void transfer(uint64 userId);
 	void rename(const QString &title);
 
-	// The room chat.
-	void sendChat(const QString &text);
+	// The room chat. false: nothing was sent (keep the text). failed is
+	// called if the server did not take the message, the error itself
+	// goes to errors() as usual.
+	bool sendChat(const QString &text, Fn<void()> failed = nullptr);
 	void deleteChat(int64 id);
 	[[nodiscard]] bool chatLoaded() const;
 
@@ -569,10 +604,17 @@ private:
 };
 
 // For the window: the temp folder of a room is removed when the room is
-// left or over, and the leftovers of old rooms at the first launch.
+// left or over, some time after its window was closed, and the leftovers
+// of old rooms at the launch.
 void RemoveRoomFolder(uint64 userId, const QString &code);
-// 0: the folders nobody has touched for half a day; an id: every folder
-// of that user (the logout).
-void CleanupRoomFolders(uint64 forgetUserId = 0);
+// "<userId>_<code>": the name of the temp folder of a room.
+[[nodiscard]] QString RoomFolderName(uint64 userId, const QString &code);
+// 0: the folders nothing was written to for an hour; an id: every folder
+// of that user (the logout). keep: the names of the folders of the rooms
+// that are open now, they are never touched (the age of a folder says
+// nothing while its files are only read).
+void CleanupRoomFolders(
+	uint64 forgetUserId = 0,
+	const QStringList &keep = {});
 
 } // namespace Oblivion::Rooms

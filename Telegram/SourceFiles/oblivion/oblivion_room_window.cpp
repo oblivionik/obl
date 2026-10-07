@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_room_window.h"
 
+#include "base/call_delayed.h"
 #include "base/timer.h"
 #include "base/unique_qptr.h"
 #include "core/application.h"
@@ -15,6 +16,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mainwindow.h"
 #include "oblivion/oblivion_cloud_ui.h"
 #include "oblivion/oblivion_lang.h"
+#include "oblivion/oblivion_look.h"
+#include "oblivion/oblivion_look_ui.h"
 #include "oblivion/oblivion_room_music.h"
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_ui_snapshots.h"
@@ -69,9 +72,30 @@ constexpr auto kStripLimit = 5;
 constexpr auto kBuiltinMusic = 100;
 constexpr auto kBuiltinChat = 400;
 constexpr auto kBuiltinMembers = 500;
+constexpr auto kFolderGrace = 30 * 60 * crl::time(1000);
+constexpr auto kFolderRecheck = 65 * 60 * crl::time(1000);
+
+// The looks («Тема Oblivion»), at the 100% scale. A card stands this far
+// from the edges of a tab and has this much around its content; without
+// cards the content is kPlainPadding from the edges, as it always was.
+constexpr auto kPlainPadding = 20;
+constexpr auto kCardMargin = 10;
+constexpr auto kCardPadding = 16;
+constexpr auto kHoverRadius = 10;
+constexpr auto kFlatCover = 6; // The radius of a cover in «Тишина».
+constexpr auto kCapsSize = 11;
+constexpr auto kCapsSpacing = 1.1;
+constexpr auto kTabPill = 30; // The selected tab of looks 1 and 2.
+constexpr auto kTabPillPadding = 12;
+constexpr auto kTabsBox = 36; // The box around the tabs of «Ночной эфир».
 
 [[nodiscard]] int Scaled(int value) {
 	return style::ConvertScale(value);
+}
+
+// «Тишина» has userpics that are rounded squares.
+[[nodiscard]] bool RoundUserpics() {
+	return Look::AvatarRadius(100) >= 50;
 }
 
 void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
@@ -108,6 +132,9 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 		? tr::lng_oblivion_room_error_queue_full(tr::now)
 		: (error.is("limit_reached") && limit == u"room_quota"_q)
 		? tr::lng_oblivion_room_error_quota(tr::now)
+		: (error.is("limit_reached")
+			&& (limit == u"uploads"_q || limit == u"uploads_address"_q))
+		? tr::lng_oblivion_share_error_uploads(tr::now)
 		: (error.is("forbidden") && !error.detail("right").isEmpty())
 		? tr::lng_oblivion_room_error_right(tr::now)
 		: Cloud::ErrorText(error);
@@ -427,12 +454,173 @@ void PaintUserpic(
 	const auto userpic = Ui::EmptyUserpic(
 		Ui::EmptyUserpic::UserpicColor(Ui::EmptyUserpic::ColorIndex(userId)),
 		name.isEmpty() ? u"?"_q : name);
+	if (!RoundUserpics()) {
+		userpic.paintRounded(
+			p,
+			rect.x(),
+			rect.y(),
+			rect.x() + rect.width(),
+			rect.width(),
+			Look::AvatarRadius(rect.width()));
+		return;
+	}
 	userpic.paintCircle(
 		p,
 		rect.x(),
 		rect.y(),
 		rect.x() + rect.width(),
 		rect.width());
+}
+
+void PaintUserpicShape(QPainter &p, QRectF rect) {
+	if (RoundUserpics()) {
+		p.drawEllipse(rect);
+		return;
+	}
+	const auto radius = rect.width() * Look::AvatarRadius(100) / 100.;
+	p.drawRoundedRect(rect, radius, radius);
+}
+
+int CoverRadius(int radius) {
+	return Look::HasCards() ? radius : std::min(radius, Scaled(kFlatCover));
+}
+
+void PaintRoomGround(
+		QPainter &p,
+		not_null<const QWidget*> widget,
+		QRect clip) {
+	if (Look::Is(Look::kPlain)) {
+		p.fillRect(clip, st::windowBg);
+		return;
+	}
+	// The glow of a look is one picture for the whole window.
+	const auto window = widget->window();
+	const auto offset = widget->mapTo(window, QPoint());
+	const auto rect = clip.translated(offset);
+	p.save();
+	p.translate(-offset);
+	if (!Look::PaintGround(p, rect, window->size())) {
+		p.fillRect(rect, st::windowBg);
+	}
+	p.restore();
+}
+
+bool RoomHasCards() {
+	return !Look::Is(Look::kPlain) && Look::HasCards();
+}
+
+int RoomCardMargin() {
+	return RoomHasCards() ? Scaled(kCardMargin) : 0;
+}
+
+int RoomContentPadding() {
+	return RoomHasCards()
+		? Scaled(kCardMargin + kCardPadding)
+		: Scaled(kPlainPadding);
+}
+
+void PaintRoomCard(QPainter &p, QRect rect) {
+	if (!RoomHasCards() || rect.isEmpty()) {
+		return;
+	}
+	Look::PaintCard(
+		p,
+		QRectF(rect),
+		st::windowBg->c,
+		0,
+		Look::Surface::Ground);
+}
+
+QColor RoomHoverColor(bool down) {
+	if (!Look::Is(Look::kNightAir)) {
+		return (down ? st::windowBgRipple : st::windowBgOver)->c;
+	}
+	// The cards are translucent there, a solid colour would be a patch.
+	auto result = Look::Color(Look::Role::Pill);
+	if (down) {
+		result.setAlphaF(std::min(result.alphaF() * 1.6, 1.));
+	}
+	return result;
+}
+
+void PaintRoomHover(QPainter &p, QRectF rect, bool down) {
+	const auto radius = Look::RowRadius(Scaled(kHoverRadius));
+	p.setPen(Qt::NoPen);
+	p.setBrush(RoomHoverColor(down));
+	p.drawRoundedRect(rect, radius, radius);
+}
+
+int PaintRoomLabel(
+		QPainter &p,
+		int left,
+		int top,
+		const QString &text,
+		int width,
+		const QColor &plain) {
+	const auto &line = st::semiboldFont;
+	if (!Look::CapsLabels()) {
+		const auto elided = line->elided(text, width);
+		p.setFont(line);
+		p.setPen(Look::Is(Look::kPlain)
+			? plain
+			: Look::Color(Look::Role::Text));
+		p.drawText(left, top + line->ascent, elided);
+		return line->width(elided);
+	}
+	auto font = line->f;
+	font.setPixelSize(Scaled(kCapsSize));
+	font.setLetterSpacing(
+		QFont::AbsoluteSpacing,
+		style::ConvertScaleExact(kCapsSpacing));
+	const auto metrics = QFontMetrics(font);
+	const auto elided = metrics.elidedText(
+		text.toUpper(),
+		Qt::ElideRight,
+		width);
+	p.setFont(font);
+	p.setPen(Look::Color(Look::Role::SubText));
+	p.drawText(
+		left,
+		top + (line->height - metrics.height()) / 2 + metrics.ascent(),
+		elided);
+	return metrics.horizontalAdvance(elided);
+}
+
+void PaintRoomPill(QPainter &p, QRectF rect, bool over) {
+	const auto radius = rect.height() / 2.;
+	const auto look = Look::Current();
+	p.setPen(Qt::NoPen);
+	if (look == Look::kPlain || look == Look::kNative) {
+		p.setBrush(over ? st::windowBgRipple : st::windowBgOver);
+		p.drawRoundedRect(rect, radius, radius);
+		return;
+	}
+	// «Ночной эфир»: a translucent pill with a stroke. «Тишина»: only an
+	// outline, filled under the mouse.
+	const auto air = (look == Look::kNightAir);
+	p.setBrush(air
+		? RoomHoverColor(over)
+		: over
+		? st::windowBgOver->c
+		: QColor(0, 0, 0, 0));
+	p.drawRoundedRect(rect, radius, radius);
+	const auto line = style::ConvertScaleExact(1.);
+	const auto half = line / 2.;
+	p.setPen(QPen(
+		Look::Color(air ? Look::Role::CardStroke : Look::Role::Divider),
+		line));
+	p.setBrush(Qt::NoBrush);
+	p.drawRoundedRect(
+		rect.marginsRemoved({ half, half, half, half }),
+		radius - half,
+		radius - half);
+}
+
+QColor RoomPillTextColor() {
+	const auto look = Look::Current();
+	return (look == Look::kPlain || look == Look::kNative)
+		? st::windowActiveTextFg->c
+		: st::windowFg->c;
 }
 
 void PaintCover(
@@ -444,6 +632,7 @@ void PaintCover(
 	if (rect.isEmpty()) {
 		return;
 	}
+	radius = CoverRadius(radius);
 	p.save();
 	p.setRenderHint(QPainter::Antialiasing);
 	p.setRenderHint(QPainter::SmoothPixmapTransform);
@@ -519,6 +708,13 @@ void GlyphButton::setDimmed(bool dimmed) {
 	}
 }
 
+void GlyphButton::setPrimary(bool primary) {
+	if (_primary != primary) {
+		_primary = primary;
+		update();
+	}
+}
+
 void GlyphButton::onStateChanged(State was, StateChangeSource source) {
 	update();
 }
@@ -527,30 +723,72 @@ void GlyphButton::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
 	const auto full = QRectF(rect());
-	p.setOpacity(_dimmed ? 0.45 : 1.);
+	// A dimmed button is painted in colours mixed with the background,
+	// not with an opacity: the strokes of a glyph overlap, and half
+	// transparent they would show every joint.
+	const auto mix = [](const QColor &a, const QColor &b, double ratio) {
+		return QColor(
+			qRound(a.red() + (b.red() - a.red()) * ratio),
+			qRound(a.green() + (b.green() - a.green()) * ratio),
+			qRound(a.blue() + (b.blue() - a.blue()) * ratio));
+	};
+	// The looks: «Тишина» fills an accent button with the colour of the
+	// text, «Ночной эфир» does so with the main one and gives the others
+	// its gradient.
+	const auto look = Look::Current();
+	const auto inverse = _accent
+		&& ((look == Look::kSilence)
+			|| (look == Look::kNightAir && _primary));
+	const auto gradient = _accent
+		&& !inverse
+		&& !_dimmed
+		&& (look == Look::kNightAir);
+	const auto back = st::windowBg->c;
+	auto glyph = inverse
+		? Look::Color(Look::Role::OnInverse)
+		: _accent
+		? st::windowFgActive->c
+		: _highlighted
+		? st::windowActiveTextFg->c
+		: st::windowFg->c;
 	if (_accent) {
-		p.setPen(Qt::NoPen);
-		p.setBrush(st::windowBgActive);
-		p.drawEllipse(full);
-		if (isOver() || isDown()) {
-			p.setBrush(QColor(255, 255, 255, isDown() ? 50 : 28));
+		const auto active = inverse
+			? Look::Color(Look::Role::Inverse)
+			: st::windowBgActive->c;
+		const auto fill = _dimmed ? mix(back, active, 0.45) : active;
+		if (gradient) {
+			Look::PaintAccentGradient(p, full, full.width() / 2., fill);
+		} else {
+			p.setPen(Qt::NoPen);
+			p.setBrush(fill);
 			p.drawEllipse(full);
 		}
-	} else if (isOver() || isDown()) {
-		p.setPen(Qt::NoPen);
-		p.setBrush(isDown() ? st::windowBgRipple : st::windowBgOver);
-		p.drawEllipse(full);
+		if (isOver() || isDown()) {
+			// Lighter under the mouse; a light circle gets darker.
+			auto over = inverse ? glyph : QColor(255, 255, 255);
+			over.setAlpha(isDown() ? 50 : 28);
+			p.setBrush(over);
+			p.drawEllipse(full);
+		}
+		if (_dimmed) {
+			glyph = mix(fill, glyph, 0.75);
+		}
+	} else {
+		if (isOver() || isDown()) {
+			p.setPen(Qt::NoPen);
+			p.setBrush(RoomHoverColor(isDown()));
+			p.drawEllipse(full);
+		}
+		if (_dimmed) {
+			glyph = mix(back, glyph, 0.4);
+		}
 	}
 	const auto skip = full.width() * (_accent ? 0.25 : 0.2);
 	PaintGlyph(
 		p,
 		_glyph,
 		full.marginsRemoved(QMarginsF(skip, skip, skip, skip)),
-		_accent
-			? st::windowFgActive->c
-			: _highlighted
-			? st::windowActiveTextFg->c
-			: st::windowFg->c);
+		glyph);
 }
 
 namespace {
@@ -580,6 +818,9 @@ protected:
 private:
 	void updateLayout();
 	[[nodiscard]] std::vector<const Member*> stripMembers() const;
+	[[nodiscard]] QString titleText() const;
+	[[nodiscard]] QString statusText() const;
+	[[nodiscard]] bool offline() const;
 
 	const not_null<Room*> _room;
 	const std::shared_ptr<Ui::Show> _show;
@@ -588,6 +829,8 @@ private:
 	std::vector<base::unique_qptr<Ui::RpWidget>> _extra;
 	rpl::event_stream<> _membersClicks;
 	QRect _strip;
+	int _stripShown = 0; // The userpics of the strip.
+	int _stripHidden = 0; // The members behind the «+N» circle.
 	int _textRight = 0;
 
 };
@@ -693,18 +936,51 @@ void Header::updateLayout() {
 			right -= widget->width() + Scaled(6);
 		}
 	}
+	// The texts come first: the title gets a fair part of the width and
+	// the line under it is never cut, the strip of the members takes as
+	// many places as there are left (the last one is «+N» then).
 	const auto size = Scaled(28);
-	const auto step = size - Scaled(8);
-	const auto limit = (w < Scaled(430)) ? 3 : kStripLimit;
-	const auto count = std::min(int(_room->state().members.size()), limit);
-	const auto stripWidth = count ? (size + (count - 1) * step) : 0;
+	const auto step = size - Scaled(4);
+	const auto left = Scaled(20);
+	const auto total = int(_room->state().members.size());
+	const auto wanted = std::min(
+		std::max(
+			st::normalFont->width(statusText()),
+			std::min(TitleFont()->width(titleText()), Scaled(150))),
+		w * 11 / 20);
 	right -= Scaled(8);
+	const auto available = right - (left + wanted + Scaled(12));
+	const auto fits = (available >= size) ? ((available - size) / step + 1) : 0;
+	const auto places = std::min({ fits, total, kStripLimit });
+	const auto folded = (places >= 2) && (places < total);
+	_stripShown = folded ? (places - 1) : places;
+	_stripHidden = folded ? (total - _stripShown) : 0;
+	const auto stripWidth = places ? (size + (places - 1) * step) : 0;
 	_strip = QRect(right - stripWidth, middle - size / 2, stripWidth, size);
-	const auto hidden = int(_room->state().members.size()) - count;
-	const auto more = (hidden > 0)
-		? (st::normalFont->width(u"+%1"_q.arg(hidden)) + Scaled(6))
-		: 0;
-	_textRight = _strip.x() - more - Scaled(12);
+	_textRight = places ? (_strip.x() - Scaled(12)) : right;
+}
+
+QString Header::titleText() const {
+	const auto &title = _room->state().title;
+	return title.isEmpty()
+		? tr::lng_oblivion_room_title_default(tr::now)
+		: title;
+}
+
+bool Header::offline() const {
+	return !_room->connected() && (_room->state().gone == Gone::No);
+}
+
+QString Header::statusText() const {
+	const auto &state = _room->state();
+	return offline()
+		? tr::lng_oblivion_room_connecting(tr::now)
+		: tr::lng_oblivion_room_header_status(
+			tr::now,
+			lt_members,
+			MembersText(int(state.members.size())),
+			lt_online,
+			QString::number(state.onlineCount()));
 }
 
 void Header::resizeEvent(QResizeEvent *e) {
@@ -726,9 +1002,14 @@ void Header::mouseReleaseEvent(QMouseEvent *e) {
 void Header::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
-	p.fillRect(e->rect(), st::windowBg);
+	// «Ночной эфир» has no bar: the header lies on the page with its glow.
+	const auto look = Look::Current();
+	if (look == Look::kNightAir) {
+		PaintRoomGround(p, this, e->rect());
+	} else {
+		p.fillRect(e->rect(), st::windowBg);
+	}
 
-	const auto &state = _room->state();
 	const auto left = Scaled(20);
 	const auto textWidth = std::max(_textRight - left, Scaled(40));
 	const auto &titleFont = TitleFont();
@@ -739,58 +1020,63 @@ void Header::paintEvent(QPaintEvent *e) {
 	p.drawText(
 		left,
 		top + titleFont->ascent,
-		titleFont->elided(
-			state.title.isEmpty()
-				? tr::lng_oblivion_room_title_default(tr::now)
-				: state.title,
-			textWidth));
+		titleFont->elided(titleText(), textWidth));
 	top += titleFont->height + Scaled(3);
-	const auto offline = !_room->connected() && (state.gone == Gone::No);
 	p.setFont(st::normalFont);
-	p.setPen(offline ? st::boxTextFgError : st::windowSubTextFg);
+	p.setPen(offline() ? st::boxTextFgError : st::windowSubTextFg);
 	p.drawText(
 		left,
 		top + st::normalFont->ascent,
-		st::normalFont->elided(
-			offline
-				? tr::lng_oblivion_room_connecting(tr::now)
-				: tr::lng_oblivion_room_header_status(
-					tr::now,
-					lt_members,
-					MembersText(int(state.members.size())),
-					lt_online,
-					QString::number(state.onlineCount())),
-			textWidth));
+		st::normalFont->elided(statusText(), textWidth));
 
-	// The members strip, the first one on top.
+	// The members strip: the first one on top, every circle in a thin
+	// ring of the background, «+N» for the rest closes the row.
 	const auto members = stripMembers();
 	const auto size = _strip.height();
-	const auto step = size - Scaled(8);
-	const auto count = (size > 0 && _strip.width() > 0)
-		? ((_strip.width() - size) / step + 1)
-		: 0;
-	for (auto i = std::min(count, int(members.size())) - 1; i >= 0; --i) {
-		const auto member = members[i];
-		const auto rect = QRect(_strip.x() + i * step, _strip.y(), size, size);
+	const auto step = size - Scaled(4);
+	const auto ring = Scaled(3) / 2.;
+	const auto shown = std::min(_stripShown, int(members.size()));
+	const auto circle = [&](int index) {
+		const auto rect = QRect(
+			_strip.x() + index * step,
+			_strip.y(),
+			size,
+			size);
 		p.setPen(Qt::NoPen);
 		p.setBrush(st::windowBg);
-		p.drawEllipse(QRectF(rect).marginsAdded(QMarginsF(2, 2, 2, 2)));
-		p.setOpacity(member->online ? 1. : 0.4);
+		PaintUserpicShape(
+			p,
+			QRectF(rect).marginsAdded(QMarginsF(ring, ring, ring, ring)));
+		return rect;
+	};
+	if (_stripHidden > 0 && size > 0) {
+		static const auto font = style::font(
+			Scaled(11),
+			st::semiboldFont->flags(),
+			st::semiboldFont->family());
+		const auto rect = circle(shown);
+		p.setBrush(st::windowBgOver);
+		PaintUserpicShape(p, QRectF(rect));
+		p.setFont(font);
+		p.setPen(st::windowSubTextFg);
+		p.drawText(rect, Qt::AlignCenter, u"+%1"_q.arg(_stripHidden));
+	}
+	for (auto i = shown - 1; i >= 0; --i) {
+		const auto member = members[i];
+		const auto rect = circle(i);
+		p.setOpacity(member->online ? 1. : 0.5);
 		PaintUserpic(p, rect, member->id, member->name);
 		p.setOpacity(1.);
 	}
-	const auto hidden = int(members.size()) - count;
-	if (hidden > 0 && count > 0) {
-		const auto text = u"+%1"_q.arg(hidden);
-		p.setFont(st::normalFont);
-		p.setPen(st::windowSubTextFg);
-		p.drawText(
-			_strip.x() - st::normalFont->width(text) - Scaled(6),
-			_strip.y() + (size - st::normalFont->height) / 2
-				+ st::normalFont->ascent,
-			text);
+	// With a look the header and the tabs under it are one bar.
+	if (look == Look::kPlain) {
+		p.fillRect(
+			0,
+			height() - st::lineWidth,
+			width(),
+			st::lineWidth,
+			st::shadowFg);
 	}
-	p.fillRect(0, height() - st::lineWidth, width(), st::lineWidth, st::shadowFg);
 }
 
 // ---- The tabs strip.
@@ -868,16 +1154,21 @@ QRect TabsStrip::tabRect(int index) const {
 	}
 	const auto pad = Scaled(12);
 	const auto available = width() - 2 * pad;
-	auto natural = 0;
+	auto texts = 0;
 	for (const auto &tab : _tabs) {
-		natural += tab.width + Scaled(28);
+		texts += tab.width;
 	}
-	if (natural <= available) {
+	// Every tab has the same space around its title: in a narrow window
+	// the space shrinks, a long title is not cut while the short ones
+	// have room to spare.
+	const auto least = Scaled(10);
+	if (texts + count * least <= available) {
+		const auto skip = std::min((available - texts) / count, Scaled(28));
 		auto left = pad;
 		for (auto i = 0; i != index; ++i) {
-			left += _tabs[i].width + Scaled(28);
+			left += _tabs[i].width + skip;
 		}
-		return QRect(left, 0, _tabs[index].width + Scaled(28), height());
+		return QRect(left, 0, _tabs[index].width + skip, height());
 	}
 	const auto each = available / count;
 	return QRect(pad + index * each, 0, each, height());
@@ -918,23 +1209,77 @@ void TabsStrip::mouseReleaseEvent(QMouseEvent *e) {
 void TabsStrip::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
-	p.fillRect(e->rect(), st::windowBg);
-	p.fillRect(0, height() - st::lineWidth, width(), st::lineWidth, st::shadowFg);
-	for (auto i = 0, count = int(_tabs.size()); i != count; ++i) {
+	// The looks. «Родной, но лучше»: the selected tab is a tinted pill.
+	// «Ночной эфир»: the tabs stand in a box on the page, the selected one
+	// is a pill of the inverse colour. «Тишина»: a thin line under it.
+	const auto look = Look::Current();
+	const auto air = (look == Look::kNightAir);
+	const auto pills = (look == Look::kNative) || air;
+	const auto count = int(_tabs.size());
+	if (air) {
+		PaintRoomGround(p, this, e->rect());
+		if (count > 0) {
+			const auto first = tabRect(0);
+			const auto last = tabRect(count - 1);
+			const auto box = Scaled(kTabsBox);
+			Look::PaintChip(
+				p,
+				QRectF(
+					first.x(),
+					(height() - box) / 2.,
+					last.x() + last.width() - first.x(),
+					box),
+				st::windowBgOver->c,
+				box / 2,
+				Look::Chip::Neutral);
+		}
+	} else {
+		p.fillRect(e->rect(), st::windowBg);
+		p.fillRect(
+			0,
+			height() - st::lineWidth,
+			width(),
+			st::lineWidth,
+			st::shadowFg);
+	}
+	for (auto i = 0; i != count; ++i) {
 		const auto &tab = _tabs[i];
 		const auto rect = tabRect(i);
 		const auto active = (tab.id == _active);
-		p.setFont(st::semiboldFont);
-		p.setPen(active
-			? st::windowActiveTextFg
-			: (i == _over)
-			? st::windowFg
-			: st::windowSubTextFg);
 		const auto text = st::semiboldFont->elided(
 			tab.title,
 			rect.width() - Scaled(8));
 		const auto textWidth = st::semiboldFont->width(text);
 		const auto left = rect.x() + (rect.width() - textWidth) / 2;
+		if (active && pills) {
+			// The pill never reaches the title of the next tab.
+			const auto pill = Scaled(kTabPill);
+			const auto padding = std::min(
+				Scaled(kTabPillPadding),
+				(rect.width() - textWidth) / 2 + Scaled(2));
+			p.setPen(Qt::NoPen);
+			p.setBrush(Look::Color(Look::Role::Inverse));
+			p.drawRoundedRect(
+				QRectF(
+					left - padding,
+					(height() - pill) / 2.,
+					textWidth + 2 * padding,
+					pill),
+				pill / 2.,
+				pill / 2.);
+		}
+		p.setFont(st::semiboldFont);
+		if (active && look != Look::kPlain) {
+			p.setPen(pills
+				? Look::Color(Look::Role::OnInverse)
+				: st::windowFg->c);
+		} else {
+			p.setPen(active
+				? st::windowActiveTextFg
+				: (i == _over)
+				? st::windowFg
+				: st::windowSubTextFg);
+		}
 		p.drawText(
 			left,
 			(height() - st::semiboldFont->height) / 2
@@ -943,14 +1288,16 @@ void TabsStrip::paintEvent(QPaintEvent *e) {
 		if (tab.dot && !active) {
 			const auto dot = Scaled(6);
 			p.setPen(Qt::NoPen);
-			p.setBrush(st::windowBgActive);
+			p.setBrush(Look::Color(
+				Look::Role::Highlight,
+				st::windowBgActive->c));
 			p.drawEllipse(QRectF(
 				left + textWidth + Scaled(3),
 				(height() - st::semiboldFont->height) / 2,
 				dot,
 				dot));
 		}
-		if (active) {
+		if (active && look == Look::kPlain) {
 			const auto line = Scaled(3);
 			p.setPen(Qt::NoPen);
 			p.setBrush(st::windowBgActive);
@@ -962,6 +1309,14 @@ void TabsStrip::paintEvent(QPaintEvent *e) {
 					line + line),
 				line,
 				line);
+		} else if (active && look == Look::kSilence) {
+			const auto line = Scaled(2);
+			p.fillRect(
+				left,
+				height() - line,
+				textWidth,
+				line,
+				st::windowFg);
 		}
 	}
 }
@@ -974,6 +1329,9 @@ public:
 
 	// True if only new messages were added at the end.
 	bool refresh();
+	// The height of the scroll area: a few messages stay at its bottom,
+	// next to the field, as in any chat. Applied by the next resize.
+	void setMinHeight(int height);
 	[[nodiscard]] rpl::producer<int64> menuRequests() const {
 		return _menuRequests.events();
 	}
@@ -989,7 +1347,9 @@ private:
 		uint64 userId = 0;
 		QString name;
 		QString time;
-		Ui::Text::String text;
+		// The default minimal resize width is «never wrap»: with it the
+		// height of a long message is counted as that of a single line.
+		Ui::Text::String text = Ui::Text::String(1);
 		bool head = false;
 		int top = 0;
 		int height = 0;
@@ -999,6 +1359,7 @@ private:
 	const not_null<Room*> _room;
 	std::vector<Entry> _entries;
 	rpl::event_stream<int64> _menuRequests;
+	int _minHeight = 0;
 
 };
 
@@ -1044,9 +1405,16 @@ bool ChatList::refresh() {
 	return append;
 }
 
+// The list may lie in a card (see RoomHasCards()): then it is narrower
+// than the tab by the margins of the card.
+[[nodiscard]] int ListPadding() {
+	return RoomContentPadding() - RoomCardMargin();
+}
+
 void ChatList::layout(int width) {
-	const auto left = Scaled(20) + Scaled(34) + Scaled(10);
-	const auto textWidth = std::max(width - left - Scaled(20), Scaled(80));
+	const auto side = ListPadding();
+	const auto left = side + Scaled(34) + Scaled(10);
+	const auto textWidth = std::max(width - left - side, Scaled(80));
 	auto top = Scaled(8);
 	for (auto &entry : _entries) {
 		entry.top = top;
@@ -1058,11 +1426,22 @@ void ChatList::layout(int width) {
 	}
 }
 
+void ChatList::setMinHeight(int height) {
+	_minHeight = height;
+}
+
 int ChatList::resizeGetHeight(int newWidth) {
 	layout(newWidth);
-	return _entries.empty()
+	const auto content = _entries.empty()
 		? Scaled(8)
 		: (_entries.back().top + _entries.back().height + Scaled(12));
+	const auto shift = std::max(_minHeight - content, 0);
+	if (shift > 0) {
+		for (auto &entry : _entries) {
+			entry.top += shift;
+		}
+	}
+	return content + shift;
 }
 
 void ChatList::contextMenuEvent(QContextMenuEvent *e) {
@@ -1080,9 +1459,9 @@ void ChatList::paintEvent(QPaintEvent *e) {
 	auto hq = PainterHighQualityEnabler(p);
 	const auto clip = e->rect();
 	const auto userpic = Scaled(34);
-	const auto userpicLeft = Scaled(20);
+	const auto userpicLeft = ListPadding();
 	const auto left = userpicLeft + userpic + Scaled(10);
-	const auto textWidth = std::max(width() - left - Scaled(20), Scaled(80));
+	const auto textWidth = std::max(width() - left - userpicLeft, Scaled(80));
 	for (const auto &entry : _entries) {
 		if (entry.top + entry.height < clip.y()) {
 			continue;
@@ -1145,6 +1524,7 @@ private:
 	const not_null<GlyphButton*> _send;
 	QPointer<ChatList> _list;
 	base::unique_qptr<Ui::PopupMenu> _menu;
+	QRect _pill; // Around the field when the tab is a card, see the looks.
 	int _composeTop = 0;
 
 };
@@ -1162,6 +1542,15 @@ ChatTab::ChatTab(QWidget *parent, TabContext context)
 	_list = _scroll->setOwnedWidget(object_ptr<ChatList>(this, _room));
 	_field->setMaxLength(kChatLimit);
 	_field->setMaxHeight(Scaled(120));
+	// The text of this style lies at the very top of the field, and one
+	// line takes a half of its minimal height: the same space above and
+	// under the text puts the line in the middle, on a level with the
+	// button of sending.
+	const auto &fieldSt = st::historyComposeField;
+	const auto textSkip = std::max(
+		(fieldSt.heightMin - fieldSt.style.font->height) / 2 - Scaled(1),
+		0);
+	_field->setAdditionalMargins(QMargins(0, textSkip, 0, textSkip));
 	_field->setSubmitSettings(Ui::InputField::SubmitSettings::Enter);
 	_field->submits(
 	) | rpl::on_next([=](Qt::KeyboardModifiers) {
@@ -1198,6 +1587,13 @@ ChatTab::ChatTab(QWidget *parent, TabContext context)
 		}
 	}, lifetime());
 
+	// A look puts the tab into a card or takes it out.
+	Look::Updates(
+	) | rpl::on_next([=] {
+		updateLayout();
+		update();
+	}, lifetime());
+
 	refresh();
 }
 
@@ -1223,7 +1619,17 @@ void ChatTab::send() {
 	if (text.isEmpty() || !_room->can(Right::Chat)) {
 		return;
 	}
-	_room->sendChat(text);
+	// The text is not lost if the message did not go: it comes back into
+	// the field (unless something new was typed there meanwhile).
+	const auto sent = _room->sendChat(text, crl::guard(this, [=] {
+		if (_field->getLastText().trimmed().isEmpty()) {
+			_field->setText(text);
+			_field->setCursorPosition(int(text.size()));
+		}
+	}));
+	if (!sent) {
+		return;
+	}
 	_field->clear();
 	_scroll->scrollToY(_scroll->scrollTopMax());
 }
@@ -1255,17 +1661,58 @@ void ChatTab::updateLayout() {
 		return;
 	}
 	const auto pad = Scaled(12);
+	// With cards (see the looks) the whole tab is one card: the messages
+	// and, at its bottom, the field in a pill with the button inside.
+	const auto cards = RoomHasCards();
+	const auto margin = RoomCardMargin();
+	const auto area = rect().marginsRemoved(
+		{ margin, margin, margin, margin });
+	_pill = QRect();
 	if (_field->isHidden()) {
 		const auto note = Scaled(44);
-		_composeTop = height() - note;
+		_composeTop = area.y() + area.height() - note;
+	} else if (cards) {
+		const auto skip = Scaled(8);
+		const auto inset = Scaled(3);
+		const auto fieldLeft = area.x() + skip + Scaled(14);
+		const auto fieldWidth = area.x()
+			+ area.width()
+			- skip
+			- inset
+			- _send->width()
+			- Scaled(6)
+			- fieldLeft;
+		_field->resizeToWidth(std::max(fieldWidth, Scaled(80)));
+		const auto pill = std::max(_field->height(), _send->height())
+			+ 2 * inset;
+		_pill = QRect(
+			area.x() + skip,
+			area.y() + area.height() - skip - pill,
+			area.width() - 2 * skip,
+			pill);
+		_composeTop = _pill.y() - skip;
+		_field->moveToLeft(
+			fieldLeft,
+			_pill.y() + (pill - _field->height()) / 2,
+			w);
+		_send->moveToRight(
+			w - _pill.x() - _pill.width() + inset,
+			_pill.y() + pill - inset - _send->height(),
+			w);
 	} else {
-		const auto fieldWidth = w - 2 * pad - _send->width() - Scaled(8);
+		// The text of the field starts where the userpics of the chat do.
+		const auto fieldLeft = Scaled(18);
+		const auto fieldWidth = w
+			- fieldLeft
+			- pad
+			- _send->width()
+			- Scaled(8);
 		_field->resizeToWidth(std::max(fieldWidth, Scaled(80)));
 		const auto block = std::max(_field->height(), _send->height())
 			+ 2 * Scaled(8);
 		_composeTop = height() - block;
 		_field->moveToLeft(
-			pad,
+			fieldLeft,
 			_composeTop + (block - _field->height()) / 2,
 			w);
 		_send->moveToRight(
@@ -1276,9 +1723,19 @@ void ChatTab::updateLayout() {
 					: 0),
 			w);
 	}
-	_scroll->setGeometry(0, 0, w, std::max(_composeTop, 0));
+	const auto scrollTop = area.y() + (cards ? Scaled(4) : 0);
+	const auto scrollHeight = std::max(_composeTop - scrollTop, 0);
+	const auto bottom = (_scroll->scrollTop() + Scaled(40)
+		>= _scroll->scrollTopMax());
+	_scroll->setGeometry(area.x(), scrollTop, area.width(), scrollHeight);
 	if (_list) {
-		_list->resizeToWidth(w);
+		_list->setMinHeight(scrollHeight);
+		_list->resizeToWidth(area.width());
+	}
+	if (bottom) {
+		// The last message stays in view when the window or the field
+		// changes its height.
+		_scroll->scrollToY(_scroll->scrollTopMax());
 	}
 }
 
@@ -1288,30 +1745,69 @@ void ChatTab::resizeEvent(QResizeEvent *e) {
 
 void ChatTab::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
-	p.fillRect(e->rect(), st::windowBg);
-	p.fillRect(0, _composeTop, width(), st::lineWidth, st::shadowFg);
+	PaintRoomGround(p, this, e->rect());
+	const auto margin = RoomCardMargin();
+	const auto card = rect().marginsRemoved(
+		{ margin, margin, margin, margin });
+	if (RoomHasCards()) {
+		PaintRoomCard(p, card);
+		if (!_pill.isEmpty()) {
+			// The field paints itself in this colour, whatever the theme
+			// is: the pill around it has the same one and an outline.
+			auto hq = PainterHighQualityEnabler(p);
+			const auto radius = _send->height() / 2. + Scaled(3);
+			const auto line = style::ConvertScaleExact(1.);
+			const auto half = line / 2.;
+			const auto stroke = Look::Color(Look::Role::CardStroke);
+			p.setPen(Qt::NoPen);
+			p.setBrush(st::historyComposeAreaBg);
+			p.drawRoundedRect(QRectF(_pill), radius, radius);
+			p.setPen(QPen(
+				(stroke.alpha() > 0
+					? stroke
+					: Look::Color(Look::Role::Divider)),
+				line));
+			p.setBrush(Qt::NoBrush);
+			p.drawRoundedRect(
+				QRectF(_pill).marginsRemoved({ half, half, half, half }),
+				radius - half,
+				radius - half);
+		}
+	} else {
+		if (!_field->isHidden()) {
+			// The field paints itself in this colour, whatever the theme
+			// is.
+			p.fillRect(
+				0,
+				_composeTop,
+				width(),
+				height() - _composeTop,
+				st::historyComposeAreaBg);
+		}
+		p.fillRect(0, _composeTop, width(), st::lineWidth, st::shadowFg);
+	}
 	if (_field->isHidden()) {
 		p.setFont(st::normalFont);
 		p.setPen(st::windowSubTextFg);
 		p.drawText(
 			QRect(
-				Scaled(16),
+				card.x() + Scaled(16),
 				_composeTop,
-				width() - Scaled(32),
-				height() - _composeTop),
+				card.width() - Scaled(32),
+				card.y() + card.height() - _composeTop),
 			Qt::AlignCenter | Qt::TextWordWrap,
 			tr::lng_oblivion_room_chat_no_right(tr::now));
 	}
 	if (_room->state().chat.empty()) {
 		const auto area = QRect(
-			Scaled(32),
-			0,
-			width() - Scaled(64),
-			std::max(_composeTop, 0));
+			card.x() + Scaled(32),
+			card.y(),
+			card.width() - Scaled(64),
+			std::max(_composeTop - card.y(), 0));
 		const auto loading = !_room->chatLoaded();
 		p.setFont(st::semiboldFont);
 		p.setPen(st::windowFg);
-		const auto middle = area.height() / 2 - Scaled(24);
+		const auto middle = area.y() + area.height() / 2 - Scaled(24);
 		p.drawText(
 			QRect(area.x(), middle, area.width(), st::semiboldFont->height),
 			Qt::AlignHCenter | Qt::AlignTop,
@@ -1372,7 +1868,12 @@ private:
 		int width,
 		const Rights &rights,
 		Fn<void(Right, bool)> toggle);
-	int sectionTitle(QPainter *p, int top, int width, const QString &text);
+	int sectionTitle(
+		QPainter *p,
+		int left,
+		int top,
+		int width,
+		const QString &text);
 	void addTarget(QRect rect, Fn<void()> action);
 	[[nodiscard]] bool overNext() const;
 	[[nodiscard]] int targetAt(QPoint point) const;
@@ -1388,6 +1889,7 @@ private:
 	const not_null<Room*> _room;
 	const std::shared_ptr<Ui::Show> _show;
 	std::vector<Target> _targets;
+	std::vector<QRect> _cards; // The sections, when a look has cards.
 	base::unique_qptr<Ui::PopupMenu> _menu;
 	int _over = -1;
 	int _pressed = -1;
@@ -1474,18 +1976,112 @@ int MembersList::targetAt(QPoint point) const {
 
 int MembersList::sectionTitle(
 		QPainter *p,
+		int left,
 		int top,
 		int width,
 		const QString &text) {
 	if (p) {
-		p->setFont(st::semiboldFont);
-		p->setPen(st::windowActiveTextFg);
-		p->drawText(
-			Scaled(20),
-			top + st::semiboldFont->ascent,
-			st::semiboldFont->elided(text, width - Scaled(40)));
+		PaintRoomLabel(
+			*p,
+			left,
+			top,
+			text,
+			width - 2 * left,
+			st::windowActiveTextFg->c);
 	}
 	return top + st::semiboldFont->height + Scaled(8);
+}
+
+// A chip of a right. Not only the colour tells a given right from one
+// that is not: there is a check mark or a small cross before the name,
+// and the chip keeps its width when it is switched.
+constexpr auto kChipHeight = 24;
+constexpr auto kChipPadding = 8;
+constexpr auto kChipMark = 9;
+constexpr auto kChipMarkSkip = 4;
+
+// The crown of the owner: the accent colour, golden in «Родной, но
+// лучше» and «Ночной эфир», the colour of the text in «Тишина».
+[[nodiscard]] QColor CrownColor() {
+	switch (Look::Current()) {
+	case Look::kNative: return QColor(0xf2, 0xb8, 0x4b);
+	case Look::kNightAir: return QColor(0xff, 0xc8, 0x57);
+	case Look::kSilence: return st::windowFg->c;
+	}
+	return st::windowActiveTextFg->c;
+}
+
+[[nodiscard]] int RightChipWidth(const QString &text) {
+	return Scaled(kChipPadding)
+		+ Scaled(kChipMark)
+		+ Scaled(kChipMarkSkip)
+		+ st::normalFont->width(text)
+		+ Scaled(kChipPadding + 1);
+}
+
+void PaintRightChip(
+		QPainter &p,
+		QRect rect,
+		const QString &text,
+		bool on,
+		bool over) {
+	const auto height = rect.height();
+	const auto look = Look::Current();
+	if (look == Look::kPlain) {
+		auto bg = on ? st::windowBgActive->c : st::windowBgOver->c;
+		if (on) {
+			bg.setAlphaF(over ? 0.28 : 0.16);
+		}
+		p.setPen(Qt::NoPen);
+		p.setBrush((over && !on) ? st::windowBgRipple->c : bg);
+		p.drawRoundedRect(QRectF(rect), height / 2., height / 2.);
+	} else if (on) {
+		// The tint of the look, stronger under the mouse.
+		auto bg = Look::Color(Look::Role::Tint);
+		if (over) {
+			bg.setAlphaF(std::min(bg.alphaF() * 1.7, 1.));
+		}
+		p.setPen(Qt::NoPen);
+		p.setBrush(bg);
+		p.drawRoundedRect(QRectF(rect), height / 2., height / 2.);
+	} else {
+		PaintRoomPill(p, QRectF(rect), over);
+	}
+
+	const auto mark = double(Scaled(kChipMark));
+	const auto markLeft = double(rect.x() + Scaled(kChipPadding));
+	const auto markTop = rect.y() + (height - mark) / 2.;
+	const auto at = [&](double fx, double fy) {
+		return QPointF(markLeft + mark * fx, markTop + mark * fy);
+	};
+	auto pen = QPen(
+		on ? st::windowActiveTextFg->c : st::windowSubTextFg->c,
+		Scaled(3) / 2.);
+	pen.setCapStyle(Qt::RoundCap);
+	pen.setJoinStyle(Qt::RoundJoin);
+	p.setPen(pen);
+	p.setBrush(Qt::NoBrush);
+	if (on) {
+		auto path = QPainterPath();
+		path.moveTo(at(0.06, 0.56));
+		path.lineTo(at(0.38, 0.86));
+		path.lineTo(at(0.96, 0.2));
+		p.drawPath(path);
+	} else {
+		p.drawLine(at(0.2, 0.2), at(0.8, 0.8));
+		p.drawLine(at(0.8, 0.2), at(0.2, 0.8));
+	}
+
+	p.setFont(st::normalFont);
+	p.setPen(on ? st::windowActiveTextFg : st::windowSubTextFg);
+	p.drawText(
+		rect.x()
+			+ Scaled(kChipPadding)
+			+ Scaled(kChipMark)
+			+ Scaled(kChipMarkSkip),
+		rect.y() + (height - st::normalFont->height) / 2
+			+ st::normalFont->ascent,
+		text);
 }
 
 // A row (or several) of chips, one for a right. toggle == nullptr: only
@@ -1497,7 +2093,7 @@ int MembersList::chips(
 		int width,
 		const Rights &rights,
 		Fn<void(Right, bool)> toggle) {
-	const auto height = Scaled(24);
+	const auto height = Scaled(kChipHeight);
 	const auto gap = Scaled(6);
 	auto x = left;
 	auto y = top;
@@ -1505,7 +2101,7 @@ int MembersList::chips(
 		const auto right = Right(i);
 		const auto on = rights.has(right);
 		const auto text = RightLabel(right);
-		const auto w = st::normalFont->width(text) + 2 * Scaled(10);
+		const auto w = RightChipWidth(text);
 		if (x > left && x + w > left + width) {
 			x = left;
 			y += height + gap;
@@ -1513,20 +2109,7 @@ int MembersList::chips(
 		const auto rect = QRect(x, y, w, height);
 		const auto over = toggle && overNext();
 		if (p) {
-			auto bg = on ? st::windowBgActive->c : st::windowBgOver->c;
-			if (on) {
-				bg.setAlphaF(over ? 0.28 : 0.16);
-			}
-			p->setPen(Qt::NoPen);
-			p->setBrush((over && !on) ? st::windowBgRipple->c : bg);
-			p->drawRoundedRect(QRectF(rect), height / 2., height / 2.);
-			p->setFont(st::normalFont);
-			p->setPen(on ? st::windowActiveTextFg : st::windowSubTextFg);
-			p->drawText(
-				rect.x() + Scaled(10),
-				rect.y() + (height - st::normalFont->height) / 2
-					+ st::normalFont->ascent,
-				text);
+			PaintRightChip(*p, rect, text, on, over);
 		}
 		if (toggle) {
 			addTarget(rect, [=] { toggle(right, !on); });
@@ -1538,24 +2121,58 @@ int MembersList::chips(
 
 int MembersList::pass(QPainter *p, int width) {
 	_targets.clear();
+	_cards.clear();
 	const auto &state = _room->state();
 	const auto owner = state.owner && (state.gone == Gone::No);
-	const auto pad = Scaled(20);
+	const auto pad = RoomContentPadding();
 	const auto inner = std::max(width - 2 * pad, Scaled(120));
 	const auto room = _room;
-	auto top = Scaled(16);
+
+	// The looks: every section is a card («Родной, но лучше», «Ночной
+	// эфир») or is followed by a hairline («Тишина»). The cards are only
+	// remembered here, paintEvent() paints them under the content.
+	const auto cards = RoomHasCards();
+	const auto margin = RoomCardMargin();
+	const auto lined = !cards && !Look::HasCards();
+	auto top = cards ? margin : Scaled(16);
+	auto cardTop = 0;
+	const auto sectionBegin = [&] {
+		cardTop = top;
+		if (cards) {
+			top += Scaled(14);
+		}
+	};
+	// plainSkip: the space under the section without cards. cardSkip:
+	// what the content of a card still needs at its bottom.
+	const auto sectionEnd = [&](int plainSkip, int cardSkip) {
+		if (cards) {
+			top += cardSkip;
+			_cards.push_back(
+				QRect(margin, cardTop, width - 2 * margin, top - cardTop));
+			top += margin;
+			return;
+		} else if (p && lined && plainSkip > 0) {
+			Look::PaintDivider(
+				*p,
+				QRectF(pad, top + plainSkip / 2, inner, st::lineWidth),
+				st::shadowFg->c);
+		}
+		top += plainSkip;
+	};
 
 	if (owner) {
+		sectionBegin();
 		top = sectionTitle(
 			p,
+			pad,
 			top,
 			width,
 			tr::lng_oblivion_room_members_defaults(tr::now));
+		// Only the right that was clicked is sent: a click made before
+		// the answer to the previous one does not undo it.
 		const auto defaults = state.settings.defaults;
 		top = chips(p, pad, top, inner, defaults, [=](Right right, bool on) {
-			auto changed = defaults;
-			changed.set(right, on);
-			room->setDefaults(changed, false);
+			room->setDefaultRight(right, on);
 		});
 		top += Scaled(10);
 
@@ -1573,16 +2190,9 @@ int MembersList::pass(QPainter *p, int width) {
 			}
 			const auto rect = QRect(x, top, w, presetHeight);
 			if (p) {
-				p->setPen(Qt::NoPen);
-				p->setBrush(overNext()
-					? st::windowBgRipple
-					: st::windowBgOver);
-				p->drawRoundedRect(
-					QRectF(rect),
-					presetHeight / 2.,
-					presetHeight / 2.);
+				PaintRoomPill(*p, QRectF(rect), overNext());
 				p->setFont(st::semiboldFont);
-				p->setPen(st::windowActiveTextFg);
+				p->setPen(RoomPillTextColor());
 				p->drawText(
 					rect.x() + Scaled(14),
 					rect.y() + (presetHeight - st::semiboldFont->height) / 2
@@ -1625,19 +2235,24 @@ int MembersList::pass(QPainter *p, int width) {
 				Qt::TextWordWrap,
 				about);
 		}
-		top += aboutRect.height() + Scaled(18);
+		top += aboutRect.height();
+		sectionEnd(Scaled(18), Scaled(14));
 	} else if (state.gone == Gone::No) {
+		sectionBegin();
 		top = sectionTitle(
 			p,
+			pad,
 			top,
 			width,
 			tr::lng_oblivion_room_members_my_rights(tr::now));
 		top = chips(p, pad, top, inner, state.rights, nullptr);
-		top += Scaled(18);
+		sectionEnd(Scaled(18), Scaled(14));
 	}
 
+	sectionBegin();
 	top = sectionTitle(
 		p,
+		pad,
 		top,
 		width,
 		tr::lng_oblivion_room_members_list(tr::now)
@@ -1690,7 +2305,7 @@ int MembersList::pass(QPainter *p, int width) {
 						rowTop + Scaled(6),
 						Scaled(15),
 						Scaled(15)),
-					st::windowActiveTextFg->c);
+					CrownColor());
 			}
 			p->setFont(st::normalFont);
 			p->setPen(st::windowSubTextFg);
@@ -1708,7 +2323,7 @@ int MembersList::pass(QPainter *p, int width) {
 			if (p) {
 				if (overNext()) {
 					p->setPen(Qt::NoPen);
-					p->setBrush(st::windowBgOver);
+					p->setBrush(RoomHoverColor());
 					p->drawEllipse(QRectF(rect));
 				}
 				PaintGlyph(
@@ -1729,26 +2344,18 @@ int MembersList::pass(QPainter *p, int width) {
 			if (p) {
 				const auto text = tr::lng_oblivion_room_members_all_rights(
 					tr::now);
-				const auto height = Scaled(24);
-				const auto rect = QRect(
-					textLeft,
-					top,
-					st::normalFont->width(text) + 2 * Scaled(10),
-					height);
-				auto bg = st::windowBgActive->c;
-				bg.setAlphaF(0.16);
-				p->setPen(Qt::NoPen);
-				p->setBrush(bg);
-				p->drawRoundedRect(QRectF(rect), height / 2., height / 2.);
-				p->setFont(st::normalFont);
-				p->setPen(st::windowActiveTextFg);
-				p->drawText(
-					rect.x() + Scaled(10),
-					rect.y() + (height - st::normalFont->height) / 2
-						+ st::normalFont->ascent,
-					text);
+				PaintRightChip(
+					*p,
+					QRect(
+						textLeft,
+						top,
+						RightChipWidth(text),
+						Scaled(kChipHeight)),
+					text,
+					true,
+					false);
 			}
-			top += Scaled(24);
+			top += Scaled(kChipHeight);
 		} else {
 			const auto id = member->id;
 			const auto rights = member->rights;
@@ -1759,18 +2366,21 @@ int MembersList::pass(QPainter *p, int width) {
 				width - textLeft - pad,
 				rights,
 				manage ? Fn<void(Right, bool)>([=](Right right, bool on) {
-					auto changed = rights;
-					changed.set(right, on);
-					room->setRights(id, changed);
+					room->setRight(id, right, on);
 				}) : nullptr);
 		}
 		top += Scaled(14);
 	}
+	sectionEnd(0, 0);
 
 	if (owner && !state.banned.empty()) {
-		top += Scaled(4);
+		if (!cards) {
+			top += Scaled(4);
+		}
+		sectionBegin();
 		top = sectionTitle(
 			p,
+			pad,
 			top,
 			width,
 			tr::lng_oblivion_room_members_banned(tr::now));
@@ -1806,8 +2416,10 @@ int MembersList::pass(QPainter *p, int width) {
 			addTarget(rect, [=] { room->unban(id); });
 			top += rect.height() + Scaled(4);
 		}
+		sectionEnd(0, Scaled(10));
 	}
-	return top + Scaled(16);
+	// The last card has left its margin under itself.
+	return cards ? top : (top + Scaled(16));
 }
 
 int MembersList::resizeGetHeight(int newWidth) {
@@ -1817,6 +2429,13 @@ int MembersList::resizeGetHeight(int newWidth) {
 void MembersList::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
 	auto hq = PainterHighQualityEnabler(p);
+	if (RoomHasCards()) {
+		// Where the cards are is known only after a pass.
+		pass(nullptr, width());
+		for (const auto &card : _cards) {
+			PaintRoomCard(p, card);
+		}
+	}
 	pass(&p, width());
 }
 
@@ -1898,9 +2517,12 @@ void MembersList::showMemberMenu(uint64 userId) {
 			false,
 			[=](not_null<Room*> strong) { strong->transfer(userId); });
 	}, &st::menuIconAdmin);
-	const auto room = _room;
 	_menu->addAction(tr::lng_oblivion_room_member_kick(tr::now), [=] {
-		room->kick(userId, false);
+		confirm(
+			tr::lng_oblivion_room_member_kick_sure(tr::now, lt_name, name),
+			tr::lng_oblivion_room_member_kick(tr::now),
+			false,
+			[=](not_null<Room*> strong) { strong->kick(userId, false); });
 	}, &st::menuIconRemove);
 	_menu->addAction(tr::lng_oblivion_room_member_ban(tr::now), [=] {
 		confirm(
@@ -1945,10 +2567,19 @@ MembersTab::MembersTab(QWidget *parent, TabContext context)
 			_list->refresh();
 		}
 	}, lifetime());
+
+	// A look puts the sections into cards, that changes the heights.
+	Look::Updates(
+	) | rpl::on_next([=] {
+		if (_list) {
+			_list->refresh();
+		}
+	}, lifetime());
 }
 
 void MembersTab::paintEvent(QPaintEvent *e) {
-	QPainter(this).fillRect(e->rect(), st::windowBg);
+	auto p = QPainter(this);
+	PaintRoomGround(p, this, e->rect());
 }
 
 void MembersTab::resizeEvent(QResizeEvent *e) {
@@ -2169,6 +2800,118 @@ struct RoomsBoxArgs {
 	Fn<void(const QString &typed)> join;
 };
 
+// A room of the list: the cover made of its code (the same one as in the
+// box of joining), the title, whose room it is and how many are there.
+class RoomsRowButton final : public Ui::AbstractButton {
+public:
+	RoomsRowButton(QWidget *parent, const RoomsRow &row);
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+	void paintEvent(QPaintEvent *e) override;
+	void onStateChanged(State was, StateChangeSource source) override;
+
+private:
+	const QString _code;
+	const QString _title;
+	const QString _about;
+	const QString _online;
+
+};
+
+RoomsRowButton::RoomsRowButton(QWidget *parent, const RoomsRow &row)
+: AbstractButton(parent)
+, _code(row.code)
+, _title(row.title.isEmpty()
+	? tr::lng_oblivion_room_title_default(tr::now)
+	: row.title)
+, _about(row.owner
+	? (tr::lng_oblivion_room_list_yours(tr::now)
+		+ u" · "_q
+		+ MembersText(row.members))
+	: MembersText(row.members))
+, _online((row.online > 0)
+	? tr::lng_oblivion_room_list_online(
+		tr::now,
+		lt_online,
+		QString::number(row.online))
+	: QString()) {
+	setAccessibleName(_title);
+}
+
+int RoomsRowButton::resizeGetHeight(int newWidth) {
+	return Scaled(56);
+}
+
+void RoomsRowButton::onStateChanged(State was, StateChangeSource source) {
+	update();
+}
+
+void RoomsRowButton::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+	const auto pad = st::boxRowPadding.left();
+	if (isOver() || isDown()) {
+		// The row is in a box: the colours of the window, the radius of
+		// the look.
+		const auto inset = pad - Scaled(10);
+		const auto radius = Look::RowRadius(Scaled(10));
+		p.setPen(Qt::NoPen);
+		p.setBrush(isDown() ? st::windowBgRipple : st::windowBgOver);
+		p.drawRoundedRect(
+			QRectF(rect()).marginsRemoved(QMarginsF(inset, 1, inset, 1)),
+			radius,
+			radius);
+	}
+	const auto cover = Scaled(40);
+	PaintCover(
+		p,
+		QRect(pad, (height() - cover) / 2, cover, cover),
+		QImage(),
+		_code,
+		Scaled(10));
+	const auto left = pad + cover + Scaled(12);
+	auto right = width() - st::boxRowPadding.right();
+	if (!_online.isEmpty()) {
+		const auto dot = Scaled(7);
+		const auto textLeft = right - st::normalFont->width(_online);
+		p.setFont(st::normalFont);
+		p.setPen(st::windowSubTextFg);
+		p.drawText(
+			textLeft,
+			(height() - st::normalFont->height) / 2 + st::normalFont->ascent,
+			_online);
+		const auto dotLeft = textLeft - Scaled(6) - dot;
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::boxTextFgGood);
+		p.drawEllipse(QRectF(dotLeft, (height() - dot) / 2., dot, dot));
+		right = dotLeft - Scaled(10);
+	}
+	const auto textWidth = std::max(right - left, Scaled(40));
+	p.setFont(st::semiboldFont);
+	p.setPen(st::windowFg);
+	p.drawText(
+		left,
+		Scaled(10) + st::semiboldFont->ascent,
+		st::semiboldFont->elided(_title, textWidth));
+	p.setFont(st::normalFont);
+	p.setPen(st::windowSubTextFg);
+	p.drawText(
+		left,
+		Scaled(30) + st::normalFont->ascent,
+		st::normalFont->elided(_about, textWidth));
+}
+
+// «Загрузка…», «комнат пока нет», the error: quiet lines in the middle.
+[[nodiscard]] const style::FlatLabel &RoomsStateLabelStyle() {
+	static const auto result = [] {
+		auto copy = st::boxDividerLabel;
+		copy.align = style::al_top;
+		return copy;
+	}();
+	return result;
+}
+
 void RoomsBox(not_null<Ui::GenericBox*> box, RoomsBoxArgs &&args) {
 	box->setTitle(tr::lng_oblivion_room_settings());
 	box->setWidth(st::boxWideWidth);
@@ -2184,12 +2927,16 @@ void RoomsBox(not_null<Ui::GenericBox*> box, RoomsBoxArgs &&args) {
 	const auto status = [=](rpl::producer<QString> text) {
 		list->clear();
 		list->add(
-			object_ptr<Ui::FlatLabel>(list, std::move(text), st::boxLabel),
+			object_ptr<Ui::FlatLabel>(
+				list,
+				std::move(text),
+				RoomsStateLabelStyle()),
 			st::boxRowPadding + QMargins(
 				0,
-				st::boxLittleSkip,
+				st::boxMediumSkip,
 				0,
-				st::boxLittleSkip));
+				st::boxLittleSkip),
+			style::al_top);
 		list->resizeToWidth(box->width());
 	};
 	status(tr::lng_oblivion_room_list_loading());
@@ -2201,28 +2948,8 @@ void RoomsBox(not_null<Ui::GenericBox*> box, RoomsBoxArgs &&args) {
 			}
 			list->clear();
 			for (const auto &row : rows) {
-				const auto title = row.title.isEmpty()
-					? tr::lng_oblivion_room_title_default(tr::now)
-					: row.title;
-				const auto members = MembersText(row.members);
-				const auto text = row.owner
-					? tr::lng_oblivion_room_list_row_owner(
-						tr::now,
-						lt_title,
-						title,
-						lt_members,
-						members)
-					: tr::lng_oblivion_room_list_row(
-						tr::now,
-						lt_title,
-						title,
-						lt_members,
-						members);
 				const auto button = list->add(
-					object_ptr<Ui::SettingsButton>(
-						list,
-						rpl::single(text),
-						st::settingsButtonNoIcon));
+					object_ptr<RoomsRowButton>(list, row));
 				const auto code = row.code;
 				button->setClickedCallback([=] {
 					if (shared->open) {
@@ -2237,16 +2964,36 @@ void RoomsBox(not_null<Ui::GenericBox*> box, RoomsBoxArgs &&args) {
 		}));
 	}
 
-	const auto field = container->add(
-		object_ptr<Ui::InputField>(
-			container,
-			st::defaultInputField,
-			tr::lng_oblivion_room_list_join_placeholder()),
-		st::boxRowPadding + QMargins(
-			0,
-			st::boxLittleSkip,
-			0,
-			st::boxLittleSkip));
+	// The field for a link and «Войти» right next to it, in one row: the
+	// bottom of the box is left to «Закрыть» and «Создать комнату».
+	const auto joinRow = container->add(
+		object_ptr<Ui::RpWidget>(container),
+		st::boxRowPadding + QMargins(0, 0, 0, st::boxLittleSkip));
+	const auto field = Ui::CreateChild<Ui::InputField>(
+		joinRow,
+		st::defaultInputField,
+		tr::lng_oblivion_room_list_join_placeholder());
+	const auto enter = Ui::CreateChild<Ui::RoundButton>(
+		joinRow,
+		tr::lng_oblivion_room_join_button(),
+		st::defaultBoxButton);
+	field->show();
+	enter->show();
+	joinRow->resize(
+		st::boxWideWidth - st::boxRowPadding.left() - st::boxRowPadding.right(),
+		st::defaultInputField.heightMin);
+	rpl::combine(
+		joinRow->widthValue(),
+		enter->widthValue()
+	) | rpl::on_next([=](int width, int buttonWidth) {
+		const auto fieldWidth = std::max(
+			width - buttonWidth - st::boxLittleSkip,
+			st::defaultInputField.widthMin);
+		field->resizeToWidth(fieldWidth);
+		field->moveToLeft(0, 0, width);
+		// The text of the button stands on the line of the field.
+		enter->moveToRight(0, field->height() - enter->height(), width);
+	}, joinRow->lifetime());
 	field->setMaxLength(256);
 	const auto join = [=] {
 		const auto typed = field->getLastText().trimmed();
@@ -2272,7 +3019,7 @@ void RoomsBox(not_null<Ui::GenericBox*> box, RoomsBoxArgs &&args) {
 		box->closeBox();
 	});
 	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
-	box->addLeftButton(tr::lng_oblivion_room_list_join(), join);
+	enter->setClickedCallback(join);
 }
 
 // ---- The content of the window.
@@ -2392,6 +3139,14 @@ RoomWidget::RoomWidget(
 		Toast(_show, text);
 	}, lifetime());
 
+	// The room has a window of its own: nobody else repaints it when the
+	// theme or the look («Тема Oblivion») gives the palette new colours.
+	// update() repaints everything inside, the tabs and their lists too.
+	style::PaletteChanged(
+	) | rpl::on_next([=] {
+		update();
+	}, lifetime());
+
 	const auto first = ranges::contains(_slots, tab, [](const Slot &slot) {
 		return slot.descriptor.id;
 	}) ? tab : _slots.empty() ? QString() : _slots.front().descriptor.id;
@@ -2485,17 +3240,38 @@ void RoomWidget::refreshGone() {
 	raw->paintRequest(
 	) | rpl::on_next([=](QRect clip) {
 		auto p = QPainter(raw);
-		p.fillRect(clip, st::windowBg);
-		p.setFont(TitleFont());
+		auto hq = PainterHighQualityEnabler(p);
+		PaintRoomGround(p, raw, clip);
+		const auto &font = TitleFont();
+		const auto area = QRect(
+			Scaled(32),
+			0,
+			raw->width() - Scaled(64),
+			raw->height() / 2 - Scaled(12));
+		const auto flags = Qt::AlignHCenter | Qt::AlignBottom | Qt::TextWordWrap;
+		p.setFont(font);
 		p.setPen(st::windowFg);
-		p.drawText(
-			QRect(
-				Scaled(32),
-				0,
-				raw->width() - Scaled(64),
-				raw->height() / 2 - Scaled(12)),
-			Qt::AlignHCenter | Qt::AlignBottom | Qt::TextWordWrap,
-			text);
+		p.drawText(area, flags, text);
+
+		// A quiet sign over the text: the room is not here any more.
+		const auto used = QFontMetrics(font->f).boundingRect(area, flags, text);
+		const auto size = Scaled(64);
+		const auto sign = QRectF(
+			(raw->width() - size) / 2.,
+			used.y() - Scaled(18) - size,
+			size,
+			size);
+		if (sign.y() >= Scaled(8)) {
+			const auto skip = size * 0.3;
+			p.setPen(Qt::NoPen);
+			p.setBrush(st::windowBgOver);
+			p.drawEllipse(sign);
+			PaintGlyph(
+				p,
+				Glyph::Cross,
+				sign.marginsRemoved(QMarginsF(skip, skip, skip, skip)),
+				st::windowSubTextFg->c);
+		}
 	}, raw->lifetime());
 	raw->sizeValue(
 	) | rpl::on_next([=](QSize size) {
@@ -2534,7 +3310,8 @@ void RoomWidget::resizeEvent(QResizeEvent *e) {
 }
 
 void RoomWidget::paintEvent(QPaintEvent *e) {
-	QPainter(this).fillRect(e->rect(), st::windowBg);
+	auto p = QPainter(this);
+	PaintRoomGround(p, this, e->rect());
 }
 
 void RoomWidget::showMenu() {
@@ -2676,6 +3453,43 @@ struct LockState {
 	return result;
 }
 
+// The names of the temp folders of the rooms that are open now.
+[[nodiscard]] QStringList OpenRoomFolders() {
+	auto result = QStringList();
+	for (const auto &window : Windows()) {
+		const auto room = window->room();
+		result.push_back(RoomFolderName(room->selfId(), room->code()));
+	}
+	return result;
+}
+
+// The window of a room was closed and the user is still its member: the
+// downloaded files stay for a quick reopen and go half an hour later,
+// unless the room is open again by then (its next close asks once more).
+// Without that the tracks and the videos of every room ever opened would
+// pile up on the disk till the app is restarted. The call keeps nothing
+// of the window, the room or the session, only the two values.
+void RemoveFolderLater(uint64 selfId, const QString &code) {
+	if (!selfId
+		|| code.isEmpty()
+		|| !Core::IsAppLaunched()
+		|| Core::Quitting()) {
+		return;
+	}
+	base::call_delayed(kFolderGrace, [=] {
+		if (!Core::IsAppLaunched() || Core::Quitting()) {
+			return;
+		}
+		for (const auto &window : Windows()) {
+			const auto room = window->room();
+			if (room->selfId() == selfId && room->code() == code) {
+				return;
+			}
+		}
+		RemoveRoomFolder(selfId, code);
+	});
+}
+
 void RemoveWindow(not_null<RoomWindow*> window) {
 	auto &list = Windows();
 	const auto i = ranges::find(
@@ -2787,7 +3601,15 @@ RoomWindow::RoomWindow(not_null<Main::Session*> session, RoomState &&state)
 RoomWindow::~RoomWindow() {
 	_layers->hideAll(anim::type::instant);
 	_widget = nullptr;
+	const auto selfId = _room->selfId();
+	const auto code = _room->code();
+	const auto member = !_room->sample()
+		&& (_room->state().gone == Gone::No);
 	_room = nullptr;
+	if (member) {
+		// A room that is over removes its folder by itself.
+		RemoveFolderLater(selfId, code);
+	}
 }
 
 void RoomWindow::detach() {
@@ -3009,7 +3831,16 @@ void Start(not_null<Main::Session*> session) {
 	static auto Cleaned = false;
 	if (!Cleaned) {
 		Cleaned = true;
+		// No room can be open yet: what the last launch has left and
+		// nothing was written to for an hour goes at once. What a quick
+		// relaunch has spared is looked at once more when it is old
+		// enough, leaving out the rooms that are open at that moment.
 		CleanupRoomFolders();
+		base::call_delayed(kFolderRecheck, [] {
+			if (Core::IsAppLaunched() && !Core::Quitting()) {
+				CleanupRoomFolders(0, OpenRoomFolders());
+			}
+		});
 	}
 	// Registered after Cloud::For(session): runs before the account of
 	// the cloud is destroyed.
@@ -3427,7 +4258,15 @@ enum class SampleKind {
 			"Everything is in sync for me, even over a VPN. Sounds "
 			"great, let us open the canvas later and draw together."),
 		120'000);
-	state.chatLastId = 4;
+	message(5, other, misha, SampleText(
+		"Давайте! Холст уже открыт, жду вас там 🎨",
+		"Let's! The canvas is open already, waiting for you 🎨"), 60'000);
+	message(6, self, me, SampleText(
+		"Иду. Только чур не стирать мой рисунок, как в прошлый раз — "
+		"я его полвечера рисовала.",
+		"Coming. Just do not wipe my drawing like the last time, "
+		"it took me half of the evening."), 30'000);
+	state.chatLastId = 6;
 	return state;
 }
 
@@ -3465,14 +4304,21 @@ private:
 const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	using namespace SelfTest;
 
+	// looks: the scene is rendered with every look («Тема Oblivion») too,
+	// as name_look1, name_look2 and name_look3.
 	const auto window = [](
 			const QString &name,
 			QSize size,
 			Fn<Room::Descriptor()> make,
-			const QString &tab = QString()) {
-		RegisterScene(name, size, [=](not_null<Ui::RpWidget*> parent) {
+			const QString &tab = QString(),
+			bool looks = false) {
+		const auto create = [=](not_null<Ui::RpWidget*> parent) -> QWidget* {
 			return Ui::CreateChild<SceneHost>(parent.get(), make(), tab);
-		});
+		};
+		RegisterScene(name, size, create);
+		if (looks) {
+			Look::RegisterScenes(name, size, create);
+		}
 	};
 	const auto descriptor = [](SampleKind kind) {
 		return Room::Descriptor{
@@ -3491,7 +4337,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.total = 9'100'000,
 		});
 		return result;
-	});
+	}, QString(), true);
 	window(u"room_window_guest"_q, size, [=] {
 		return descriptor(SampleKind::Guest);
 	});
@@ -3511,13 +4357,13 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.name = SampleText("Спамер", "Spammer"),
 		});
 		return result;
-	}, u"members"_q);
+	}, u"members"_q, true);
 	window(u"room_window_members_guest"_q, size, [=] {
 		return descriptor(SampleKind::Guest);
 	}, u"members"_q);
 	window(u"room_window_chat"_q, size, [=] {
 		return descriptor(SampleKind::Owner);
-	}, u"chat"_q);
+	}, u"chat"_q, true);
 	window(u"room_window_chat_empty"_q, size, [=] {
 		auto result = descriptor(SampleKind::Guest);
 		result.state.chat.clear();
@@ -3538,10 +4384,49 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		u"room_window_narrow"_q,
 		QSize(Scaled(kWindowMinWidth), Scaled(kWindowMinHeight)),
 		[=] { return descriptor(SampleKind::Owner); });
-	window(
-		u"room_window_wide"_q,
-		QSize(Scaled(760), Scaled(640)),
-		[=] { return descriptor(SampleKind::Owner); });
+	window(u"room_window_wide"_q, QSize(Scaled(760), Scaled(640)), [=] {
+		auto result = descriptor(SampleKind::Owner);
+		result.uploads.push_back({
+			.id = 1,
+			.title = u"Tame Impala — Let It Happen"_q,
+			.ready = 6'900'000,
+			.total = 9'100'000,
+		});
+		result.uploads.push_back({
+			.id = 2,
+			.title = SampleText("Молчат Дома — Судно", "Molchat Doma — Sudno"),
+		});
+		return result;
+	});
+	// A full house and a long title: the strip of the header folds the
+	// rest into «+N», the title is elided, the line under it is whole.
+	window(u"room_window_crowd"_q, size, [=] {
+		auto result = descriptor(SampleKind::Owner);
+		result.state.title = SampleText(
+			"Пятничный киноклуб и музыка до утра",
+			"Friday film club and music till the morning");
+		const auto names = {
+			SampleText("Даша", "Daria"),
+			SampleText("Игорь Ветров", "Igor Wind"),
+			SampleText("Соня", "Sonia"),
+			SampleText("Тимур", "Timur"),
+			SampleText("Вика Орлова", "Victoria Eagle"),
+			SampleText("Глеб", "Gleb"),
+			SampleText("Оля", "Olga"),
+			SampleText("Рома", "Roman"),
+		};
+		auto id = uint64(9000000000000110ULL);
+		for (const auto &name : names) {
+			result.state.members.push_back(SampleMember(
+				id,
+				name,
+				false,
+				(id % 3) != 0,
+				Rights::Everything()));
+			++id;
+		}
+		return result;
+	});
 
 	const auto boxSize = QSize(st::boxWideWidth * 2, 0);
 	const auto joinArgs = [](const QString &reason) {

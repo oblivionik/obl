@@ -102,6 +102,9 @@ constexpr auto kCloudUpdateSeenBuild = "cloud_update_seen_build";
 constexpr auto kSendWhenOnline = "send_when_online";
 constexpr auto kSendWhenOnlineHours = "send_when_online_hours";
 // Round 5: send online end.
+// Oblivion looks: core.
+constexpr auto kLook = "look";
+// Oblivion looks: core end.
 
 [[nodiscard]] QString FilePath() {
 	return cWorkingDir() + u"tdata/oblivion.json"_q;
@@ -243,6 +246,14 @@ QByteArray Settings::syncSnapshot() {
 		auto file = QFile(FilePath());
 		return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
 	};
+	// A file that was saved by an older build has no keys for the
+	// settings added since, and the sync takes values only for the keys
+	// the file of this device has: written anew once per launch, the
+	// file has them all (with the values that are in use anyway).
+	static auto Completed = false;
+	if (!std::exchange(Completed, true)) {
+		save();
+	}
 	auto result = read();
 	if (!QJsonDocument::fromJson(result).isObject()) {
 		// Nothing was changed since the installation: the defaults.
@@ -489,6 +500,15 @@ void Settings::load() {
 	read(kSendWhenOnline, _sendWhenOnline);
 	readRange(kSendWhenOnlineHours, _sendWhenOnlineHours, 1, 168);
 	// Round 5: send online end.
+	// Oblivion looks: core.
+	// A number that is not a look (a file of a newer build) is the plain
+	// Telegram, not the nearest look.
+	if (const auto value = object.value(QString::fromUtf8(kLook))
+		; value.isDouble()) {
+		const auto look = int64(value.toDouble());
+		_look = (look >= 0 && look <= 3) ? look : 0;
+	}
+	// Oblivion looks: core end.
 }
 
 void Settings::save() {
@@ -671,6 +691,9 @@ void Settings::save() {
 		QString::fromUtf8(kSendWhenOnlineHours),
 		double(_sendWhenOnlineHours));
 	// Round 5: send online end.
+	// Oblivion looks: core.
+	object.insert(QString::fromUtf8(kLook), double(_look));
+	// Oblivion looks: core end.
 
 	// QSaveFile replaces the old file only after a complete write
 	// (a failed write() is remembered and makes commit() discard it),

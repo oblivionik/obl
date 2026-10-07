@@ -11,6 +11,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 #include "base/call_delayed.h"
 #include "base/event_filter.h"
+#include "base/flat_set.h"
 #include "base/invoke_queued.h"
 #include "base/random.h"
 #include "base/timer.h"
@@ -21,7 +22,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/tabbed_panel.h"
 #include "chat_helpers/tabbed_selector.h"
 #include "core/application.h"
-#include "core/click_handler_types.h"
 #include "data/data_channel.h"
 #include "data/data_chat.h"
 #include "data/data_document.h"
@@ -48,7 +48,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_settings.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/abstract_button.h"
-#include "ui/basic_click_handlers.h"
 #include "ui/boxes/confirm_box.h"
 #include "ui/effects/animations.h"
 #include "ui/emoji_config.h"
@@ -77,6 +76,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainterPath>
 
+#include <array>
 #include <deque>
 
 namespace Oblivion::Rooms {
@@ -95,7 +95,6 @@ constexpr auto kOwnEchoLimit = 64;
 constexpr auto kStickerCooldown = crl::time(700);
 constexpr auto kGroupsLimit = 200;
 constexpr auto kTitleLimit = 64;
-constexpr auto kMaxChatId = (uint64(1) << 47);
 constexpr auto kPanelDuration = crl::time(140);
 
 // The server allows 15 at once and 5 a second for a device (reactions and
@@ -104,9 +103,26 @@ constexpr auto kOutgoingBurst = 8.;
 constexpr auto kOutgoingPerSecond = 3.;
 // Documents the app does not know yet are asked from Telegram: a member
 // who throws a new sticker every second must not turn into a flood of
-// requests of this account.
+// requests of this account. For all the members together and for one of
+// them: a few at once, then one a minute.
 constexpr auto kResolveBurst = 8.;
 constexpr auto kResolvePerSecond = 0.2;
+constexpr auto kResolveUserBurst = 4.;
+constexpr auto kResolveUserPerSecond = 1. / 60.;
+// What Telegram has said it does not know is not asked again while the
+// window lives, and a member that many of whose stickers were such is
+// not asked for at all (till the window is opened again).
+constexpr auto kResolveFailedLimit = 256;
+constexpr auto kResolveStrikes = 5;
+constexpr auto kResolveKnownLimit = 512;
+// Even looking whether the app knows a document is limited (the session
+// keeps an entry for every id it was asked about): a lot of different
+// stickers at once, then a few a minute. Those met in this window and
+// the user's own ones are not counted.
+constexpr auto kLookBurst = 200.;
+constexpr auto kLookPerSecond = 0.2;
+constexpr auto kLookUserBurst = 60.;
+constexpr auto kLookUserPerSecond = 0.05;
 
 const char *const kQuickEmoji[] = {
 	"👍",
@@ -287,27 +303,19 @@ void PaintNameTag(
 	return false;
 }
 
-// The group of the voice chat if this account knows it and is in it.
-[[nodiscard]] PeerData *VoicePeer(
-		not_null<Main::Session*> session,
-		const QString &chatId) {
-	if (chatId.isEmpty() || chatId.size() > 20 || !OnlyOf(chatId, DigitChar)) {
-		return nullptr;
+// A group (not a channel, not a bot, not a person): the only thing the
+// link of a voice chat may lead to.
+[[nodiscard]] bool IsGroup(not_null<PeerData*> peer) {
+	return peer->isChat() || peer->isMegagroup();
+}
+
+[[nodiscard]] bool InGroup(not_null<PeerData*> peer) {
+	if (const auto chat = peer->asChat()) {
+		return chat->amIn();
+	} else if (const auto channel = peer->asChannel()) {
+		return channel->isMegagroup() && channel->amIn();
 	}
-	auto ok = false;
-	const auto id = uint64(chatId.toULongLong(&ok));
-	if (!ok || !id || id >= kMaxChatId) {
-		return nullptr;
-	}
-	const auto channel = session->data().channelLoaded(ChannelId(id));
-	if (channel && channel->isMegagroup() && channel->amIn()) {
-		return channel;
-	}
-	const auto chat = session->data().chatLoaded(ChatId(id));
-	if (chat && chat->amIn()) {
-		return chat;
-	}
-	return nullptr;
+	return false;
 }
 
 [[nodiscard]] bool GroupFits(not_null<PeerData*> peer) {
@@ -319,14 +327,6 @@ void PaintNameTag(
 			&& (channel->hasUsername() || channel->canHaveInviteLink());
 	}
 	return false;
-}
-
-[[nodiscard]] QString GroupBareId(not_null<PeerData*> peer) {
-	return peer->isChannel()
-		? QString::number(quint64(peerToChannel(peer->id).bare))
-		: peer->isChat()
-		? QString::number(quint64(peerToChat(peer->id).bare))
-		: QString();
 }
 
 [[nodiscard]] ChannelData *CreatedChannel(
@@ -374,6 +374,133 @@ void PaintNameTag(
 	return result;
 }
 
+// ---- What asking Telegram about the stickers of the others may cost.
+//
+// A sticker another member has thrown is only numbers he has sent, and
+// he can send any numbers as often as the server lets him:
+//  - what Telegram has said it does not know is not asked again while
+//    the window lives, and a member with several such stickers is not
+//    asked for at all (till the window is opened again);
+//  - a member gets a few requests at once, then one a minute, all the
+//    members together kResolveBurst and kResolvePerSecond;
+//  - one sticker is not asked twice at a time;
+//  - even looking whether the app knows a document is limited: the
+//    session keeps an entry for every id it was asked about.
+// The user's own stickers do not come here.
+class StickerLookups final {
+public:
+	StickerLookups()
+	: _looks(kLookUserBurst, kLookUserPerSecond, kLookBurst, kLookPerSecond)
+	, _requests(
+		kResolveUserBurst,
+		kResolveUserPerSecond,
+		kResolveBurst,
+		kResolvePerSecond) {
+	}
+
+	// The session may be asked whether it has the document.
+	[[nodiscard]] bool mayLook(
+			uint64 from,
+			const RoomSticker &sticker,
+			crl::time now) {
+		if (_known.contains(sticker.documentId)) {
+			return true;
+		}
+		const auto strikes = _strikes.find(from);
+		return (strikes == end(_strikes) || strikes->second < kResolveStrikes)
+			&& !ranges::contains(_failed, Key(sticker))
+			&& _looks.accept(from, now);
+	}
+
+	// The app has the document.
+	void known(uint64 documentId) {
+		if (int(_known.size()) >= kResolveKnownLimit) {
+			_known.clear();
+		}
+		_known.emplace(documentId);
+	}
+
+	// The app does not have it. true: Telegram is asked, finished() is
+	// called with the answer.
+	[[nodiscard]] bool mayAsk(
+			uint64 from,
+			const RoomSticker &sticker,
+			crl::time now) {
+		const auto key = Key(sticker);
+		const auto askable = sticker.customEmoji
+			|| sticker.setId
+			|| !sticker.setShortName.isEmpty();
+		if (!askable) {
+			// Nothing to ask Telegram with: the same as "not known".
+			failed(from, key);
+			return false;
+		} else if (_asking.contains(key) || !_requests.accept(from, now)) {
+			return false;
+		}
+		_asking.emplace(key);
+		return true;
+	}
+
+	// found: the document has come. answered: Telegram has said whether
+	// there is such a document (a flood wait or a network error says
+	// nothing about the sticker).
+	void finished(
+			uint64 from,
+			const RoomSticker &sticker,
+			bool found,
+			bool answered) {
+		const auto key = Key(sticker);
+		_asking.remove(key);
+		if (found) {
+			known(sticker.documentId);
+		} else if (answered) {
+			failed(from, key);
+		}
+	}
+
+	// The session is gone: no answers will come.
+	void forgetAsked() {
+		_asking.clear();
+	}
+
+private:
+	// With the set: a wrong set must not hide the sticker for those who
+	// send the right one.
+	[[nodiscard]] static QString Key(const RoomSticker &sticker) {
+		return sticker.customEmoji
+			? (u"c"_q + QString::number(quint64(sticker.documentId)))
+			: u"s%1:%2:%3:%4"_q.arg(
+				QString::number(quint64(sticker.documentId)),
+				QString::number(quint64(sticker.setId)),
+				QString::number(quint64(sticker.setAccessHash)),
+				sticker.setShortName);
+	}
+
+	void failed(uint64 from, const QString &key) {
+		if (!ranges::contains(_failed, key)) {
+			if (int(_failed.size()) >= kResolveFailedLimit) {
+				_failed.erase(
+					begin(_failed),
+					begin(_failed) + kResolveFailedLimit / 2);
+			}
+			_failed.push_back(key);
+		}
+		if (_strikes.size() >= 256) {
+			// More than a room can hold: start over.
+			_strikes.clear();
+		}
+		++_strikes[from];
+	}
+
+	IncomingGuard _looks;
+	IncomingGuard _requests;
+	base::flat_set<uint64> _known; // Documents met in this window.
+	base::flat_set<QString> _asking; // Asked, no answer yet.
+	std::vector<QString> _failed; // Telegram does not know them.
+	base::flat_map<uint64, int> _strikes; // Such ones of a member.
+
+};
+
 // ---- What the widgets of one room window share.
 
 class Extras final : public base::has_weak_ptr {
@@ -416,8 +543,12 @@ public:
 	void react(EmojiPtr emoji);
 	void throwSticker(const RoomSticker &sticker);
 	void throwDocument(not_null<DocumentData*> document);
-	// nullptr: show the emoji of the sticker instead.
-	void resolve(const RoomSticker &sticker, Fn<void(DocumentData*)> done);
+	// The document of a sticker the member from has thrown. nullptr: show
+	// the emoji of the sticker instead.
+	void resolve(
+		uint64 from,
+		const RoomSticker &sticker,
+		Fn<void(DocumentData*)> done);
 
 	void openVoice(std::shared_ptr<Ui::Show> show);
 	void createVoice(std::shared_ptr<Ui::Show> show);
@@ -440,6 +571,16 @@ private:
 	void expectEcho(const QString &key);
 	[[nodiscard]] bool takeEcho(const QString &key);
 
+	void voiceInviteChecked(
+		const QString &hash,
+		const MTPChatInvite &result,
+		std::shared_ptr<Ui::Show> show);
+	void voiceGroupFound(
+		not_null<PeerData*> peer,
+		std::shared_ptr<Ui::Show> show);
+	void showVoiceGroup(
+		not_null<PeerData*> peer,
+		std::shared_ptr<Ui::Show> show);
 	void startCreate(std::shared_ptr<Ui::Show> show);
 	void exportLink(
 		not_null<PeerData*> peer,
@@ -459,13 +600,13 @@ private:
 	rpl::event_stream<> _sessionGone;
 	rpl::event_stream<> _refreshes;
 	ReactionLimiter _outgoing;
-	ReactionLimiter _resolveBudget;
 	IncomingGuard _incomingReactions;
 	IncomingGuard _incomingStickers;
 	std::vector<Echo> _echoes;
 	crl::time _lastSticker = 0;
+	StickerLookups _lookups;
 	bool _voiceBusy = false;
-	rpl::lifetime _sessionLifetime;
+	mtpRequestId _voiceCheckId = 0;
 	rpl::lifetime _lifetime;
 
 };
@@ -473,7 +614,6 @@ private:
 Extras::Extras(not_null<Room*> room)
 : _room(room)
 , _outgoing(kOutgoingBurst, kOutgoingPerSecond)
-, _resolveBudget(kResolveBurst, kResolvePerSecond)
 , _incomingReactions(6., 3., 24., 12.)
 , _incomingStickers(2., 0.5, 4., 1.5) {
 	_room->events(
@@ -506,8 +646,10 @@ Extras::Extras(not_null<Room*> room)
 }
 
 void Extras::detached() {
-	_sessionLifetime.destroy();
+	// The requests of the session never answer after that.
 	_voiceBusy = false;
+	_voiceCheckId = 0;
+	_lookups.forgetAsked();
 	_sessionGone.fire({});
 	_refreshes.fire({});
 }
@@ -676,7 +818,12 @@ void Extras::throwSticker(const RoomSticker &sticker) {
 	}
 }
 
+// The document of a sticker somebody has thrown. For a sticker of
+// another member it is only a reference, numbers he has sent: what
+// looking at them and asking Telegram may cost this account is limited
+// by StickerLookups.
 void Extras::resolve(
+		uint64 from,
 		const RoomSticker &sticker,
 		Fn<void(DocumentData*)> done) {
 	const auto session = _room->session();
@@ -684,33 +831,59 @@ void Extras::resolve(
 		done(nullptr);
 		return;
 	}
-	const auto known = session->data().document(
-		DocumentId(sticker.documentId));
+	const auto documentId = sticker.documentId;
+	const auto own = (from == _room->selfId());
+	const auto now = crl::now();
+	if (!own && !_lookups.mayLook(from, sticker, now)) {
+		done(nullptr);
+		return;
+	}
+	const auto known = session->data().document(DocumentId(documentId));
 	if (known->sticker()) {
+		if (!own) {
+			_lookups.known(documentId);
+		}
 		done(known);
 		return;
-	} else if (!_resolveBudget.take(crl::now())) {
+	} else if (own || !_lookups.mayAsk(from, sticker, now)) {
 		done(nullptr);
 		return;
 	}
-	if (sticker.customEmoji) {
-		// Batched by the manager into messages.getCustomEmojiDocuments.
-		session->data().customEmojiManager().resolve(
-			sticker.documentId
-		) | rpl::take(
-			1
-		) | rpl::on_next_error([=](not_null<DocumentData*> document) {
-			done(document->sticker() ? document.get() : nullptr);
-		}, [=] {
-			done(nullptr);
-		}, _sessionLifetime);
-		return;
-	} else if (!sticker.setId && sticker.setShortName.isEmpty()) {
-		done(nullptr);
-		return;
-	}
-	const auto documentId = sticker.documentId;
 	const auto weak = base::make_weak(this);
+	const auto finish = [=](DocumentData *document, bool answered) {
+		if (const auto strong = weak.get()) {
+			const auto found = document && document->sticker();
+			strong->_lookups.finished(from, sticker, found, answered);
+			done(found ? document : nullptr);
+		}
+	};
+	const auto failed = [=](const MTP::Error &error) {
+		// Only "there is no such thing" is an answer.
+		finish(nullptr, error.code() == 400);
+	};
+	if (sticker.customEmoji) {
+		// An own request, not the one of the custom emoji manager: that
+		// one never answers for a document that does not exist.
+		session->api().request(MTPmessages_GetCustomEmojiDocuments(
+			MTP_vector<MTPlong>(1, MTP_long(documentId))
+		)).done([=](const MTPVector<MTPDocument> &result) {
+			const auto strong = weak.get();
+			const auto alive = strong ? strong->_room->session() : nullptr;
+			if (!alive) {
+				return;
+			}
+			auto found = (DocumentData*)nullptr;
+			for (const auto &document : result.v) {
+				if (document.type() == mtpc_document
+					&& uint64(document.c_document().vid().v) == documentId) {
+					found = alive->data().processDocument(document);
+					break;
+				}
+			}
+			finish(found, true);
+		}).fail(failed).send();
+		return;
+	}
 	session->api().request(MTPmessages_GetStickerSet(
 		Data::InputStickerSet(StickerSetIdentifier{
 			.id = sticker.setId,
@@ -735,12 +908,8 @@ void Extras::resolve(
 			}
 		}, [](const MTPDmessages_stickerSetNotModified &) {
 		});
-		done((found && found->sticker()) ? found : nullptr);
-	}).fail([=] {
-		if (weak) {
-			done(nullptr);
-		}
-	}).send();
+		finish(found, true);
+	}).fail(failed).send();
 }
 
 // ---- Voice.
@@ -903,7 +1072,8 @@ void VoiceAttachBox(not_null<Ui::GenericBox*> box, VoiceAttachArgs &&args) {
 			}
 		}, list->lifetime());
 	}
-	box->addButton(tr::lng_cancel(), [=] {
+	// With no groups there is nothing to cancel: the box only tells that.
+	box->addButton(empty ? tr::lng_close() : tr::lng_cancel(), [=] {
 		box->closeBox();
 	});
 }
@@ -915,66 +1085,201 @@ void Extras::voiceFailed(
 	Toast(show, text);
 }
 
+// The «Голос» button. What the room says about its voice chat was set by
+// another member (and has come through a server), so nothing of it is
+// trusted:
+//  - only an invite link or the public link of a group is a voice chat
+//    (ParseVoiceLink), no other t.me link is ever opened from here, and
+//    even those are not given to the link handler of the app: the hash
+//    or the name is taken out and asked from Telegram;
+//  - the chat is the one Telegram names for that link, never the chat
+//    id the room carries (it could point at any group of this account);
+//  - a channel, a bot or a person behind the link is refused;
+//  - joining the group is the standard «Вступить в группу» box, joining
+//    or starting the video chat is the standard box of the calls.
 void Extras::openVoice(std::shared_ptr<Ui::Show> show) {
-	const auto &voice = _room->state().voice;
 	const auto session = _room->session();
-	if (!voice.valid() || !session || _room->state().gone != Gone::No) {
+	if (!session || _room->state().gone != Gone::No) {
 		return;
 	}
-	if (const auto peer = VoicePeer(session, voice.chatId)) {
-		// The user is in the group already.
-		using Confirm = Calls::StartGroupCallArgs::JoinConfirm;
-		const auto active = CallActive(peer);
-		if (peer->groupCall()) {
-			// Joining a video chat asks in the usual box of Telegram.
-			auto args = Calls::StartGroupCallArgs();
-			args.confirm = Confirm::Always;
-			Core::App().calls().startOrJoinGroupCall(show, peer, args);
-		} else if (active) {
-			// The video chat is on, but the app has not loaded it yet:
-			// the group is opened, its own bar joins.
-			session->api().requestFullPeer(peer);
-			if (const auto window = session->tryResolveWindow()) {
-				window->showPeerHistory(peer);
-				window->window().activate();
-			} else {
-				Toast(show, tr::lng_oblivion_rextra_voice_no_window(tr::now));
-			}
-		} else if (_room->owner() && peer->canManageGroupCall()) {
-			// Only the owner of the room (who attached the group) starts
-			// a new video chat from here.
-			Core::App().calls().startOrJoinGroupCall(
-				show,
-				peer,
-				Calls::StartGroupCallArgs());
-		} else {
-			Toast(show, (_room->owner()
-				? tr::lng_oblivion_rextra_voice_no_call
-				: tr::lng_oblivion_rextra_voice_no_call_member)(
-					tr::now,
-					lt_title,
-					peer->name()));
+	const auto raw = _room->state().voice.link;
+	const auto link = ParseVoiceLink(raw);
+	if (!link.valid()) {
+		return;
+	}
+	// One question at a time, the last click counts.
+	session->api().request(base::take(_voiceCheckId)).cancel();
+	const auto weak = base::make_weak(this);
+	// The answer is for the link the room still has.
+	const auto current = [=]() -> Extras* {
+		const auto strong = weak.get();
+		if (!strong) {
+			return nullptr;
 		}
+		strong->_voiceCheckId = 0;
+		const auto &state = strong->_room->state();
+		return (strong->_room->session()
+			&& state.gone == Gone::No
+			&& state.voice.link == raw)
+			? strong
+			: nullptr;
+	};
+	const auto failed = [=](const MTP::Error &error, const QString &text) {
+		if (!current()) {
+			return;
+		} else if (MTP::IsFloodError(error)) {
+			Toast(show, tr::lng_flood_error(tr::now));
+		} else if (error.code() == 400) {
+			Toast(show, text);
+		}
+	};
+	if (!link.inviteHash.isEmpty()) {
+		const auto hash = link.inviteHash;
+		_voiceCheckId = session->api().request(MTPmessages_CheckChatInvite(
+			MTP_string(hash)
+		)).done([=](const MTPChatInvite &result) {
+			if (const auto strong = current()) {
+				strong->voiceInviteChecked(hash, result, show);
+			}
+		}).fail([=](const MTP::Error &error) {
+			failed(error, tr::lng_group_invite_bad_link(tr::now));
+		}).handleFloodErrors().send();
 		return;
 	}
-	const auto window = session->tryResolveWindow();
+	const auto username = link.username;
+	if (const auto peer = session->data().peerByUsername(username)) {
+		voiceGroupFound(peer, show);
+		return;
+	}
+	_voiceCheckId = session->api().request(MTPcontacts_ResolveUsername(
+		MTP_flags(0),
+		MTP_string(username),
+		MTPstring() // referer
+	)).done([=](const MTPcontacts_ResolvedPeer &result) {
+		const auto strong = current();
+		if (!strong) {
+			return;
+		}
+		const auto alive = strong->_room->session();
+		auto peer = (PeerData*)nullptr;
+		result.match([&](const MTPDcontacts_resolvedPeer &data) {
+			alive->data().processUsers(data.vusers());
+			alive->data().processChats(data.vchats());
+			if (const auto peerId = peerFromMTP(data.vpeer())) {
+				peer = alive->data().peerLoaded(peerId);
+			}
+		});
+		if (peer) {
+			strong->voiceGroupFound(peer, show);
+		} else {
+			Toast(
+				show,
+				tr::lng_username_not_found(tr::now, lt_user, username));
+		}
+	}).fail([=](const MTP::Error &error) {
+		failed(
+			error,
+			tr::lng_username_not_found(tr::now, lt_user, username));
+	}).handleFloodErrors().send();
+}
+
+void Extras::voiceInviteChecked(
+		const QString &hash,
+		const MTPChatInvite &result,
+		std::shared_ptr<Ui::Show> show) {
+	const auto session = _room->session();
+	if (!session) {
+		return;
+	}
+	auto group = false;
+	auto mine = (PeerData*)nullptr;
+	result.match([&](const MTPDchatInvite &data) {
+		group = !data.is_broadcast();
+	}, [&](const MTPDchatInviteAlready &data) {
+		const auto chat = session->data().processChat(data.vchat());
+		group = IsGroup(chat);
+		mine = InGroup(chat) ? chat.get() : nullptr;
+	}, [&](const MTPDchatInvitePeek &data) {
+		group = IsGroup(session->data().processChat(data.vchat()));
+	});
+	if (!group) {
+		Toast(show, tr::lng_oblivion_rextra_voice_not_group(tr::now));
+	} else if (mine) {
+		// The user is in the group already.
+		voiceGroupFound(mine, show);
+	} else if (const auto window = session->tryResolveWindow()) {
+		// Not in the group yet: the standard «Вступить в группу» of
+		// Telegram, in the window of this account.
+		Api::CheckChatInvite(window, hash);
+		window->window().activate();
+	} else {
+		Toast(show, tr::lng_oblivion_rextra_voice_no_window(tr::now));
+	}
+}
+
+void Extras::showVoiceGroup(
+		not_null<PeerData*> peer,
+		std::shared_ptr<Ui::Show> show) {
+	const auto session = _room->session();
+	const auto window = session ? session->tryResolveWindow() : nullptr;
 	if (!window) {
 		Toast(show, tr::lng_oblivion_rextra_voice_no_window(tr::now));
 		return;
 	}
-	// Not in the group yet: the standard «Вступить в группу» of Telegram,
-	// in the window of this account.
-	const auto hash = VoiceInviteHash(voice.link);
-	if (!hash.isEmpty()) {
-		Api::CheckChatInvite(window, hash);
+	// The way the app opens a group by its link.
+	if (const auto forum = peer->forum()) {
+		window->showForum(forum, Window::SectionShow::Way::Forward);
 	} else {
-		UrlClickHandler::Open(
-			voice.link,
-			QVariant::fromValue(ClickHandlerContext{
-				.sessionWindow = base::make_weak(window),
-			}));
+		window->showPeerHistory(peer, Window::SectionShow::Way::Forward);
 	}
 	window->window().activate();
+}
+
+// peer is what Telegram has named for the link of the room.
+void Extras::voiceGroupFound(
+		not_null<PeerData*> peer,
+		std::shared_ptr<Ui::Show> show) {
+	const auto session = _room->session();
+	if (!session || !show || !show->valid()) {
+		return;
+	} else if (!IsGroup(peer)) {
+		Toast(show, tr::lng_oblivion_rextra_voice_not_group(tr::now));
+		return;
+	}
+	using Confirm = Calls::StartGroupCallArgs::JoinConfirm;
+	// Only who has attached the group starts a new video chat from here:
+	// a member is never made to start one in a group somebody else has
+	// pointed the room at.
+	const auto attachedByMe = _room->owner()
+		&& (_room->state().voice.setBy == _room->selfId());
+	if (peer->groupCall()) {
+		// Joining a video chat asks in the usual box of Telegram.
+		auto args = Calls::StartGroupCallArgs();
+		args.confirm = Confirm::Always;
+		Core::App().calls().startOrJoinGroupCall(show, peer, args);
+	} else if (CallActive(peer)) {
+		// The video chat is on, but the app has not loaded it yet: the
+		// group is opened, its own bar joins.
+		session->api().requestFullPeer(peer);
+		showVoiceGroup(peer, show);
+	} else if (!InGroup(peer)) {
+		// A public group the user is not in, no video chat there now:
+		// the group is shown, joining it is the button of Telegram.
+		showVoiceGroup(peer, show);
+	} else if (attachedByMe && peer->canManageGroupCall()) {
+		// Asks in the usual box of Telegram («Начать видеочат?»).
+		Core::App().calls().startOrJoinGroupCall(
+			show,
+			peer,
+			Calls::StartGroupCallArgs());
+	} else {
+		Toast(show, (attachedByMe
+			? tr::lng_oblivion_rextra_voice_no_call
+			: tr::lng_oblivion_rextra_voice_no_call_member)(
+				tr::now,
+				lt_title,
+				peer->name()));
+	}
 }
 
 void Extras::createVoice(std::shared_ptr<Ui::Show> show) {
@@ -1053,12 +1358,12 @@ void Extras::exportLink(
 		return;
 	}
 	if (const auto channel = peer->asChannel()) {
-		if (channel->hasUsername()) {
-			saveVoice(
-				peer,
-				u"https://t.me/"_q + channel->username(),
-				show,
-				startCall);
+		// Only what the others will take for a voice chat link is put
+		// into the room (see ParseVoiceLink): a public group with a name
+		// of another kind gets an invite link below.
+		const auto link = u"https://t.me/"_q + channel->username();
+		if (channel->hasUsername() && ParseVoiceLink(link).valid()) {
+			saveVoice(peer, link, show, startCall);
 			return;
 		}
 	}
@@ -1085,7 +1390,7 @@ void Extras::exportLink(
 		});
 		if (!strong->_room->session()) {
 			strong->_voiceBusy = false;
-		} else if (!link.startsWith(u"https://t.me/"_q)) {
+		} else if (ParseVoiceLink(link).inviteHash.isEmpty()) {
 			strong->voiceFailed(
 				show,
 				tr::lng_oblivion_rextra_voice_link_failed(
@@ -1115,7 +1420,9 @@ void Extras::saveVoice(
 	auto body = QJsonObject();
 	body.insert(u"link"_q, link);
 	body.insert(u"title"_q, peer->name().left(kTitleLimit));
-	body.insert(u"tg_chat_id"_q, GroupBareId(peer));
+	// The link is all another member needs (and all he may trust): the
+	// id of the group in Telegram is not given to the cloud.
+	body.insert(u"tg_chat_id"_q, QString());
 	const auto sent = _room->send(
 		Cloud::PutRequest(u"/voice"_q, std::move(body)),
 		crl::guard(this, [=](const Cloud::Response &) {
@@ -1412,6 +1719,14 @@ public:
 			update();
 		}
 	}
+	// The icon in the active colour, without the round background of
+	// a pressed button: something is offered here, nothing is switched on.
+	void setAccent(bool accent) {
+		if (_accent != accent) {
+			_accent = accent;
+			update();
+		}
+	}
 
 protected:
 	void paintEvent(QPaintEvent *e) override {
@@ -1428,7 +1743,9 @@ protected:
 			p,
 			_icon,
 			full.marginsRemoved(QMarginsF(skip, skip, skip, skip)),
-			_highlighted ? st::windowActiveTextFg->c : st::windowFg->c);
+			((_highlighted || _accent)
+				? st::windowActiveTextFg->c
+				: st::windowFg->c));
 	}
 	void onStateChanged(State was, StateChangeSource source) override {
 		update();
@@ -1441,6 +1758,7 @@ private:
 	const HeaderIcon _icon;
 	bool _wanted = false;
 	bool _highlighted = false;
+	bool _accent = false;
 
 };
 
@@ -1885,6 +2203,9 @@ void ReactionPanel::openPicker(bool stickers) {
 }
 
 bool ScenePanelOpen = false;
+// A scene shows what a member sees when the owner has just attached
+// a voice chat: the button and the toast about it.
+bool SceneVoiceAppeared = false;
 
 class ReactButton final : public HeaderButton {
 public:
@@ -1953,8 +2274,10 @@ public:
 	: HeaderButton(parent, HeaderIcon::Voice)
 	, _extras(ExtrasFor(context.room))
 	, _show(context.show)
-	, _had(context.room->state().voice.valid()) {
-		setHighlighted(true);
+	, _had(ParseVoiceLink(context.room->state().voice.link).valid()) {
+		// Not setHighlighted(): a microphone on a pressed-looking round
+		// background reads as "your microphone is on".
+		setAccent(true);
 		setClickedCallback([=] {
 			_extras->openVoice(_show);
 		});
@@ -1963,13 +2286,23 @@ public:
 			refresh();
 		}, lifetime());
 		refresh();
+		if (SceneVoiceAppeared && _extras->room()->sample()) {
+			// After the scene is laid out.
+			InvokeQueued(this, [=] {
+				Toast(_show, tr::lng_oblivion_rextra_voice_appeared(tr::now));
+			});
+		}
 	}
 
 private:
 	void refresh() {
 		const auto room = _extras->room();
 		const auto &voice = room->state().voice;
-		const auto has = voice.valid() && (room->state().gone == Gone::No);
+		// Only a link that is a voice chat for sure gives the button (and
+		// the toast): any other t.me link somebody has put into the room
+		// is as if there was none.
+		const auto has = ParseVoiceLink(voice.link).valid()
+			&& (room->state().gone == Gone::No);
 		setWanted(has);
 		if (has && !_had && voice.setBy != room->selfId()) {
 			Toast(_show, tr::lng_oblivion_rextra_voice_appeared(tr::now));
@@ -2032,6 +2365,7 @@ private:
 	};
 
 	[[nodiscard]] crl::time now() const;
+	[[nodiscard]] bool watched() const;
 	[[nodiscard]] QString nameOf(uint64 userId, const QString &name) const;
 	[[nodiscard]] double random();
 	void add(const Extras::Reaction &reaction);
@@ -2087,6 +2421,21 @@ ReactionsOverlay::ReactionsOverlay(QWidget *parent, TabContext context)
 
 crl::time ReactionsOverlay::now() const {
 	return _frozen ? _frozenNow : crl::now();
+}
+
+// Somebody can see the room now. While the window is hidden or minimized
+// or the app is locked, what the others send is neither shown nor asked
+// from Telegram: reactions and stickers live for a couple of seconds,
+// nothing of them is kept for later.
+bool ReactionsOverlay::watched() const {
+	if (_room->sample()) {
+		return true;
+	}
+	const auto top = window();
+	return isVisible()
+		&& top
+		&& !top->isMinimized()
+		&& !Core::App().passcodeLocked();
 }
 
 double ReactionsOverlay::random() {
@@ -2148,7 +2497,9 @@ void ReactionsOverlay::setSampleMoment(
 }
 
 void ReactionsOverlay::add(const Extras::Reaction &reaction) {
-	if (!reaction.emoji || int(_particles.size()) >= kParticlesLimit) {
+	if (!reaction.emoji
+		|| int(_particles.size()) >= kParticlesLimit
+		|| !watched()) {
 		return;
 	}
 	auto particle = Particle();
@@ -2172,7 +2523,10 @@ void ReactionsOverlay::add(const Extras::Reaction &reaction) {
 }
 
 void ReactionsOverlay::push(Extras::Thrown &&thrown) {
-	if (!_moment) {
+	if (!watched()) {
+		// Nothing is asked from Telegram for a sticker nobody sees.
+		return;
+	} else if (!_moment) {
 		startMoment(std::move(thrown));
 	} else if (int(_queue.size()) < kMomentQueueLimit) {
 		_queue.push_back(std::move(thrown));
@@ -2194,6 +2548,7 @@ void ReactionsOverlay::startMoment(Extras::Thrown &&thrown) {
 		_moment->waiting = false;
 	} else {
 		_extras->resolve(
+			thrown.userId,
 			thrown.sticker,
 			crl::guard(this, [=](DocumentData *document) {
 				if (_moment && _momentId == id) {
@@ -2287,7 +2642,9 @@ void ReactionsOverlay::checkLoaded() {
 
 void ReactionsOverlay::finishMoment() {
 	_moment = nullptr;
-	if (!_queue.empty()) {
+	if (!watched()) {
+		_queue.clear();
+	} else if (!_queue.empty()) {
 		auto next = std::move(_queue.front());
 		_queue.pop_front();
 		startMoment(std::move(next));
@@ -2384,6 +2741,9 @@ void ReactionsOverlay::paintMoment(QPainter &p, crl::time now) {
 		side * scale);
 	p.setOpacity(opacity);
 	auto painted = false;
+	// The name hangs right under what is really shown: the stand-in emoji
+	// is much smaller than a sticker.
+	auto shownHalf = side * scale / 2.;
 	if (playing) {
 		const auto document = moment.media->owner();
 		auto frame = moment.player->frame(
@@ -2408,6 +2768,7 @@ void ReactionsOverlay::paintMoment(QPainter &p, crl::time now) {
 				frame.image);
 			moment.player->markFrameShown();
 			painted = true;
+			shownHalf = fitted.height() / 2.;
 		}
 	}
 	if (!painted && moment.fallback) {
@@ -2419,10 +2780,11 @@ void ReactionsOverlay::paintMoment(QPainter &p, crl::time now) {
 			center.y() - size / 2.,
 			size,
 			size));
+		shownHalf = size / 2.;
 	}
 	PaintNameTag(
 		p,
-		QPointF(center.x(), center.y() + side / 2. + Scaled(6)),
+		QPointF(center.x(), center.y() + shownHalf + Scaled(8)),
 		moment.name,
 		moment.userId,
 		1.);
@@ -2491,10 +2853,14 @@ const auto MenuRegistration = MenuRegistrar([] {
 			const auto extras = ExtrasFor(room);
 			const auto show = context.show;
 			if (room->state().voice.valid()) {
-				menu->addAction(
-					tr::lng_oblivion_rextra_voice_open(tr::now),
-					[=] { extras->openVoice(show); },
-					&st::menuIconVideoChat);
+				// Something that is not a voice chat link can only be
+				// detached by the owner, never opened.
+				if (ParseVoiceLink(room->state().voice.link).valid()) {
+					menu->addAction(
+						tr::lng_oblivion_rextra_voice_open(tr::now),
+						[=] { extras->openVoice(show); },
+						&st::menuIconVideoChat);
+				}
 				if (room->owner()) {
 					menu->addAction(
 						tr::lng_oblivion_rextra_voice_detach(tr::now),
@@ -2691,6 +3057,124 @@ void TestCodec(Checker &check) {
 	check(!ParseRoomSticker(QJsonObject()), "an empty object is dropped");
 }
 
+// What the stickers of the others may cost this account.
+void TestLookups(Checker &check) {
+	const auto sticker = [](uint64 id, uint64 set = 77) {
+		auto result = RoomSticker();
+		result.documentId = id;
+		result.setId = set;
+		result.setAccessHash = 5;
+		return result;
+	};
+	auto now = crl::time(100'000);
+	{
+		auto lookups = StickerLookups();
+		const auto bogus = sticker(1001);
+		check(lookups.mayLook(1, bogus, now) && lookups.mayAsk(1, bogus, now),
+			"an unknown sticker is asked from Telegram");
+		check(lookups.mayLook(2, bogus, now) && !lookups.mayAsk(2, bogus, now),
+			"but not twice at a time");
+		lookups.finished(1, bogus, false, true);
+		check(!lookups.mayLook(1, bogus, now + 600'000)
+			&& !lookups.mayLook(2, bogus, now + 600'000),
+			"what Telegram does not know is never asked again");
+		check(lookups.mayLook(2, sticker(1001, 78), now),
+			"the same document of another set is another question");
+
+		const auto flaky = sticker(1002);
+		check(lookups.mayLook(1, flaky, now) && lookups.mayAsk(1, flaky, now),
+			"one more unknown sticker");
+		lookups.finished(1, flaky, false, false);
+		check(lookups.mayLook(1, flaky, now) && lookups.mayAsk(1, flaky, now),
+			"a network error is not an answer: it may be asked again");
+		lookups.finished(1, flaky, true, true);
+		check(lookups.mayLook(1, flaky, now + 1),
+			"a sticker that was found is known");
+
+		const auto bare = sticker(1003, 0);
+		check(lookups.mayLook(3, bare, now)
+			&& !lookups.mayAsk(3, bare, now)
+			&& !lookups.mayLook(3, bare, now),
+			"a sticker without a set can't be asked and is not looked at again");
+		auto custom = sticker(1004, 0);
+		custom.customEmoji = true;
+		check(lookups.mayLook(3, custom, now) && lookups.mayAsk(3, custom, now),
+			"a custom emoji needs no set");
+		lookups.forgetAsked();
+		check(lookups.mayAsk(4, custom, now),
+			"what was asked from a session that is gone can be asked again");
+	}
+	{
+		// A member who throws numbers that are not stickers.
+		auto lookups = StickerLookups();
+		auto asked = 0;
+		auto refusedAt = crl::time(0);
+		auto time = now;
+		for (auto i = 0; i != 400 && !refusedAt; ++i, time += 2000) {
+			const auto bogus = sticker(2000 + i);
+			if (!lookups.mayLook(7, bogus, time)) {
+				refusedAt = time;
+			} else if (lookups.mayAsk(7, bogus, time)) {
+				++asked;
+				lookups.finished(7, bogus, false, true);
+			}
+		}
+		check(asked == kResolveStrikes && refusedAt > 0,
+			"after a few stickers Telegram does not know a member is refused");
+		check(refusedAt - now <= 150'000,
+			"and that takes a couple of minutes at most");
+		check(!lookups.mayLook(7, sticker(9001), refusedAt + 86'400'000),
+			"for as long as the window lives");
+		check(lookups.mayLook(8, sticker(9001), refusedAt)
+			&& lookups.mayAsk(8, sticker(9001), refusedAt),
+			"the others are still asked for");
+		lookups.finished(8, sticker(9001), true, true);
+		check(lookups.mayLook(7, sticker(9001), refusedAt),
+			"and a sticker the app knows is shown whoever throws it");
+	}
+	{
+		// A member who throws real stickers as fast as he can.
+		auto lookups = StickerLookups();
+		auto looked = 0;
+		auto asked = 0;
+		for (auto i = 0; i != 1200; ++i) {
+			const auto time = now + i * 500;
+			const auto real = sticker(3000 + i);
+			if (lookups.mayLook(9, real, time)) {
+				++looked;
+				if (lookups.mayAsk(9, real, time)) {
+					++asked;
+					lookups.finished(9, real, true, true);
+				}
+			}
+		}
+		// Ten minutes: a burst and one a minute.
+		check(asked >= int(kResolveUserBurst) + 8
+			&& asked <= int(kResolveUserBurst) + 11,
+			"a member gets a few requests at once, then one a minute");
+		check(looked >= int(kLookUserBurst) + 25
+			&& looked <= int(kLookUserBurst) + 35,
+			"and a limited number of new documents is looked at");
+		check(lookups.mayLook(10, sticker(4000), now + 600'000)
+			&& lookups.mayAsk(10, sticker(4000), now + 600'000),
+			"another member is not affected by that");
+	}
+	{
+		// A lot of members at once.
+		auto lookups = StickerLookups();
+		auto asked = 0;
+		for (auto user = uint64(20); user != 60; ++user) {
+			const auto real = sticker(5000 + user);
+			if (lookups.mayLook(user, real, now)
+				&& lookups.mayAsk(user, real, now)) {
+				++asked;
+			}
+		}
+		check(asked == int(kResolveBurst),
+			"all the members together get a limited number of requests");
+	}
+}
+
 void TestVoice(Checker &check) {
 	check(VoiceInviteHash(u"https://t.me/+AbCdEf_12-xyz"_q)
 		== u"AbCdEf_12-xyz"_q, "a + link");
@@ -2711,6 +3195,82 @@ void TestVoice(Checker &check) {
 		&& VoiceInviteHash(u"https://t.me.evil.example/+AbCdEf_12"_q).isEmpty(),
 		"only https://t.me/");
 	check(VoiceInviteHash(QString()).isEmpty(), "nothing: nothing");
+
+	// What the «Голос» button takes for a voice chat: an invite link or
+	// the public link of a group, with the mark of a video chat at most.
+	const auto invite = [](const QString &link) {
+		const auto parsed = ParseVoiceLink(link);
+		return parsed.valid() && parsed.username.isEmpty()
+			? parsed.inviteHash
+			: QString();
+	};
+	const auto name = [](const QString &link) {
+		const auto parsed = ParseVoiceLink(link);
+		return parsed.valid() && parsed.inviteHash.isEmpty()
+			? parsed.username
+			: QString();
+	};
+	const auto refused = [](const QString &link) {
+		return !ParseVoiceLink(link).valid();
+	};
+	check(invite(u"https://t.me/+AbCdEf_12-xyz"_q) == u"AbCdEf_12-xyz"_q
+		&& invite(u"https://t.me/joinchat/AbCdEf_12-xyz"_q)
+			== u"AbCdEf_12-xyz"_q,
+		"an invite link is a voice chat link");
+	check(invite(u"https://t.me/+AbCdEf_12-xyz?videochat"_q)
+			== u"AbCdEf_12-xyz"_q
+		&& invite(u"https://t.me/+AbCdEf_12-xyz?voicechat=Xy_9-z"_q)
+			== u"AbCdEf_12-xyz"_q,
+		"the mark of a video chat may follow");
+	check(name(u"https://t.me/night_air_room"_q) == u"night_air_room"_q
+		&& name(u"https://t.me/Group2026?videochat"_q) == u"Group2026"_q
+		&& name(u"https://t.me/abcd?voicechat=AbC-12_x"_q) == u"abcd"_q,
+		"the public link of a group is a voice chat link");
+	check(refused(u"https://t.me/SomeBot?start=payload"_q)
+		&& refused(u"https://t.me/SomeBot?startapp=1"_q)
+		&& refused(u"https://t.me/SomeBot?startgroup=1"_q)
+		&& refused(u"https://t.me/SomeBot/app?startapp=1"_q)
+		&& refused(u"https://t.me/+AbCdEf_12-xyz?start=1"_q),
+		"a bot or a mini app link is refused");
+	check(refused(u"https://t.me/proxy?server=1.2.3.4&port=443&secret=ee"_q)
+		&& refused(u"https://t.me/socks?server=1.2.3.4&port=1080"_q)
+		&& refused(u"https://t.me/proxy"_q)
+		&& refused(u"https://t.me/share/url?url=https://evil.example"_q)
+		&& refused(u"https://t.me/share"_q)
+		&& refused(u"https://t.me/addstickers/Animals"_q)
+		&& refused(u"https://t.me/addlist/AbCdEfGh1234"_q)
+		&& refused(u"https://t.me/login/12345"_q)
+		&& refused(u"https://t.me/joinchat"_q)
+		&& refused(u"https://t.me/joinchat/"_q),
+		"the other things t.me has are refused");
+	check(refused(u"https://t.me/durov/123"_q)
+		&& refused(u"https://t.me/c/1234567890/45"_q)
+		&& refused(u"https://t.me/durov?videochat=1&start=2"_q)
+		&& refused(u"https://t.me/durov?videochat=a%20b"_q)
+		&& refused(u"https://t.me/durov?"_q)
+		&& refused(u"https://t.me/durov#x"_q)
+		&& refused(u"https://t.me/durov/"_q)
+		&& refused(u"https://t.me/"_q),
+		"a post, more parameters or a tail are refused");
+	check(refused(u"https://t.me/abc"_q)
+		&& refused(u"https://t.me/1group"_q)
+		&& refused(u"https://t.me/_group"_q)
+		&& refused(u"https://t.me/my group"_q)
+		&& refused(u"https://t.me/my-group"_q)
+		&& refused(u"https://t.me/"_q + QString(33, QChar('a')))
+		&& refused(QString::fromUtf8("https://t.me/группа"))
+		&& refused(u"https://t.me/+79991234567"_q)
+		&& refused(u"https://t.me/+short"_q),
+		"what can't be the name of a group or an invite is refused");
+	check(refused(u"http://t.me/night_air_room"_q)
+		&& refused(u"https://T.me/night_air_room"_q)
+		&& refused(u"https://telegram.me/night_air_room"_q)
+		&& refused(u"https://t.me.evil.example/night_air_room"_q)
+		&& refused(u"tg://resolve?domain=night_air_room"_q)
+		&& refused(u" https://t.me/night_air_room"_q)
+		&& refused(u"https://t.me/+"_q + QString(300, QChar('a')))
+		&& refused(QString()),
+		"only https://t.me/ and not too long");
 }
 
 // ---- Snapshot scenes (OBLIVION_SELFTEST=ui).
@@ -2761,6 +3321,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 				tab);
 			OverlaySceneSetup = nullptr;
 			ScenePanelOpen = false;
+			SceneVoiceAppeared = false;
 			return result;
 		});
 	};
@@ -2792,7 +3353,12 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		overlay->freeze();
 		overlay->setSampleMoment(kSampleThird, "😎", 0.5);
 	}, u"chat"_q);
-	scene(u"room_extras_voice"_q, size, false, false, withVoice, nullptr);
+	// A member right after the owner has attached the voice chat.
+	scene(u"room_extras_voice"_q, size, false, false, [=](
+			Room::Descriptor &descriptor) {
+		withVoice(descriptor);
+		SceneVoiceAppeared = true;
+	}, nullptr);
 	scene(u"room_extras_voice_owner"_q, narrow, true, false, withVoice, nullptr);
 
 	const auto boxSize = QSize(st::boxWideWidth * 2, 0);
@@ -2953,28 +3519,79 @@ QJsonObject SerializeRoomSticker(const RoomSticker &sticker) {
 	return result;
 }
 
-QString VoiceInviteHash(const QString &link) {
+VoiceLink ParseVoiceLink(const QString &link) {
 	const auto prefix = u"https://t.me/"_q;
-	if (!link.startsWith(prefix)) {
-		return QString();
+	if (!link.startsWith(prefix) || link.size() > 256) {
+		return {};
 	}
 	auto rest = link.mid(prefix.size());
 	const auto query = rest.indexOf(QChar('?'));
 	if (query >= 0) {
+		// Only the mark of a video chat link, nothing a bot, a mini app
+		// or a proxy link would carry.
+		const auto param = rest.mid(query + 1);
+		const auto equals = param.indexOf(QChar('='));
+		const auto name = (equals >= 0) ? param.left(equals) : param;
+		const auto value = (equals >= 0) ? param.mid(equals + 1) : QString();
+		if ((name != u"videochat"_q && name != u"voicechat"_q)
+			|| value.size() > 64
+			|| !OnlyOf(value, HashChar)) {
+			return {};
+		}
 		rest = rest.left(query);
 	}
-	const auto hash = rest.startsWith(QChar('+'))
-		? rest.mid(1)
-		: rest.startsWith(u"joinchat/"_q)
-		? rest.mid(9)
-		: QString();
-	if (hash.size() < 8
-		|| hash.size() > 64
-		|| !OnlyOf(hash, HashChar)
-		|| OnlyOf(hash, DigitChar)) {
-		return QString();
+	const auto plus = rest.startsWith(QChar('+'));
+	if (plus || rest.startsWith(u"joinchat/"_q)) {
+		// A phone number looks like "+digits" too.
+		const auto hash = rest.mid(plus ? 1 : 9);
+		if (hash.size() < 8
+			|| hash.size() > 64
+			|| !OnlyOf(hash, HashChar)
+			|| OnlyOf(hash, DigitChar)) {
+			return {};
+		}
+		return { .inviteHash = hash };
 	}
-	return hash;
+	// The name of a public group: a letter, then letters, digits and
+	// underscores, nothing after it. The words t.me keeps for itself are
+	// not names.
+	static const auto Reserved = std::array{
+		u"joinchat"_q,
+		u"addstickers"_q,
+		u"addemoji"_q,
+		u"addtheme"_q,
+		u"addlist"_q,
+		u"setlanguage"_q,
+		u"confirmphone"_q,
+		u"share"_q,
+		u"proxy"_q,
+		u"socks"_q,
+		u"login"_q,
+		u"invoice"_q,
+		u"giftcode"_q,
+		u"boost"_q,
+		u"contact"_q,
+		u"stars"_q,
+		u"call"_q,
+		u"iv"_q,
+		u"msg"_q,
+		u"nft"_q,
+	};
+	const auto first = rest.isEmpty() ? ushort(0) : rest.front().unicode();
+	const auto letter = (first >= 'a' && first <= 'z')
+		|| (first >= 'A' && first <= 'Z');
+	if (!letter
+		|| rest.size() < 4
+		|| rest.size() > 32
+		|| !OnlyOf(rest, NameChar)
+		|| ranges::contains(Reserved, rest.toLower())) {
+		return {};
+	}
+	return { .username = rest };
+}
+
+QString VoiceInviteHash(const QString &link) {
+	return ParseVoiceLink(link).inviteHash;
 }
 
 bool RunExtrasSelfTest(QStringList &log) {
@@ -2983,6 +3600,8 @@ bool RunExtrasSelfTest(QStringList &log) {
 	check.section("reaction rate limits");
 	TestCodec(check);
 	check.section("reaction and sticker codec");
+	TestLookups(check);
+	check.section("sticker lookups");
 	TestVoice(check);
 	check.section("voice links");
 	log.push_back(u"room_extras: %1 checks, %2 failed"_q.arg(

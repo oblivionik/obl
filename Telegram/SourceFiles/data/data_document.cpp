@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_document.h"
 
+#include "oblivion/oblivion_cloud_share.h" // Oblivion
 #include "oblivion/oblivion_sticker_export.h" // Oblivion
 
 #include "data/data_document_resolver.h"
@@ -1316,6 +1317,11 @@ void DocumentData::handleLoaderUpdates() {
 			&& Oblivion::StickerExport::QuietLoad(this)) {
 			// Oblivion: a load into memory that the sticker export waits
 			// for is reported by the export itself, without the retry box.
+		} else if (error.started
+			&& _loader
+			&& Oblivion::Share::QuietLoad(this)) {
+			// Oblivion: a file taken for «Поделиться» of a playlist, the
+			// upload counts the track as skipped itself.
 		} else if (error.started && _loader) {
 			const auto origin = _loader->fileOrigin();
 			const auto failedFileName = _loader->fileName();

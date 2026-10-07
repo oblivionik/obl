@@ -288,6 +288,11 @@ const LangOverride kAppIcon[] = {
 	{ "lng_oblivion_app_icon_default", "Oblivion" },
 	{ "lng_oblivion_app_icon_telegram", "Telegram" },
 	{ "lng_oblivion_app_icon_previous", "Прежняя" },
+	{ "lng_oblivion_app_icon_eclipse", "Затмение" },
+	{ "lng_oblivion_app_icon_portal", "Портал" },
+	{ "lng_oblivion_app_icon_ghost", "Призрак" },
+	{ "lng_oblivion_app_icon_shadow", "Тень" },
+	{ "lng_oblivion_app_icon_horizon", "Горизонт" },
 	{ "lng_oblivion_app_icon_custom", "Своё изображение…" },
 	{ "lng_oblivion_app_icon_reset", "Вернуть стандартную" },
 	{ "lng_oblivion_app_icon_custom_short", "Своя" },
@@ -4574,24 +4579,28 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_cloud_soon", "Этот раздел пока не готов." },
 	{
 		"lng_oblivion_cloud_consent_about",
-		"Комнаты, общие плейлисты, значок и всё остальное, что вы делаете "
-		"вместе с другими людьми, работает через Oblivion Cloud. Это "
-		"собственный сервер разработчика Oblivion, а не часть Telegram.",
+		"Комнаты, общие плейлисты, значок и всё, что вы делаете вместе "
+		"с другими, работает через Oblivion Cloud. Это сервер разработчика "
+		"Oblivion, а не часть Telegram.",
 	},
 	{ "lng_oblivion_cloud_consent_sent_title", "Что отправляется" },
 	{
 		"lng_oblivion_cloud_consent_sent",
-		"Числовой ID аккаунта Telegram {name}, имя и картинка, которые вы "
-		"сами выберете для Oblivion, название этого устройства и то, что "
-		"вы сами делаете в облаке: комнаты, плейлисты и наборы, которыми "
-		"делитесь. Пока Oblivion Cloud включён, сервер видит ваш IP-адрес "
-		"и то, что приложение запущено.",
+		// Every line is a row of the list in the consent box.
+		"Числовой ID аккаунта Telegram {name}\n"
+		"Имя и картинка, которые вы сами выберете для Oblivion\n"
+		"Название этого устройства\n"
+		"То, что вы сами делаете в облаке: комнаты, плейлисты и наборы, "
+		"которыми делитесь\n"
+		"Пока Oblivion Cloud включён, сервер видит ваш IP-адрес и то, что "
+		"приложение запущено",
 	},
 	{ "lng_oblivion_cloud_consent_not_title", "Что не отправляется" },
 	{
 		"lng_oblivion_cloud_consent_not",
-		"Ваши сообщения и чаты, список контактов, номер телефона, пароль "
-		"и ключи входа в Telegram.",
+		"Ваши сообщения и чаты\n"
+		"Список контактов и номер телефона\n"
+		"Пароль и ключи входа в Telegram",
 	},
 	{
 		"lng_oblivion_cloud_consent_off",
@@ -4624,8 +4633,10 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_cloud_link_expired",
-		"Срок действия кода истёк. Нажмите «Новый код».",
+		"Код истёк. Нажмите «Новый код».",
 	},
+	{ "lng_oblivion_cloud_off_title", "Отключить Oblivion Cloud?" },
+	{ "lng_oblivion_cloud_delete_title", "Удалить данные с сервера?" },
 	{ "lng_oblivion_cloud_link_copy", "Скопировать" },
 	{ "lng_oblivion_cloud_link_copied", "Код скопирован." },
 	{ "lng_oblivion_cloud_link_new", "Новый код" },
@@ -4657,8 +4668,15 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_cloud_code_lost",
-		"Если устройства с Oblivion больше нет, попросите разработчика "
-		"Oblivion сбросить привязку.",
+		"Если устройства с Oblivion больше нет, попросите у разработчика "
+		"Oblivion одноразовый код.",
+	},
+	{
+		"lng_oblivion_cloud_code_reserved_about",
+		"Данные этого аккаунта Telegram хранятся в Oblivion Cloud, но к "
+		"нему больше не привязано ни одного устройства: так бывает после "
+		"выхода из Telegram. Попросите у разработчика Oblivion одноразовый "
+		"код и введите его здесь.",
 	},
 	{
 		"lng_oblivion_cloud_error_off",
@@ -4732,6 +4750,13 @@ const LangOverride kRound5[] = {
 		"устройстве. Получите там код и нажмите «Ввести код с другого "
 		"устройства».",
 	},
+	{
+		"lng_oblivion_cloud_status_reserved_about",
+		"Данные этого аккаунта хранятся в Oblivion Cloud, но к нему больше "
+		"не привязано ни одного устройства: так бывает после выхода из "
+		"Telegram. Попросите у разработчика Oblivion одноразовый код и "
+		"нажмите «Ввести код с другого устройства».",
+	},
 	{ "lng_oblivion_cloud_status_connecting", "Подключение…" },
 	{
 		"lng_oblivion_cloud_status_connecting_about",
@@ -4740,7 +4765,7 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_cloud_status_online", "Подключено" },
 	{
 		"lng_oblivion_cloud_status_online_as",
-		"Другие участники комнат видят вас как {name}.",
+		"Другие участники комнат видят вас под именем «{name}».",
 	},
 	{
 		"lng_oblivion_cloud_status_online_noname",
@@ -4756,10 +4781,10 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_cloud_on_done", "Oblivion Cloud подключён." },
 	{
 		"lng_oblivion_cloud_off_sure",
-		"Отключить Oblivion Cloud для этого аккаунта? Ваши данные "
+		"Oblivion Cloud будет отключён для этого аккаунта. Ваши данные "
 		"останутся на сервере, а ключ этого устройства — на этом "
-		"компьютере, чтобы можно было подключиться снова. Чтобы стереть "
-		"всё, выберите «Удалить мои данные с сервера».",
+		"компьютере, чтобы можно было подключиться снова.\n\n"
+		"Чтобы стереть всё, выберите «Удалить мои данные с сервера».",
 	},
 	{ "lng_oblivion_cloud_off_confirm", "Отключить" },
 	{
@@ -4768,9 +4793,9 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_cloud_delete_sure",
-		"Удалить всё, что Oblivion Cloud хранит об этом аккаунте? Имя "
-		"и картинка, профиль, ваши комнаты, общие плейлисты и наборы, "
-		"копия настроек и все привязанные устройства будут стёрты сразу. "
+		"Сразу будет стёрто всё, что Oblivion Cloud хранит об этом "
+		"аккаунте: имя и картинка, профиль, ваши комнаты, общие плейлисты "
+		"и наборы, копия настроек и все привязанные устройства.\n\n"
 		"Отменить это нельзя.",
 	},
 	{ "lng_oblivion_cloud_delete_confirm", "Удалить" },
@@ -4795,7 +4820,10 @@ const LangOverride kRound5[] = {
 		"lng_oblivion_cloud_section_about",
 		"Oblivion Cloud — сервер разработчика Oblivion для комнат, общих "
 		"плейлистов и наборов, значка и профилей. Включается отдельно для "
-		"каждого аккаунта Telegram и только после вашего согласия.",
+		"каждого аккаунта Telegram и только после вашего согласия. Выход "
+		"из Telegram на этом компьютере только отвязывает этот компьютер "
+		"от Oblivion Cloud: ваши данные остаются на сервере, пока вы сами "
+		"их не удалите, а чтобы подключиться снова, понадобится код.",
 	},
 	// Oblivion round 5: rooms.
 	{ "lng_oblivion_room_section", "Вместе" },
@@ -4814,10 +4842,7 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_room_members_count#many", "{count} участников" },
 	{ "lng_oblivion_room_members_count#other", "{count} участника" },
 	{ "lng_oblivion_room_header_status", "{members} · {online} в сети" },
-	{
-		"lng_oblivion_room_connecting",
-		"Нет связи с сервером. Переподключаемся…",
-	},
+	{ "lng_oblivion_room_connecting", "Нет связи, переподключаемся…" },
 	{ "lng_oblivion_room_copy_link", "Скопировать ссылку" },
 	{ "lng_oblivion_room_copy_code", "Скопировать код" },
 	{ "lng_oblivion_room_link_copied", "Ссылка на комнату скопирована." },
@@ -4907,6 +4932,10 @@ const LangOverride kRound5[] = {
 		"Сделать {name} владельцем комнаты? Вы останетесь участником.",
 	},
 	{ "lng_oblivion_room_member_kick", "Исключить" },
+	{
+		"lng_oblivion_room_member_kick_sure",
+		"Исключить {name} из комнаты? По ссылке можно будет войти снова.",
+	},
 	{ "lng_oblivion_room_member_ban", "Исключить и заблокировать" },
 	{
 		"lng_oblivion_room_member_ban_sure",
@@ -4924,14 +4953,10 @@ const LangOverride kRound5[] = {
 		"Вы пока не состоите ни в одной комнате. Создайте свою или "
 		"войдите по ссылке друга.",
 	},
-	{ "lng_oblivion_room_list_row", "{title} · {members}" },
-	{
-		"lng_oblivion_room_list_row_owner",
-		"{title} · ваша комната · {members}",
-	},
+	{ "lng_oblivion_room_list_yours", "Ваша комната" },
+	{ "lng_oblivion_room_list_online", "{online} в сети" },
 	{ "lng_oblivion_room_list_create", "Создать комнату" },
 	{ "lng_oblivion_room_list_join_placeholder", "Ссылка или код комнаты" },
-	{ "lng_oblivion_room_list_join", "Войти по ссылке" },
 	{
 		"lng_oblivion_room_list_bad_code",
 		"Это не похоже на ссылку или код комнаты.",
@@ -5001,7 +5026,7 @@ const LangOverride kRound5[] = {
 		"Файл слишком большой: в комнату можно отправить до {size} МБ.",
 	},
 	{ "lng_oblivion_room_untitled", "Без названия" },
-	{ "lng_oblivion_room_open_as_room", "Открыть как комнату" },
+	{ "lng_oblivion_room_open_as_room", "В комнату" },
 	// Oblivion round 5: room music.
 	{ "lng_oblivion_rmusic_tab", "Музыка" },
 	{ "lng_oblivion_rmusic_queue", "Очередь" },
@@ -5011,8 +5036,24 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_rmusic_add_files", "Файлы с компьютера…" },
 	{ "lng_oblivion_rmusic_add_files_title", "Выберите музыку" },
 	{ "lng_oblivion_rmusic_add_to_room", "Добавить в комнату" },
-	{ "lng_oblivion_rmusic_added_by", "от {name}" },
+	{ "lng_oblivion_rmusic_added_by", "Ставит {name}" },
 	{ "lng_oblivion_rmusic_added_toast", "Трек отправляется в комнату." },
+	{
+		"lng_oblivion_rmusic_batch_toast#one",
+		"{count} трек отправляется в комнату.",
+	},
+	{
+		"lng_oblivion_rmusic_batch_toast#few",
+		"{count} трека отправляются в комнату.",
+	},
+	{
+		"lng_oblivion_rmusic_batch_toast#many",
+		"{count} треков отправляются в комнату.",
+	},
+	{
+		"lng_oblivion_rmusic_batch_toast#other",
+		"{count} трека отправляются в комнату.",
+	},
 	{ "lng_oblivion_rmusic_clear", "Очистить очередь" },
 	{
 		"lng_oblivion_rmusic_clear_sure",
@@ -5068,8 +5109,8 @@ const LangOverride kRound5[] = {
 		"lng_oblivion_rmusic_playlist_empty",
 		"В этом плейлисте пока нет треков.",
 	},
-	{ "lng_oblivion_rmusic_playlist_loading", "{track} — загружается…" },
-	{ "lng_oblivion_rmusic_playlist_unavailable", "{track} — недоступен" },
+	{ "lng_oblivion_rmusic_playlist_wait", "загружается…" },
+	{ "lng_oblivion_rmusic_playlist_gone", "недоступен" },
 	{ "lng_oblivion_rmusic_preparing", "Подготовка…" },
 	{ "lng_oblivion_rmusic_uploading", "Отправка в комнату… {percent}%" },
 	{
@@ -5077,6 +5118,7 @@ const LangOverride kRound5[] = {
 		"За один раз добавляется не больше 20 треков.",
 	},
 	{ "lng_oblivion_rmusic_rejoin", "Вернуться в эфир" },
+	{ "lng_oblivion_rmusic_retry", "Повторить загрузку" },
 	{ "lng_oblivion_rmusic_row_play", "Играть сейчас" },
 	{ "lng_oblivion_rmusic_row_next", "Играть следующим" },
 	{ "lng_oblivion_rmusic_row_up", "Выше" },
@@ -5152,6 +5194,10 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_rvideo_state_buffering", "Буферизация… {percent}%" },
 	{ "lng_oblivion_rvideo_state_failed", "Не удалось загрузить видео" },
 	{
+		"lng_oblivion_rvideo_state_no_space",
+		"Для этого видео не хватает места на диске",
+	},
+	{
 		"lng_oblivion_rvideo_state_unplayable",
 		"Это видео не удаётся воспроизвести",
 	},
@@ -5176,14 +5222,17 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_rvideo_in_fullscreen",
-		"Видео показывается на весь экран",
+		"Видео открыто на весь экран",
 	},
 	// Oblivion round 5: room canvas.
 	{ "lng_oblivion_rcanvas_tab", "Холст" },
 	{ "lng_oblivion_rcanvas_status_loading", "Загружаем холст…" },
+	{ "lng_oblivion_rcanvas_status_failed", "Не удалось загрузить холст." },
+	{ "lng_oblivion_rcanvas_retry", "Повторить" },
+	{ "lng_oblivion_rcanvas_empty", "Холст пока чистый" },
 	{
-		"lng_oblivion_rcanvas_status_failed",
-		"Не удалось загрузить холст. Нажмите здесь, чтобы повторить.",
+		"lng_oblivion_rcanvas_empty_about",
+		"Всё, что здесь рисуют, сразу видят все в комнате.",
 	},
 	{
 		"lng_oblivion_rcanvas_status_offline",
@@ -5253,12 +5302,10 @@ const LangOverride kRound5[] = {
 	{
 		"lng_oblivion_rextra_voice_create_about",
 		"Oblivion создаст в вашем аккаунте Telegram закрытую группу "
-		"«{title}», получит ссылку-приглашение в неё и покажет всем "
-		"участникам комнаты кнопку голосового чата (микрофон вверху "
-		"окна).\n\nЗатем Telegram запустит в этой группе видеочат, и вы "
-		"войдёте в него с выключенным микрофоном. Другие люди попадут в "
-		"группу, только когда сами нажмут эту кнопку и подтвердят "
-		"вступление в Telegram.\n\nУдалить группу можно в Telegram в "
+		"«{title}» и запустит в ней видеочат. Вы войдёте в него с "
+		"выключенным микрофоном.\n\nУ всех в комнате вверху окна появится "
+		"кнопка с микрофоном. В группу попадёт только тот, кто сам нажмёт "
+		"её и подтвердит вступление в Telegram.\n\nУдалить группу можно в "
 		"любой момент.",
 	},
 	{ "lng_oblivion_rextra_voice_create_button", "Создать группу" },
@@ -5288,13 +5335,14 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_rextra_voice_attach_title", "Привязать группу" },
 	{
 		"lng_oblivion_rextra_voice_attach_about",
-		"Выберите свою группу с видеочатом. Все в комнате получат "
-		"ссылку-приглашение в неё по кнопке с микрофоном.",
+		"Выберите свою группу с видеочатом. Все в комнате смогут войти в "
+		"неё по кнопке с микрофоном.",
 	},
 	{
 		"lng_oblivion_rextra_voice_attach_empty",
-		"В вашем списке чатов нет групп, где вы можете создавать "
-		"ссылки-приглашения.",
+		"У вас нет групп, в которые вы можете приглашать по ссылке.\n\n"
+		"Выберите в меню комнаты «Создать голосовой чат…» — Oblivion сам "
+		"создаст для него новую группу.",
 	},
 	{ "lng_oblivion_rextra_voice_attach_public", "Публичная группа" },
 	{
@@ -5332,6 +5380,11 @@ const LangOverride kRound5[] = {
 		"lng_oblivion_rextra_voice_appeared",
 		"В комнате появился голосовой чат: нажмите на микрофон вверху "
 		"окна.",
+	},
+	{
+		"lng_oblivion_rextra_voice_not_group",
+		"Ссылка голосового чата этой комнаты ведёт не в группу Telegram, "
+		"поэтому она не открыта.",
 	},
 	// Oblivion round 5: social.
 	{ "lng_oblivion_social_section", "Профиль и видимость" },
@@ -5375,9 +5428,9 @@ const LangOverride kRound5[] = {
 		"lng_oblivion_social_badge_confirm",
 		"Рядом с вашим именем появится значок. Его увидят все, кто "
 		"пользуется Oblivion, и поймут, что этот аккаунт тоже использует "
-		"Oblivion. Это не галочка Telegram, в обычных приложениях Telegram "
-		"ничего не изменится. Текст «О себе» для значка больше не "
-		"меняется.",
+		"Oblivion.\n\n"
+		"Это не галочка Telegram: в обычных приложениях Telegram ничего "
+		"не изменится. Текст «О себе» для значка больше не меняется.",
 	},
 	{ "lng_oblivion_social_badge_confirm_enable", "Включить" },
 	{
@@ -5420,8 +5473,8 @@ const LangOverride kRound5[] = {
 	{
 		"lng_oblivion_social_marker_about",
 		"Раньше Oblivion хранил значок в виде невидимой метки в конце "
-		"«О себе». Она больше не нужна и всё ещё есть в «О себе» этого "
-		"аккаунта.",
+		"«О себе». Метка больше не нужна, но всё ещё осталась в «О себе» "
+		"этого аккаунта. Убрать её?",
 	},
 	{
 		"lng_oblivion_social_chip_hint_nobody",
@@ -5463,15 +5516,24 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_social_shared_photo", "фото" },
 	{ "lng_oblivion_social_shared_video", "видео" },
 	{ "lng_oblivion_social_editor_preview", "Так это увидят другие" },
+	{
+		"lng_oblivion_social_editor_preview_empty",
+		"Добавьте статус, и этот блок появится в вашем профиле.",
+	},
 	{ "lng_oblivion_social_editor_name", "Имя в Oblivion" },
 	{ "lng_oblivion_social_editor_status", "Статус" },
 	{ "lng_oblivion_social_editor_emoji", "Эмодзи статуса" },
-	{ "lng_oblivion_social_editor_accent", "Цвет акцента" },
+	{ "lng_oblivion_social_editor_accent", "Цвет профиля" },
+	{
+		"lng_oblivion_social_editor_accent_about",
+		"Этим цветом в профиле выделяются ваша активность («слушает», "
+		"«в комнате») и метка блока Oblivion.",
+	},
 	{ "lng_oblivion_social_editor_shared", "Показывать в профиле" },
 	{
 		"lng_oblivion_social_editor_shared_about",
-		"Плейлисты и наборы эффектов, которыми вы поделились. Включённые "
-		"видны в вашем профиле тем, кто его видит.",
+		"Включённое здесь показывается в вашем профиле — только тем, кто "
+		"видит профиль.",
 	},
 	{
 		"lng_oblivion_social_editor_shared_empty",
@@ -5483,7 +5545,8 @@ const LangOverride kRound5[] = {
 	{
 		"lng_oblivion_social_editor_photo_about",
 		"Фото видят участники ваших комнат и те, кому виден ваш профиль. "
-		"Оно отправляется на сервер Oblivion только по вашему клику.",
+		"Оно отправляется на сервер Oblivion, только когда вы сами "
+		"нажимаете кнопку выше.",
 	},
 	{
 		"lng_oblivion_social_editor_photo_none",
@@ -5517,16 +5580,17 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_social_friends_hidden",
-		"Ваш профиль сейчас скрыт от всех. Чтобы друзья могли найти вас, "
-		"выберите, кто его видит.",
+		"Ваш профиль сейчас скрыт от всех. Чтобы друзья могли вас найти, "
+		"выберите круг в пункте «Кто видит мой профиль»: Настройки > "
+		"Oblivion.",
 	},
 	{ "lng_oblivion_social_friends_plain", "пользуется Oblivion" },
 	{
 		"lng_oblivion_social_chosen_about",
-		"Люди, которых вы выбираете сами. Если выбрано «Выбранные люди», "
-		"ваш профиль или активность видят только они. Список хранится на "
-		"сервере Oblivion для этого аккаунта. Список ваших контактов "
-		"никуда не отправляется.",
+		"Люди, которых вы выбираете сами. Когда в настройках выбрано "
+		"«Выбранные люди», ваш профиль или активность видят только они. "
+		"Этот список хранится на сервере Oblivion, а список ваших "
+		"контактов никуда не отправляется.",
 	},
 	{ "lng_oblivion_social_chosen_empty", "Пока никто не выбран." },
 	{ "lng_oblivion_social_chosen_add", "Добавить людей" },
@@ -5537,6 +5601,41 @@ const LangOverride kRound5[] = {
 		"Список выбранных людей заполнен.",
 	},
 	{ "lng_oblivion_social_chosen_add_title", "Добавить в выбранные" },
+	{
+		"lng_oblivion_social_editor_gallery",
+		"Показывать всем в «Общих наборах»",
+	},
+	{
+		"lng_oblivion_social_editor_gallery_about",
+		"Включённый здесь набор видят в «Общих наборах» все, кто пользуется "
+		"Oblivion, вместе с вашим именем в Oblivion — кому бы ни был открыт "
+		"ваш профиль. Он же показывается в вашем профиле. Выключите, чтобы "
+		"убрать набор из «Общих наборов» и из профиля; ссылка на него "
+		"продолжит работать.",
+	},
+	{
+		"lng_oblivion_social_editor_gallery_apart",
+		"Включённый здесь набор видят в «Общих наборах» все, кто пользуется "
+		"Oblivion, вместе с вашим именем в Oblivion — кому бы ни был открыт "
+		"ваш профиль. Выключите, чтобы убрать набор из «Общих наборов»; "
+		"ссылка на него продолжит работать.",
+	},
+	{ "lng_oblivion_social_gallery_confirm_title", "Показать всем?" },
+	{
+		"lng_oblivion_social_gallery_confirm",
+		"Набор «{title}» появится в «Общих наборах» у всех, кто пользуется "
+		"Oblivion, и рядом с ним будет ваше имя в Oblivion. Это не зависит "
+		"от того, кто видит ваш профиль.",
+	},
+	{ "lng_oblivion_social_gallery_confirm_yes", "Показать всем" },
+	{
+		"lng_oblivion_social_settings_left",
+		"Oblivion Cloud для этого аккаунта отключён, но на сервере остаётся "
+		"то, что показано выше, и другие люди по-прежнему это видят. Чтобы "
+		"что-то скрыть или изменить, нажмите на нужный пункт: Oblivion "
+		"предложит подключиться снова и после этого изменит настройку на "
+		"сервере.",
+	},
 	// Oblivion round 5: share.
 	{ "lng_oblivion_share_playlist_menu", "Поделиться…" },
 	{ "lng_oblivion_share_library", "Общие плейлисты" },
@@ -5547,28 +5646,28 @@ const LangOverride kRound5[] = {
 		"в меню «Поделиться…».",
 	},
 	{ "lng_oblivion_share_library_empty", "Здесь пока ничего нет." },
-	{ "lng_oblivion_share_library_loading", "Загружаю список…" },
+	{ "lng_oblivion_share_library_loading", "Загрузка списка…" },
 	{
 		"lng_oblivion_share_playlist_empty",
 		"В этом плейлисте пока нет треков.",
 	},
 	{
 		"lng_oblivion_share_playlist_sure",
-		"Загрузить плейлист {name} в Oblivion Cloud? Его музыка ({tracks}) "
-		"будет отправлена на сервер разработчика Oblivion. Слушать её "
-		"сможет любой, у кого есть ссылка.",
+		"Загрузить плейлист «{name}» в Oblivion Cloud? Его музыка "
+		"({tracks}) будет отправлена на сервер разработчика Oblivion. "
+		"Слушать её сможет любой, у кого есть ссылка.",
 	},
 	{
 		"lng_oblivion_share_playlist_new_sure",
-		"Плейлистом {name} вы уже поделились. Загрузить в него то, что "
+		"Плейлистом «{name}» вы уже поделились. Загрузить в него то, что "
 		"появилось нового ({tracks})?",
 	},
 	{ "lng_oblivion_share_playlist_upload", "Загрузить" },
 	{ "lng_oblivion_share_upload_title", "Загрузка плейлиста" },
 	{ "lng_oblivion_share_upload_track", "Трек {index} из {total}" },
-	{ "lng_oblivion_share_upload_fetch", "Получаю файл…" },
-	{ "lng_oblivion_share_upload_send", "Отправляю на сервер…" },
-	{ "lng_oblivion_share_upload_add", "Добавляю в плейлист…" },
+	{ "lng_oblivion_share_upload_fetch", "Получение файла…" },
+	{ "lng_oblivion_share_upload_send", "Отправка на сервер…" },
+	{ "lng_oblivion_share_upload_add", "Добавление в плейлист…" },
 	{
 		"lng_oblivion_share_upload_skipped#one",
 		"Пропущен {count} трек: файл недоступен, защищён от копирования "
@@ -5663,18 +5762,26 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_share_error_daily",
-		"Достигнут дневной лимит загрузки ({size}). Продолжите завтра.",
+		"Достигнут дневной лимит загрузки: {size} в сутки на один аккаунт, "
+		"и есть общий лимит для всех, кто в одной сети с вами. Продолжите "
+		"завтра.",
 	},
 	{
 		"lng_oblivion_share_error_uploads",
 		"Слишком много незавершённых загрузок. Попробуйте чуть позже.",
 	},
 	{
+		"lng_oblivion_share_error_user_tracks",
+		"Вы добавили слишком много треков в общие плейлисты: для одного "
+		"аккаунта есть ограничение. Удалите ненужные треки из своих общих "
+		"плейлистов и попробуйте ещё раз.",
+	},
+	{
 		"lng_oblivion_share_error_gone",
 		"Этого плейлиста на сервере больше нет.",
 	},
 	{ "lng_oblivion_share_view_title", "Общий плейлист" },
-	{ "lng_oblivion_share_view_by", "от {name}" },
+	{ "lng_oblivion_share_view_by", "автор: {name}" },
 	{ "lng_oblivion_share_view_yours", "ваш" },
 	{ "lng_oblivion_share_view_followers#one", "{count} слушатель" },
 	{ "lng_oblivion_share_view_followers#few", "{count} слушателя" },
@@ -5689,8 +5796,8 @@ const LangOverride kRound5[] = {
 		"устройство.",
 	},
 	{ "lng_oblivion_share_view_unkept", "Плейлист убран из ваших." },
-	{ "lng_oblivion_share_view_keeping", "сохранено {ready} из {total}" },
-	{ "lng_oblivion_share_view_kept_all", "на этом устройстве" },
+	{ "lng_oblivion_share_view_keeping", "скачано {ready} из {total}" },
+	{ "lng_oblivion_share_view_kept_all", "скачан" },
 	{ "lng_oblivion_share_view_collab", "Другие могут добавлять треки" },
 	{ "lng_oblivion_share_view_add_files", "Добавить треки из файлов…" },
 	{ "lng_oblivion_share_view_delete", "Удалить с сервера" },
@@ -5701,7 +5808,7 @@ const LangOverride kRound5[] = {
 	},
 	{ "lng_oblivion_share_view_deleted", "Плейлист удалён с сервера." },
 	{ "lng_oblivion_share_view_remove_track", "Убрать из плейлиста" },
-	{ "lng_oblivion_share_view_loading", "Загружаю плейлист…" },
+	{ "lng_oblivion_share_view_loading", "Плейлист загружается…" },
 	{ "lng_oblivion_share_view_empty", "Здесь пока нет треков." },
 	{
 		"lng_oblivion_share_view_about",
@@ -5778,7 +5885,7 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_share_gallery_title", "Общие наборы" },
 	{ "lng_oblivion_share_gallery_new", "Новые" },
 	{ "lng_oblivion_share_gallery_top", "Популярные" },
-	{ "lng_oblivion_share_gallery_loading", "Загружаю наборы…" },
+	{ "lng_oblivion_share_gallery_loading", "Загрузка наборов…" },
 	{
 		"lng_oblivion_share_gallery_empty",
 		"Здесь пока никто не поделился набором. Будьте первым: "
@@ -5790,11 +5897,12 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_share_gallery_uses#many", "применили {count} раз" },
 	{ "lng_oblivion_share_gallery_uses#other", "применили {count} раза" },
 	{ "lng_oblivion_share_preset_apply", "Применить" },
-	{ "lng_oblivion_share_preset_keep", "Сохранить к себе" },
+	{ "lng_oblivion_share_preset_keep", "Сохранить" },
 	{
 		"lng_oblivion_share_preset_kept_hint",
-		"Набор лежит в «Моих наборах»: кнопка «Наборы» у эффектов в "
-		"редакторе фото и «Заготовки» в редакторе видео.",
+		"Набор сохранён в «Мои наборы». Они открываются кнопкой «Наборы» "
+		"у эффектов в редакторе фото и кнопкой «Заготовки» в редакторе "
+		"видео.",
 	},
 	{ "lng_oblivion_share_preset_report", "Пожаловаться" },
 	{
@@ -5822,7 +5930,7 @@ const LangOverride kRound5[] = {
 		"Этот набор скрыт из «Общих наборов» из-за жалоб. Ссылка на него "
 		"работает.",
 	},
-	{ "lng_oblivion_share_preset_loading", "Загружаю набор…" },
+	{ "lng_oblivion_share_preset_loading", "Загрузка набора…" },
 	{ "lng_oblivion_share_preset_before", "До" },
 	{ "lng_oblivion_share_preset_after", "После" },
 	// Oblivion round 5: sync.
@@ -5835,12 +5943,13 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_sync_title", "Синхронизация настроек" },
 	{
 		"lng_oblivion_sync_about",
-		"Настройки Oblivion и ваши сохранённые наборы шифруются на этом "
-		"устройстве паролем синхронизации и только потом отправляются. На "
-		"сервере лежит файл, который он не может прочитать. Забытый пароль "
-		"восстановить нельзя: отправьте настройки заново с новым.",
+		"Настройки Oblivion и сохранённые наборы шифруются на этом "
+		"устройстве вашим паролем синхронизации и только потом "
+		"отправляются: сервер хранит файл, который не может прочитать. "
+		"Забытый пароль восстановить нельзя — отправьте настройки заново "
+		"с новым.",
 	},
-	{ "lng_oblivion_sync_state_loading", "Проверяю сервер…" },
+	{ "lng_oblivion_sync_state_loading", "Проверка сервера…" },
 	{ "lng_oblivion_sync_state_error", "Не удалось проверить сервер" },
 	{ "lng_oblivion_sync_state_none", "На сервере пока нет копии" },
 	{
@@ -5873,10 +5982,16 @@ const LangOverride kRound5[] = {
 		"Автоматическая синхронизация начнётся после первой отправки или "
 		"получения с паролем.",
 	},
+	{
+		"lng_oblivion_sync_auto_paused",
+		"Копии на сервере нет, поэтому сами настройки не отправляются. "
+		"Автоматическая синхронизация продолжится после нажатия "
+		"«Отправить настройки на сервер».",
+	},
 	{ "lng_oblivion_sync_password", "Пароль синхронизации" },
 	{
 		"lng_oblivion_sync_password_same",
-		"Пароль (запомнен на этом устройстве)",
+		"Пароль (уже запомнен)",
 	},
 	{
 		"lng_oblivion_sync_password_hint",
@@ -5885,7 +6000,8 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_sync_password_kept",
-		"Пароль запомнен на этом устройстве, поле можно оставить пустым.",
+		"Поле можно оставить пустым. Введите пароль, только если хотите "
+		"сменить его или если копия на сервере сделана с другим.",
 	},
 	{
 		"lng_oblivion_sync_password_short",
@@ -5944,6 +6060,26 @@ const LangOverride kRound5[] = {
 		"копией от {date} с устройства «{device}». Значок приложения, "
 		"громкость и подключение к Oblivion Cloud останутся как есть.",
 	},
+	{
+		"lng_oblivion_sync_receive_presets#one",
+		"{count} сохранённый набор эффектов был удалён на другом "
+		"устройстве и будет удалён и с этого.",
+	},
+	{
+		"lng_oblivion_sync_receive_presets#few",
+		"{count} сохранённых набора эффектов были удалены на другом "
+		"устройстве и будут удалены и с этого.",
+	},
+	{
+		"lng_oblivion_sync_receive_presets#many",
+		"{count} сохранённых наборов эффектов были удалены на другом "
+		"устройстве и будут удалены и с этого.",
+	},
+	{
+		"lng_oblivion_sync_receive_presets#other",
+		"{count} сохранённых набора эффектов были удалены на другом "
+		"устройстве и будут удалены и с этого.",
+	},
 	{ "lng_oblivion_sync_receive_confirm", "Заменить" },
 	{ "lng_oblivion_sync_received", "Настройки получены." },
 	{ "lng_oblivion_sync_received_same", "Настройки уже совпадают." },
@@ -5973,14 +6109,20 @@ const LangOverride kRound5[] = {
 	{
 		"lng_oblivion_sync_erase_sure",
 		"Удалить копию настроек с сервера? Настройки на ваших устройствах "
-		"останутся как есть.",
+		"останутся как есть. Автоматическая синхронизация на этом "
+		"устройстве будет выключена. Новая копия появится на сервере, "
+		"только когда вы нажмёте «Отправить настройки на сервер».",
 	},
 	{ "lng_oblivion_sync_erased", "Копия удалена с сервера." },
 	{
+		"lng_oblivion_sync_erased_auto",
+		"Копия удалена с сервера. Автоматическая синхронизация выключена.",
+	},
+	{
 		"lng_oblivion_sync_not_synced",
-		"Не синхронизируются: значок приложения, громкость, локальная "
-		"расшифровка, опрос статусов и всё, что касается подключения к "
-		"Oblivion Cloud. Они на каждом устройстве свои.",
+		"Не синхронизируются значок приложения, громкость, локальная "
+		"расшифровка, опрос статусов и подключение к Oblivion Cloud: они "
+		"на каждом устройстве свои.",
 	},
 	// Oblivion round 5: update.
 	{ "lng_oblivion_update_settings_check", "Проверить обновления" },
@@ -5995,6 +6137,8 @@ const LangOverride kRound5[] = {
 		"устанавливает.",
 	},
 	{ "lng_oblivion_update_title", "Доступна новая версия" },
+	{ "lng_oblivion_update_title_loading", "Скачивание обновления" },
+	{ "lng_oblivion_update_title_ready", "Обновление скачано" },
 	{ "lng_oblivion_update_version", "Oblivion {version}" },
 	{ "lng_oblivion_update_current", "у вас {version}" },
 	{
@@ -6004,12 +6148,12 @@ const LangOverride kRound5[] = {
 	},
 	{
 		"lng_oblivion_update_no_notes",
-		"Разработчик не написал, что нового.",
+		"Описания изменений для этой версии нет.",
 	},
 	{
 		"lng_oblivion_update_file",
-		"{name}, {size}. Файл сохранится в папку «Загрузки», "
-		"устанавливаете его вы сами.",
+		"{name}, {size}. Файл сохранится в папку «Загрузки», установить "
+		"его нужно вручную.",
 	},
 	{
 		"lng_oblivion_update_no_file",
@@ -6019,7 +6163,7 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_update_later", "Позже" },
 	{ "lng_oblivion_update_retry", "Повторить" },
 	{ "lng_oblivion_update_progress", "Скачано {ready} из {total}" },
-	{ "lng_oblivion_update_saved", "Сохранено и проверено: {path}" },
+	{ "lng_oblivion_update_saved", "Файл сохранён и проверен:\n{path}" },
 	{
 		"lng_oblivion_update_install_mac",
 		"Закройте Oblivion, распакуйте архив и замените приложение в "
@@ -6035,7 +6179,7 @@ const LangOverride kRound5[] = {
 		"Файл не удалось сохранить, или он не прошёл проверку. Попробуйте "
 		"ещё раз.",
 	},
-	{ "lng_oblivion_update_checking", "Проверяю обновления…" },
+	{ "lng_oblivion_update_checking", "Проверка обновлений…" },
 	{
 		"lng_oblivion_update_latest",
 		"У вас последняя версия Oblivion ({version}).",
@@ -6045,15 +6189,16 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_dsearch_title", "Поиск в сохранённом" },
 	{ "lng_oblivion_dsearch_placeholder", "Слова, имя или файл" },
 	{ "lng_oblivion_dsearch_chat_all", "Все чаты" },
-	{ "lng_oblivion_dsearch_period_all", "За всё время" },
+	{ "lng_oblivion_dsearch_chat_this", "Этот чат" },
+	{ "lng_oblivion_dsearch_period_all", "Всё время" },
 	{ "lng_oblivion_dsearch_period_today", "Сегодня" },
 	{ "lng_oblivion_dsearch_period_week", "За 7 дней" },
 	{ "lng_oblivion_dsearch_period_month", "За 30 дней" },
 	{ "lng_oblivion_dsearch_period_year", "За год" },
 	{ "lng_oblivion_dsearch_period_day", "Выбрать день…" },
-	{ "lng_oblivion_dsearch_kind_all", "Удалённые и изменённые" },
-	{ "lng_oblivion_dsearch_kind_deleted", "Только удалённые" },
-	{ "lng_oblivion_dsearch_kind_edited", "Только изменённые" },
+	{ "lng_oblivion_dsearch_kind_all", "Все записи" },
+	{ "lng_oblivion_dsearch_kind_deleted", "Удалённые" },
+	{ "lng_oblivion_dsearch_kind_edited", "Изменённые" },
 	{ "lng_oblivion_dsearch_badge_deleted", "удалено" },
 	{ "lng_oblivion_dsearch_badge_edited", "изменено" },
 	{ "lng_oblivion_dsearch_empty", "Ничего не найдено" },
@@ -6071,7 +6216,7 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_dsearch_unknown_chat", "Неизвестный чат" },
 	{ "lng_oblivion_dsearch_record_title", "Удалённое сообщение" },
 	{ "lng_oblivion_dsearch_versions_title", "История изменений" },
-	{ "lng_oblivion_dsearch_version_was", "До {date}" },
+	{ "lng_oblivion_dsearch_version_was", "Было до {date}" },
 	{ "lng_oblivion_dsearch_version_now", "Сейчас" },
 	{ "lng_oblivion_dsearch_jump", "Перейти к сообщению" },
 	{ "lng_oblivion_dsearch_gone", "Эта запись больше не сохранена." },
@@ -6096,8 +6241,10 @@ const LangOverride kRound5[] = {
 		"Сообщение ждёт на этом устройстве и отправляется, когда человек "
 		"появится в сети (или напишет вам, если скрывает время в сети), "
 		"пока Oblivion запущен. По истечении срока оно не отправляется: "
-		"вас спросят, что с ним делать. Вариант Telegram, который ждёт "
-		"на сервере, остаётся в окне «Отложить отправку».",
+		"вас спросят, что с ним делать. Если вы удалите чат или "
+		"заблокируете человека, ожидающие его сообщения тоже не "
+		"отправятся. Вариант Telegram, который ждёт на сервере, остаётся "
+		"в окне «Отложить отправку».",
 	},
 	{ "lng_oblivion_sendonline_menu", "Отправить, когда будет в сети" },
 	{
@@ -6169,6 +6316,29 @@ const LangOverride kRound5[] = {
 		"lng_oblivion_sendonline_reason_server",
 		"Telegram не принял сообщение ({error})",
 	},
+	{ "lng_oblivion_sendonline_reason_chat_deleted", "Чат был удалён" },
+	{
+		"lng_oblivion_sendonline_reason_blocked",
+		"Вы заблокировали этого человека",
+	},
+	{
+		"lng_oblivion_sendonline_gone",
+		"Это сообщение больше не ждёт отправки: оно уже отправлено или "
+		"убрано.",
+	},
+	{
+		"lng_oblivion_sendonline_busy",
+		"Это сообщение уже отправляется: изменить или убрать его нельзя.",
+	},
+	{
+		"lng_oblivion_sendonline_not_saved",
+		"Не удалось записать на диск этого устройства, поэтому сообщение "
+		"не ждёт отправки. Ничего не отправлено.",
+	},
+	{
+		"lng_oblivion_sendonline_not_loaded",
+		"Этот чат ещё не загружен. Откройте его и попробуйте ещё раз.",
+	},
 	{
 		"lng_oblivion_sendonline_list_empty",
 		"Нет сообщений, ожидающих отправки.",
@@ -6178,16 +6348,20 @@ const LangOverride kRound5[] = {
 		"Нажмите правой кнопкой на кнопку отправки в личном чате и "
 		"выберите «Отправить, когда будет в сети».",
 	},
-	{ "lng_oblivion_sendonline_status_waiting", "Ждёт до {date}" },
+	{
+		"lng_oblivion_sendonline_status_waiting",
+		"Ждёт, когда будет в сети · до {date}",
+	},
 	{
 		"lng_oblivion_sendonline_status_retry",
 		"Повторим, когда человек будет в сети",
 	},
 	{ "lng_oblivion_sendonline_action_edit", "Изменить" },
 	{ "lng_oblivion_sendonline_action_cancel", "Убрать" },
-	{ "lng_oblivion_sendonline_action_send", "Отправить сейчас" },
+	{ "lng_oblivion_sendonline_action_send", "Отправить" },
 	{ "lng_oblivion_sendonline_action_wait", "Ждать ещё" },
 	{ "lng_oblivion_sendonline_edit_title", "Сообщение ждёт отправки" },
+	{ "lng_oblivion_sendonline_edit_placeholder", "Текст сообщения" },
 	{
 		"lng_oblivion_sendonline_cancel_sure",
 		"Убрать это сообщение из ожидающих? Оно не будет отправлено.",
@@ -6205,23 +6379,23 @@ const LangOverride kRound5[] = {
 	{ "lng_oblivion_sendonline_ask_title", "Сообщения не отправлены" },
 	{
 		"lng_oblivion_sendonline_ask_text#one",
-		"{count} ожидавшее сообщение не отправлено: срок ожидания истёк "
-		"или отправка не удалась.",
+		"{count} ожидавшее сообщение не отправлено. Откройте список: там "
+		"видно почему, и можно решить, что с ним делать.",
 	},
 	{
 		"lng_oblivion_sendonline_ask_text#few",
-		"{count} ожидавших сообщения не отправлены: срок ожидания истёк "
-		"или отправка не удалась.",
+		"{count} ожидавших сообщения не отправлены. Откройте список: там "
+		"видно почему, и можно решить, что с ними делать.",
 	},
 	{
 		"lng_oblivion_sendonline_ask_text#many",
-		"{count} ожидавших сообщений не отправлено: срок ожидания истёк "
-		"или отправка не удалась.",
+		"{count} ожидавших сообщений не отправлено. Откройте список: там "
+		"видно почему, и можно решить, что с ними делать.",
 	},
 	{
 		"lng_oblivion_sendonline_ask_text#other",
-		"{count} ожидавших сообщения не отправлены: срок ожидания истёк "
-		"или отправка не удалась.",
+		"{count} ожидавших сообщения не отправлены. Откройте список: там "
+		"видно почему, и можно решить, что с ними делать.",
 	},
 	{ "lng_oblivion_sendonline_ask_open", "Открыть список" },
 	{ "lng_oblivion_sendonline_ask_later", "Позже" },
@@ -6260,6 +6434,173 @@ const LangOverride kRound5[] = {
 	// Oblivion round 5 end.
 };
 
+const LangOverride kLooks[] = {
+	// Oblivion looks: core.
+	{ "lng_oblivion_look_title", "Тема Oblivion" },
+	{ "lng_oblivion_look_plain", "Обычный Telegram" },
+	{ "lng_oblivion_look_native", "Родной, но лучше" },
+	{ "lng_oblivion_look_night_air", "Ночной эфир" },
+	{ "lng_oblivion_look_silence", "Тишина" },
+	{
+		"lng_oblivion_look_plain_about",
+		"Всё как в Telegram, с вашей темой.",
+	},
+	{
+		"lng_oblivion_look_native_about",
+		"Тот же Telegram, только аккуратнее: карточки и плашки.",
+	},
+	{
+		"lng_oblivion_look_night_air_about",
+		"Фиолетовая ночь, свечение и один яркий градиент.",
+	},
+	{
+		"lng_oblivion_look_silence_about",
+		"Спокойный минимализм и один кислотный акцент.",
+	},
+	{
+		"lng_oblivion_look_note",
+		"Тема Oblivion меняет цвета всего приложения и вид экранов "
+		"Oblivion: блока в профиле, комнат, друзей и инструментов. "
+		"Расположение обычных экранов Telegram остаётся прежним.\n\n"
+		"Ваша тема Telegram и обои чата не изменяются: выберите "
+		"«Обычный Telegram» — и всё вернётся. «Ночной эфир» и «Тишина» "
+		"показывают свой фон чата, только пока вы сами не выбрали обои.",
+	},
+	{
+		"lng_oblivion_look_paused",
+		"Пока вы редактируете тему Telegram, тема Oblivion приостановлена. "
+		"Она вернётся, когда вы закроете редактор.",
+	},
+	// Oblivion looks: own screens.
+	{ "lng_oblivion_look_room_now_playing", "Сейчас играет" },
+	// Oblivion looks: upstream.
+	// Oblivion looks: hub.
+	{ "lng_oblivion_hub_menu", "Инструменты Oblivion" },
+	{ "lng_oblivion_hub_title", "Инструменты" },
+	{
+		"lng_oblivion_hub_about",
+		"Всё, чего нет в обычном Telegram, — в одном месте",
+	},
+	{ "lng_oblivion_hub_search", "Найти инструмент" },
+	{
+		"lng_oblivion_hub_empty",
+		"Такого инструмента нет. Попробуйте другое слово.",
+	},
+	{
+		"lng_oblivion_hub_settings_about",
+		"Все инструменты Oblivion на одном экране. Этот же экран "
+		"открывается из главного меню.",
+	},
+	{ "lng_oblivion_hub_group_create", "Создавать" },
+	{ "lng_oblivion_hub_group_together", "Вместе" },
+	{ "lng_oblivion_hub_group_know", "Знать" },
+	{ "lng_oblivion_hub_group_app", "Приложение" },
+	{ "lng_oblivion_hub_new", "новое" },
+	{ "lng_oblivion_hub_footer#one", "{count} инструмент" },
+	{ "lng_oblivion_hub_footer#few", "{count} инструмента" },
+	{ "lng_oblivion_hub_footer#many", "{count} инструментов" },
+	{ "lng_oblivion_hub_footer#other", "{count} инструмента" },
+	{ "lng_oblivion_hub_live", "Комната идёт сейчас" },
+	{ "lng_oblivion_hub_live_join", "Войти" },
+	{ "lng_oblivion_hub_live_untitled", "Комната" },
+	{ "lng_oblivion_hub_live_silence", "Сейчас ничего не играет" },
+	{ "lng_oblivion_hub_t_sticker_studio", "Студия стикеров" },
+	{ "lng_oblivion_hub_t_sticker_batch", "Стикеры пачкой" },
+	{ "lng_oblivion_hub_t_lottie", "Lottie-редактор" },
+	{ "lng_oblivion_hub_t_voice", "Войсчейнджер" },
+	{ "lng_oblivion_hub_t_round", "Видео в кружок" },
+	{ "lng_oblivion_hub_t_ocr", "Текст с картинки" },
+	{ "lng_oblivion_hub_t_cutout", "Вырезать фон" },
+	{ "lng_oblivion_hub_t_listen", "Слушать вместе" },
+	{ "lng_oblivion_hub_t_send_online", "Когда будет в сети" },
+	{ "lng_oblivion_hub_t_chat_stats", "Статистика чата" },
+	{ "lng_oblivion_hub_t_online", "Журнал онлайна" },
+	{ "lng_oblivion_hub_t_profile_history", "История профиля" },
+	{ "lng_oblivion_hub_t_ghost", "Режим призрака" },
+	{ "lng_oblivion_hub_t_updates", "Обновления" },
+	{ "lng_oblivion_hub_t_settings", "Настройки Oblivion" },
+	{ "lng_oblivion_hub_s_photo_editor", "слои, эффекты, рисование" },
+	{ "lng_oblivion_hub_s_collage", "несколько фото в одной сетке" },
+	{ "lng_oblivion_hub_s_video_editor", "обрезка, эффекты, трекинг" },
+	{
+		"lng_oblivion_hub_s_sticker_studio",
+		"перекрасить анимированный стикер",
+	},
+	{ "lng_oblivion_hub_s_sticker_packs", "создавать и пополнять наборы" },
+	{ "lng_oblivion_hub_s_sticker_converter", "фото и видео — в стикер" },
+	{
+		"lng_oblivion_hub_s_sticker_batch",
+		"много стикеров или эмодзи сразу",
+	},
+	{ "lng_oblivion_hub_s_lottie", "анимация по кадрам" },
+	{ "lng_oblivion_hub_s_music_editor", "обрезка, темп, тон" },
+	{ "lng_oblivion_hub_s_voice", "голосовые с эффектами" },
+	{ "lng_oblivion_hub_s_round", "любое видео — кружком" },
+	{ "lng_oblivion_hub_s_ocr", "распознать и скопировать" },
+	{ "lng_oblivion_hub_s_cutout", "объект без фона" },
+	{ "lng_oblivion_hub_s_rooms", "музыка, видео, холст" },
+	{ "lng_oblivion_hub_s_listen", "прямо в чате" },
+	{ "lng_oblivion_hub_s_friends", "кто что слушает" },
+	{ "lng_oblivion_hub_s_my_profile", "статус, цвет, что видят другие" },
+	{ "lng_oblivion_hub_s_playlists", "своя музыка по спискам" },
+	{ "lng_oblivion_hub_s_shared_playlists", "поделиться по ссылке" },
+	{ "lng_oblivion_hub_s_presets", "эффекты по ссылке" },
+	{ "lng_oblivion_hub_s_send_online", "сообщение подождёт" },
+	{ "lng_oblivion_hub_s_chat_stats", "кто, когда, сколько" },
+	{ "lng_oblivion_hub_s_deleted", "поиск по сохранённым" },
+	{ "lng_oblivion_hub_s_online", "кто когда заходил" },
+	{ "lng_oblivion_hub_s_profile_history", "имена, фото, био" },
+	{ "lng_oblivion_hub_s_gift_catalog", "модели и фоны" },
+	{ "lng_oblivion_hub_s_ghost", "читать незаметно" },
+	{ "lng_oblivion_hub_s_look", "три оформления и обычный Telegram" },
+	{ "lng_oblivion_hub_s_app_icon", "Oblivion, Telegram, своя" },
+	{ "lng_oblivion_hub_s_cloud", "значок, синхронизация, подключение" },
+	{ "lng_oblivion_hub_s_updates", "проверить новую версию" },
+	{ "lng_oblivion_hub_s_settings", "все переключатели" },
+	{
+		"lng_oblivion_hub_h_round",
+		"Откройте чат, в который хотите отправить кружок, и выберите "
+		"этот инструмент снова.",
+	},
+	{
+		"lng_oblivion_hub_h_ocr",
+		"Скопируйте картинку и выберите этот инструмент снова. Или "
+		"нажмите правой кнопкой на фото в чате: «Скопировать текст с "
+		"фото».",
+	},
+	{
+		"lng_oblivion_hub_h_cutout",
+		"Скопируйте картинку и выберите этот инструмент снова. Или "
+		"нажмите правой кнопкой на фото в чате: «Вырезать объект».",
+	},
+	{
+		"lng_oblivion_hub_h_listen",
+		"Нажмите правой кнопкой на музыку в чате: «Слушать вместе в "
+		"этом чате».",
+	},
+	{
+		"lng_oblivion_hub_h_chat_stats",
+		"Откройте чат и выберите этот инструмент снова. Он есть и в "
+		"меню чата: «Статистика чата».",
+	},
+	{
+		"lng_oblivion_hub_h_online",
+		"Откройте чат с человеком и выберите этот инструмент снова. Он "
+		"есть и в меню чата: «Журнал онлайна».",
+	},
+	{
+		"lng_oblivion_hub_h_profile_history",
+		"Откройте чат и выберите этот инструмент снова. Он есть и в "
+		"меню чата: «История профиля».",
+	},
+	{
+		"lng_oblivion_hub_h_rooms_off",
+		"Комнаты выключены. Включите их: Настройки → Oblivion → "
+		"«Вместе».",
+	},
+	// Oblivion looks end.
+};
+
 [[nodiscard]] bool IsRussianCode(QString code) {
 	code = code.trimmed().toLower().replace('_', '-');
 	if (code.startsWith('-')) {
@@ -6288,6 +6629,7 @@ const std::vector<LangOverride> &RussianStrings() {
 		append(kExtras);
 		append(kRound4);
 		append(kRound5);
+		append(kLooks);
 		return list;
 	}();
 	return result;

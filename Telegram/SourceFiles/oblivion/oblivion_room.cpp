@@ -13,6 +13,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "media/audio/media_audio.h"
 #include "oblivion/oblivion_audio.h"
+#include "oblivion/oblivion_room_extras.h"
 #include "oblivion/oblivion_room_music.h"
 #include "ui/chat/attach/attach_prepare.h"
 #include "settings.h"
@@ -29,7 +30,7 @@ namespace {
 
 constexpr auto kTitleLimit = 64;
 constexpr auto kNameLimit = 64;
-constexpr auto kTrackTextLimit = 256;
+constexpr auto kTrackTextLimit = 128; // limits.track_text of the server.
 constexpr auto kChatTextLimit = 2000;
 constexpr auto kChatKeep = 500;
 constexpr auto kChatLoad = 50;
@@ -40,11 +41,24 @@ constexpr auto kListLimit = 1000;
 constexpr auto kMaxDuration = int64(86'400'000);
 constexpr auto kStatusGap = crl::time(1000);
 constexpr auto kReloadRetry = crl::time(4000);
+constexpr auto kReloadRetryMax = crl::time(120'000);
+constexpr auto kReloadAttempts = 6;
 constexpr auto kCoverSide = 320;
 constexpr auto kCoverBytesLimit = 500 * 1024;
 constexpr auto kAudioBytesDefault = int64(83'886'080);
 constexpr auto kVideoBytesDefault = int64(734'003'200);
-constexpr auto kFolderTtl = int64(12 * 3600);
+constexpr auto kFolderTtl = int64(3600);
+constexpr auto kOrphanDelay = crl::time(30'000);
+constexpr auto kQueueRateRetries = 3;
+
+// The queue of a room has a bucket of its own on the server (150 changes
+// at once, then three in a second for a device). "Too often" is not an
+// error to show: the request was not done, it waits as long as the server
+// asks and goes again, see Cloud::Request::rateRetries.
+[[nodiscard]] Cloud::Request QueueRequest(Cloud::Request request) {
+	request.rateRetries = kQueueRateRetries;
+	return request;
+}
 
 [[nodiscard]] bool ValidItemId(const QString &id) {
 	if (id.isEmpty() || id.size() > kIdLimit) {
@@ -112,13 +126,15 @@ constexpr auto kFolderTtl = int64(12 * 3600);
 	}
 	const auto object = value.toObject();
 	const auto link = Cloud::JsonText(object.value(u"link"_q), 256);
-	if (!link.startsWith(u"https://t.me/"_q)) {
+	if (!ParseVoiceLink(link).valid()) {
+		// Only an invite link or the public link of a group is a voice
+		// chat, see oblivion_room_extras.h. "tg_chat_id" of the room is
+		// not read at all: a chat is never picked by what a room says.
 		return {};
 	}
 	return {
 		.link = link,
 		.title = Cloud::JsonText(object.value(u"title"_q), kTitleLimit),
-		.chatId = Cloud::JsonText(object.value(u"tg_chat_id"_q), 32),
 		.setBy = Cloud::JsonUserId(object.value(u"set_by"_q)),
 		.setAt = Cloud::JsonInt(object.value(u"set_at"_q)),
 	};
@@ -325,7 +341,7 @@ constexpr auto kFolderTtl = int64(12 * 3600);
 }
 
 [[nodiscard]] QString RoomFolder(uint64 userId, const QString &code) {
-	return RoomsFolder() + QString::number(userId) + '_' + code + '/';
+	return RoomsFolder() + RoomFolderName(userId, code) + '/';
 }
 
 [[nodiscard]] QString SafeExtension(const QString &fileName) {
@@ -340,6 +356,54 @@ constexpr auto kFolderTtl = int64(12 * 3600);
 		}
 	}
 	return '.' + suffix;
+}
+
+// The name Room::download() gives to the file of an item in the temp
+// folder of the room: by the content, so two items with the same file
+// share it.
+[[nodiscard]] QString MediaFileName(const QueueItem &item) {
+	return item.media + SafeExtension(item.fileName);
+}
+
+// path -> sha256 for the files of the items of both queues.
+[[nodiscard]] base::flat_map<QString, QString> QueueFiles(
+		const RoomState &state,
+		const QString &folder) {
+	auto result = base::flat_map<QString, QString>();
+	for (const auto kind : { Kind::Music, Kind::Video }) {
+		for (const auto &item : state.player(kind).queue) {
+			result.emplace(folder + MediaFileName(item), item.media);
+		}
+	}
+	return result;
+}
+
+// What was in the queues and is in none of them now: path -> sha256.
+[[nodiscard]] base::flat_map<QString, QString> LeftFiles(
+		const base::flat_map<QString, QString> &was,
+		const base::flat_map<QString, QString> &now) {
+	auto result = base::flat_map<QString, QString>();
+	for (const auto &[path, sha] : was) {
+		if (!now.contains(path)) {
+			result.emplace(path, sha);
+		}
+	}
+	return result;
+}
+
+// A file right in that folder (folder ends with a slash), not the folder
+// itself and nothing deeper or outside of it.
+[[nodiscard]] bool InFolder(const QString &path, const QString &folder) {
+	if (folder.isEmpty()
+		|| path.size() <= folder.size()
+		|| !path.startsWith(folder)) {
+		return false;
+	}
+	const auto name = path.mid(folder.size());
+	return !name.contains(QChar('/'))
+		&& !name.contains(QChar('\\'))
+		&& (name != u".."_q)
+		&& (name != u"."_q);
 }
 
 [[nodiscard]] QString MimeFor(const QString &fileName, Kind kind) {
@@ -562,6 +626,19 @@ QJsonObject SerializeRights(const Rights &rights) {
 	return result;
 }
 
+QJsonObject SerializeRight(Right right, bool value) {
+	auto result = QJsonObject();
+	result.insert(QLatin1String(RightName(right)), value);
+	return result;
+}
+
+crl::time ReloadRetryDelay(int attempt) {
+	if (attempt < 0 || attempt >= kReloadAttempts) {
+		return 0;
+	}
+	return std::min(kReloadRetry << attempt, kReloadRetryMax);
+}
+
 const QueueItem *Player::find(const QString &id) const {
 	const auto i = ranges::find(queue, id, &QueueItem::id);
 	return (id.isEmpty() || i == end(queue)) ? nullptr : &*i;
@@ -759,6 +836,13 @@ Changes ApplyEvent(
 			Gone::Closed);
 		return Change::Gone;
 	} else if (type == u"room.updated"_q) {
+		// The answer of a later request of this user may be here already
+		// (two quick clicks on the rights of newcomers): an older state
+		// of the room does not come back for a moment.
+		const auto rev = Cloud::JsonInt(data.value(u"rev"_q));
+		if (rev > 0 && rev < state.rev) {
+			return {};
+		}
 		auto result = Changes(Change::Room);
 		if (data.contains(u"title"_q)) {
 			state.title = Cloud::JsonText(data.value(u"title"_q), kTitleLimit);
@@ -945,6 +1029,34 @@ std::pair<bool, QString> MoveTarget(
 	return { true, (before < count) ? queue[before].id : QString() };
 }
 
+std::pair<int, int> MoveIndexes(
+		const Player &player,
+		const QString &itemId,
+		QueueMove move) {
+	const auto none = std::pair(-1, -1);
+	const auto count = int(player.queue.size());
+	const auto from = player.indexOf(itemId);
+	if (from < 0) {
+		return none;
+	}
+	switch (move) {
+	case QueueMove::Up:
+		return (from > 0) ? std::pair(from, from - 1) : none;
+	case QueueMove::Down:
+		return (from + 1 < count) ? std::pair(from, from + 1) : none;
+	case QueueMove::Next: {
+		const auto current = player.indexOf(player.state.itemId);
+		if (current < 0 || from == current || from == current + 1) {
+			return none;
+		}
+		// The item leaves its place first: what is above the current
+		// one lands on the place of the current one, right after it.
+		return std::pair(from, (from < current) ? current : (current + 1));
+	}
+	}
+	return none;
+}
+
 QString ExtractCode(const QString &typed) {
 	const auto trimmed = typed.trimmed();
 	if (trimmed.isEmpty() || trimmed.size() > 256) {
@@ -1000,12 +1112,16 @@ struct Room::Private {
 	void apply(const Cloud::Event &event);
 	void fire(Changes changes);
 	void wentGone();
-	void reload();
+	void reload(bool retry = false);
+	void reloadLater();
 	void reloadDone(const QJsonObject &room);
 	void applyRoomInfo(const QJsonObject &room);
 	void refreshRoomInfo();
+	void checkMember();
 	void loadChat();
 	void setConnected(bool value);
+	void trackFiles();
+	void removeLeftFiles();
 
 	void playerAction(Kind kind, QJsonObject body, bool withRev);
 	void pauseOther(Kind kind);
@@ -1043,8 +1159,10 @@ struct Room::Private {
 
 	bool reloading = false;
 	bool reloadFailed = false;
+	int reloadAttempts = 0;
 	std::vector<Cloud::Event> queued;
 	base::Timer reloadTimer;
+	Cloud::RequestId memberCheck = 0;
 	bool chatLoaded = false;
 
 	std::vector<std::unique_ptr<Task>> tasks;
@@ -1059,7 +1177,15 @@ struct Room::Private {
 
 	base::flat_map<QString, QImage> covers;
 	base::flat_set<QString> coversRequested;
+	base::flat_set<QString> coversFailed; // Asked again after a reconnect.
 	base::flat_map<QString, QString> known; // sha256 -> an own file.
+
+	// The files of the temp folder: path -> sha256. What has left both
+	// queues is deleted a bit later, the folder does not grow for as long
+	// as the window stays open.
+	base::flat_map<QString, QString> queueFiles;
+	base::flat_map<QString, QString> leftFiles;
+	base::Timer leftTimer;
 
 	std::unique_ptr<MusicEngine> music;
 	rpl::lifetime subscription;
@@ -1070,13 +1196,129 @@ struct Room::Private {
 
 Room::Private::Private(not_null<Room*> owner)
 : owner(owner)
-, reloadTimer([=] { if (reloadFailed && connected) { reload(); } })
-, statusTimer([=] { sendStatus(); }) {
+, reloadTimer([=] { if (reloadFailed && connected) { reload(true); } })
+, statusTimer([=] { sendStatus(); })
+, leftTimer([=] { removeLeftFiles(); }) {
 }
 
 void Room::Private::fire(Changes value) {
 	if (value) {
+		const auto queues = Changes(Change::MusicQueue)
+			| Change::VideoQueue
+			| Change::Reloaded;
+		if (value & queues) {
+			trackFiles();
+		}
 		changes.fire_copy(value);
+	}
+}
+
+// Called after every change of a queue: remembers what has left both
+// queues. The files (and the covers) of those items are removed a bit
+// later, when the players have surely let them go.
+void Room::Private::trackFiles() {
+	if (sample || !sender || state.gone != Gone::No) {
+		return;
+	}
+	auto now = QueueFiles(state, folder());
+	const auto left = LeftFiles(queueFiles, now);
+	for (const auto &[path, sha] : left) {
+		leftFiles.emplace(path, sha);
+	}
+	for (const auto &[path, sha] : now) {
+		leftFiles.remove(path);
+	}
+	queueFiles = std::move(now);
+	if (leftFiles.empty()) {
+		leftTimer.cancel();
+	} else if (!left.empty() || !leftTimer.isActive()) {
+		// Counted from the last item that has left.
+		leftTimer.callOnce(kOrphanDelay);
+	}
+
+	// The covers of the items that are gone: out of the memory at once.
+	auto used = base::flat_set<QString>();
+	for (const auto kind : { Kind::Music, Kind::Video }) {
+		for (const auto &item : state.player(kind).queue) {
+			if (!item.cover.isEmpty()) {
+				used.emplace(item.cover);
+			}
+		}
+	}
+	for (auto i = begin(covers); i != end(covers);) {
+		if (used.contains(i->first)) {
+			++i;
+		} else {
+			coversRequested.remove(i->first);
+			i = covers.erase(i);
+		}
+	}
+	for (auto i = begin(coversFailed); i != end(coversFailed);) {
+		if (used.contains(*i)) {
+			++i;
+		} else {
+			coversRequested.remove(*i);
+			i = coversFailed.erase(i);
+		}
+	}
+}
+
+// Only what Room::download() or the room itself has put into the temp
+// folder is deleted, never a file of the user (known[] may point to the
+// original he has added from the disk).
+void Room::Private::removeLeftFiles() {
+	if (sample || state.gone != Gone::No) {
+		leftFiles.clear();
+		return;
+	}
+	const auto root = folder();
+	const auto inQueues = [&](const QString &sha) {
+		for (const auto &[path, media] : queueFiles) {
+			if (media == sha) {
+				return true;
+			}
+		}
+		return false;
+	};
+	auto later = base::flat_map<QString, QString>();
+	const auto list = base::take(leftFiles);
+	for (const auto &[path, sha] : list) {
+		if (queueFiles.contains(path) || !InFolder(path, root)) {
+			continue;
+		}
+		// The copy made while a file of Telegram went to the relay.
+		const auto i = known.find(sha);
+		const auto copy = (i != end(known)
+			&& !inQueues(sha)
+			&& InFolder(i->second, root))
+			? i->second
+			: QString();
+		const auto uploading = !copy.isEmpty()
+			&& ranges::contains(
+				tasks,
+				copy,
+				[](const std::unique_ptr<Task> &task) {
+					return task->media.path;
+				});
+		const auto playing = music
+			&& (music->usesFile(path)
+				|| (!copy.isEmpty() && music->usesFile(copy)));
+		if (uploading || playing) {
+			// Still in the player (the user listens to it on his own)
+			// or on its way to the relay once more.
+			later.emplace(path, sha);
+			continue;
+		}
+		QFile::remove(path);
+		QFile::remove(path + u".part"_q);
+		if (!copy.isEmpty()) {
+			QFile::remove(copy);
+			known.erase(i);
+		}
+	}
+	leftFiles = std::move(later);
+	if (!leftFiles.empty()) {
+		leftTimer.callOnce(kOrphanDelay);
 	}
 }
 
@@ -1095,9 +1337,14 @@ void Room::Private::handle(const Cloud::Event &event) {
 
 void Room::Private::apply(const Cloud::Event &event) {
 	const auto weak = base::make_weak(owner.get());
+	const auto wasOwner = state.owner;
 	const auto result = ApplyEvent(state, event, selfId);
 	if (result & Change::Gone) {
 		wentGone();
+	} else if (!wasOwner && state.owner) {
+		// The banned and the invited lists are given only to the owner:
+		// the new one asks for them once.
+		refreshRoomInfo();
 	}
 	events.fire_copy(event);
 	if (weak) {
@@ -1109,7 +1356,10 @@ void Room::Private::wentGone() {
 	subscription.destroy();
 	reloadTimer.cancel();
 	statusTimer.cancel();
+	leftTimer.cancel();
+	leftFiles.clear();
 	reloading = false;
+	memberCheck = 0;
 	queued.clear();
 	if (sender) {
 		sender->cancelAll();
@@ -1119,47 +1369,64 @@ void Room::Private::wentGone() {
 	}
 }
 
-void Room::Private::reload() {
+// retry: one more attempt of the same reload (the timer), otherwise a new
+// reason to reload ("resync", the stream is back) and the count of the
+// attempts starts over.
+void Room::Private::reload(bool retry) {
 	if (reloading || !sender || state.gone != Gone::No) {
 		return;
 	}
+	if (!retry) {
+		reloadAttempts = 0;
+	}
+	reloadTimer.cancel();
 	reloading = true;
 	reloadFailed = false;
 	owner->send(Cloud::GetRequest(QString()), [=](
 			const Cloud::Response &response) {
 		reloadDone(response.json.value(u"room"_q).toObject());
 	}, [=](const Cloud::Error &error) {
-		reloading = false;
 		if (error.status == 404 || error.status == 403) {
+			reloading = false;
 			auto rejected = Cloud::Event{ .type = u"room.rejected"_q };
 			rejected.room = state.code;
 			queued.clear();
 			apply(rejected);
 			return;
 		}
-		// The events that were held back are applied to what there is,
-		// the snapshot is asked for once more a bit later.
-		reloadFailed = true;
-		reloadTimer.callOnce(kReloadRetry);
-		const auto weak = base::make_weak(owner.get());
-		for (const auto &event : base::take(queued)) {
-			if (!weak || state.gone != Gone::No) {
-				return;
-			}
-			apply(event);
-		}
+		reloadLater();
 	});
 }
 
-void Room::Private::reloadDone(const QJsonObject &room) {
+// The snapshot did not come (or it is not one): the events that were held
+// back are applied to what there is, the snapshot is asked for again
+// after a pause that grows, a few times at most. After that the room
+// waits for the stream to reconnect or to say "resync" once more.
+void Room::Private::reloadLater() {
 	reloading = false;
+	reloadFailed = true;
+	if (const auto delay = ReloadRetryDelay(reloadAttempts)) {
+		++reloadAttempts;
+		reloadTimer.callOnce(delay);
+	}
+	const auto weak = base::make_weak(owner.get());
+	const auto list = base::take(queued);
+	for (const auto &event : list) {
+		if (!weak || state.gone != Gone::No) {
+			return;
+		}
+		apply(event);
+	}
+}
+
+void Room::Private::reloadDone(const QJsonObject &room) {
 	auto fresh = ParseRoom(room, selfId);
 	if (!fresh.valid() || fresh.code != state.code) {
-		reloadFailed = true;
-		reloadTimer.callOnce(kReloadRetry);
-		queued.clear();
+		reloadLater();
 		return;
 	}
+	reloading = false;
+	reloadAttempts = 0;
 	fresh.chat = std::move(state.chat);
 	state = std::move(fresh);
 	if (const auto strong = account.get()) {
@@ -1215,6 +1482,28 @@ void Room::Private::refreshRoomInfo() {
 	});
 }
 
+// "me.rooms": the list of the rooms of the user has changed on another
+// device. If this room was left there nothing else tells this window
+// about it (the stream of the room just goes silent), so the room is
+// asked once whether the user is still in it.
+void Room::Private::checkMember() {
+	if (memberCheck || reloading || state.gone != Gone::No) {
+		return;
+	}
+	memberCheck = owner->send(Cloud::GetRequest(QString()), [=](
+			const Cloud::Response &response) {
+		memberCheck = 0;
+		applyRoomInfo(response.json.value(u"room"_q).toObject());
+	}, [=](const Cloud::Error &error) {
+		memberCheck = 0;
+		if (error.status == 404 && state.gone == Gone::No) {
+			auto rejected = Cloud::Event{ .type = u"room.rejected"_q };
+			rejected.room = state.code;
+			apply(rejected);
+		}
+	});
+}
+
 void Room::Private::loadChat() {
 	auto request = Cloud::GetRequest(
 		u"/chat"_q,
@@ -1242,7 +1531,17 @@ void Room::Private::setConnected(bool value) {
 	if (connected && reloadFailed) {
 		reload();
 	}
-	fire(Change::Connection);
+	auto result = Changes(Change::Connection);
+	if (connected && !coversFailed.empty()) {
+		// The covers that did not come are asked for once more when
+		// they are painted again.
+		const auto failed = base::take(coversFailed);
+		for (const auto &sha : failed) {
+			coversRequested.remove(sha);
+		}
+		result |= Change::Covers;
+	}
+	fire(result);
 }
 
 void Room::Private::playerAction(Kind kind, QJsonObject body, bool withRev) {
@@ -1439,7 +1738,9 @@ void Room::Private::finishTask(int id) {
 		pauseOther(kind);
 	}
 	raw->request = owner->send(
-		Cloud::PostRequest(u"/queue/"_q + KindName(kind), std::move(body)),
+		QueueRequest(Cloud::PostRequest(
+			u"/queue/"_q + KindName(kind),
+			std::move(body))),
 		[=](const Cloud::Response &) {
 			removeTask(id, false);
 		},
@@ -1533,7 +1834,7 @@ QString Room::Private::folder() const {
 }
 
 QString Room::Private::mediaPath(const QueueItem &item) const {
-	return folder() + item.media + SafeExtension(item.fileName);
+	return folder() + MediaFileName(item);
 }
 
 Room::Room(Descriptor &&descriptor)
@@ -1555,11 +1856,18 @@ Room::Room(Descriptor &&descriptor)
 	p->account = base::make_weak(account);
 	p->sender.emplace(account);
 	p->connected = (account->state() == Cloud::State::Online);
+	p->queueFiles = QueueFiles(p->state, p->folder());
 	p->subscription = account->subscribeRoom(p->state.code, p->state.eventId);
 	account->roomEvents(
 		p->state.code
 	) | rpl::on_next([=](const Cloud::Event &event) {
 		p->handle(event);
+	}, p->lifetime);
+	account->events(
+	) | rpl::filter([](const Cloud::Event &event) {
+		return (event.type == u"me.rooms"_q);
+	}) | rpl::on_next([=](const Cloud::Event &) {
+		p->checkMember();
 	}, p->lifetime);
 	account->stateValue(
 	) | rpl::on_next([=](Cloud::State state) {
@@ -1592,7 +1900,10 @@ void Room::detach() {
 	p->subscription.destroy();
 	p->reloadTimer.cancel();
 	p->statusTimer.cancel();
+	p->leftTimer.cancel();
+	p->leftFiles.clear();
 	p->reloading = false;
+	p->memberCheck = 0;
 	p->queued.clear();
 	while (!p->tasks.empty()) {
 		p->removeTask(p->tasks.back()->id, true);
@@ -1773,8 +2084,8 @@ void Room::removeItem(Kind kind, const QString &itemId) {
 	if (!player(kind).find(itemId)) {
 		return;
 	}
-	send(Cloud::DeleteRequest(
-		u"/queue/"_q + KindName(kind) + '/' + itemId));
+	send(QueueRequest(Cloud::DeleteRequest(
+		u"/queue/"_q + KindName(kind) + '/' + itemId)));
 }
 
 void Room::moveItem(Kind kind, int from, int to) {
@@ -1788,13 +2099,21 @@ void Room::moveItem(Kind kind, int from, int to) {
 	body.insert(u"before"_q, target.second.isEmpty()
 		? QJsonValue()
 		: QJsonValue(target.second));
-	send(Cloud::PostRequest(
+	send(QueueRequest(Cloud::PostRequest(
 		u"/queue/"_q + KindName(kind) + u"/move"_q,
-		std::move(body)));
+		std::move(body))));
+}
+
+void Room::moveItem(Kind kind, const QString &itemId, QueueMove move) {
+	const auto indexes = MoveIndexes(player(kind), itemId, move);
+	if (indexes.first >= 0) {
+		moveItem(kind, indexes.first, indexes.second);
+	}
 }
 
 void Room::clearQueue(Kind kind) {
-	send(Cloud::PostRequest(u"/queue/"_q + KindName(kind) + u"/clear"_q));
+	send(QueueRequest(Cloud::PostRequest(
+		u"/queue/"_q + KindName(kind) + u"/clear"_q)));
 }
 
 int Room::addMedia(AddMedia &&media) {
@@ -1883,7 +2202,9 @@ void Room::addUploaded(
 	if (play) {
 		p->pauseOther(kind);
 	}
-	send(Cloud::PostRequest(u"/queue/"_q + KindName(kind), std::move(body)));
+	send(QueueRequest(Cloud::PostRequest(
+		u"/queue/"_q + KindName(kind),
+		std::move(body))));
 }
 
 void Room::reportStatus(
@@ -1899,6 +2220,49 @@ void Room::reportStatus(
 		.buffered = std::clamp(buffered, 0, 100),
 	};
 	p->sendStatus();
+}
+
+void Room::setRight(uint64 userId, Right right, bool value) {
+	const auto p = _private.get();
+	auto body = QJsonObject();
+	body.insert(u"rights"_q, SerializeRight(right, value));
+	send(
+		Cloud::PatchRequest(
+			u"/members/"_q + QString::number(userId),
+			std::move(body)),
+		[=](const Cloud::Response &response) {
+			// The answer of an earlier click may come after the event
+			// of a later one: only the right that was asked for is taken
+			// from it, the whole member comes with the events.
+			const auto answer = ParseMember(
+				response.json.value(u"member"_q).toObject());
+			const auto i = ranges::find(
+				p->state.members,
+				userId,
+				&Member::id);
+			if (answer.id != userId
+				|| i == end(p->state.members)
+				|| i->owner
+				|| i->rights.has(right) == answer.rights.has(right)) {
+				return;
+			}
+			auto member = *i;
+			member.rights.set(right, answer.rights.has(right));
+			p->fire(UpsertMember(p->state, std::move(member), p->selfId));
+		});
+}
+
+void Room::setDefaultRight(Right right, bool value) {
+	const auto p = _private.get();
+	auto settings = QJsonObject();
+	settings.insert(u"default_rights"_q, SerializeRight(right, value));
+	auto body = QJsonObject();
+	body.insert(u"settings"_q, settings);
+	send(
+		Cloud::PatchRequest(QString(), std::move(body)),
+		[=](const Cloud::Response &response) {
+			p->applyRoomInfo(response.json.value(u"room"_q).toObject());
+		});
 }
 
 void Room::setRights(uint64 userId, const Rights &rights) {
@@ -1978,10 +2342,10 @@ void Room::rename(const QString &title) {
 		});
 }
 
-void Room::sendChat(const QString &text) {
+bool Room::sendChat(const QString &text, Fn<void()> failed) {
 	const auto trimmed = text.trimmed().left(kChatTextLimit);
 	if (trimmed.isEmpty()) {
-		return;
+		return false;
 	}
 	const auto p = _private.get();
 	auto body = QJsonObject();
@@ -1989,7 +2353,7 @@ void Room::sendChat(const QString &text) {
 	body.insert(
 		u"client_id"_q,
 		u"c-"_q + QString::number(base::RandomValue<uint32>(), 16));
-	send(
+	const auto sent = send(
 		Cloud::PostRequest(u"/chat"_q, std::move(body)),
 		[=](const Cloud::Response &response) {
 			auto message = ParseChatMessage(
@@ -1997,7 +2361,15 @@ void Room::sendChat(const QString &text) {
 			if (AddChatMessage(p->state, std::move(message))) {
 				p->fire(Change::Chat);
 			}
+		},
+		[=](const Cloud::Error &error) {
+			const auto weak = base::make_weak(this);
+			p->errors.fire_copy(error);
+			if (weak && failed) {
+				failed();
+			}
 		});
+	return (sent != 0);
 }
 
 void Room::deleteChat(int64 id) {
@@ -2147,14 +2519,19 @@ QImage Room::cover(const QString &sha256) {
 						Qt::SmoothTransformation);
 				}
 				crl::on_main(weak, [=, image = std::move(image)] {
-					if (!image.isNull()) {
+					if (!image.isNull()
+						&& p->coversRequested.contains(sha256)) {
 						p->covers[sha256] = image;
 						p->fire(Change::Covers);
 					}
 				});
 			});
 		}),
-		.fail = crl::guard(this, [](const Cloud::Error &) {
+		.fail = crl::guard(this, [=](const Cloud::Error &) {
+			// Asked for again after the next reconnect, not before.
+			if (p->coversRequested.contains(sha256)) {
+				p->coversFailed.emplace(sha256);
+			}
 		}),
 	});
 	return QImage();
@@ -2170,7 +2547,11 @@ void RemoveRoomFolder(uint64 userId, const QString &code) {
 	});
 }
 
-void CleanupRoomFolders(uint64 forgetUserId) {
+QString RoomFolderName(uint64 userId, const QString &code) {
+	return QString::number(userId) + '_' + code;
+}
+
+void CleanupRoomFolders(uint64 forgetUserId, const QStringList &keep) {
 	const auto root = RoomsFolder();
 	const auto prefix = forgetUserId
 		? (QString::number(forgetUserId) + '_')
@@ -2180,11 +2561,16 @@ void CleanupRoomFolders(uint64 forgetUserId) {
 		const auto list = QDir(root).entryInfoList(
 			QDir::Dirs | QDir::NoDotAndDotDot);
 		for (const auto &info : list) {
-			const auto old = (now - info.lastModified().toSecsSinceEpoch())
-				> kFolderTtl;
-			const auto forget = !prefix.isEmpty()
-				&& info.fileName().startsWith(prefix);
-			if (forget || (prefix.isEmpty() && old)) {
+			const auto name = info.fileName();
+			const auto forget = !prefix.isEmpty() && name.startsWith(prefix);
+			// The age is that of the last file added to the folder: it
+			// says nothing about a room that is open, so those are never
+			// judged by it.
+			const auto old = prefix.isEmpty()
+				&& !keep.contains(name)
+				&& ((now - info.lastModified().toSecsSinceEpoch())
+					> kFolderTtl);
+			if (forget || old) {
 				QDir(info.absoluteFilePath()).removeRecursively();
 			}
 		}
@@ -2414,7 +2800,16 @@ void TestParse(Checker &check) {
 	voice.insert(u"link"_q, u"https://evil.example/x"_q);
 	check(!ParseVoice(voice).valid(), "foreign voice link dropped");
 	voice.insert(u"link"_q, u"https://t.me/+AbCd"_q);
-	check(ParseVoice(voice).valid(), "t.me voice link kept");
+	check(!ParseVoice(voice).valid(), "too short an invite dropped");
+	voice.insert(u"link"_q, u"https://t.me/SomeBot?start=payload"_q);
+	check(!ParseVoice(voice).valid(), "a bot link is not a voice chat");
+	voice.insert(u"link"_q, u"https://t.me/+AbCdEfGh1234"_q);
+	voice.insert(u"tg_chat_id"_q, u"-1001234567890"_q);
+	check(ParseVoice(voice).valid()
+		&& ParseVoice(voice).link == u"https://t.me/+AbCdEfGh1234"_q,
+		"an invite link kept");
+	voice.insert(u"link"_q, u"https://t.me/some_group?videochat"_q);
+	check(ParseVoice(voice).valid(), "a public group link kept");
 
 	auto message = QJsonObject();
 	message.insert(u"id"_q, 5);
@@ -2496,6 +2891,22 @@ void TestReducer(Checker &check) {
 		&& state.rights == Rights::Everything()
 		&& state.member(kTestSelf)->owner
 		&& !state.member(kTestOwner)->owner, "ownership transfer");
+
+	// An older room.updated that comes after the answer of a later
+	// request changes nothing.
+	data = QJsonObject();
+	data.insert(u"title"_q, u"Old"_q);
+	data.insert(u"owner_id"_q, double(kTestOwner));
+	data.insert(u"rev"_q, 8);
+	result = apply(u"room.updated"_q, data);
+	check(!result && state.title == u"Night"_q && state.owner
+		&& state.rev == 9, "a stale room.updated is ignored");
+	data.insert(u"rev"_q, 9);
+	data.insert(u"owner_id"_q, double(kTestSelf));
+	data.insert(u"title"_q, u"Same rev"_q);
+	result = apply(u"room.updated"_q, data);
+	check((result & Change::Room) && state.title == u"Same rev"_q,
+		"room.updated with the same rev is taken");
 
 	// room.player: only a newer rev.
 	data = QJsonObject();
@@ -2591,7 +3002,7 @@ void TestReducer(Checker &check) {
 
 	// Voice, canvas, unknown.
 	auto voice = QJsonObject();
-	voice.insert(u"link"_q, u"https://t.me/+AbCd"_q);
+	voice.insert(u"link"_q, u"https://t.me/+AbCdEfGh1234"_q);
 	data = QJsonObject();
 	data.insert(u"voice"_q, voice);
 	result = apply(u"room.voice"_q, data);
@@ -2717,6 +3128,52 @@ void TestRightsAndQueue(Checker &check) {
 	check(MoveTarget(queue, 2, 1)
 		== std::pair(true, u"b2"_q), "move up by one");
 
+	// A row menu: the place is counted by the queue at the click. The
+	// queue is a1 (current), b2, c3.
+	const auto none = std::pair(-1, -1);
+	check(MoveIndexes(state.music, u"a1"_q, QueueMove::Up) == none,
+		"the first item does not go up");
+	check(MoveIndexes(state.music, u"c3"_q, QueueMove::Down) == none,
+		"the last item does not go down");
+	check(MoveIndexes(state.music, u"c3"_q, QueueMove::Up)
+		== std::pair(2, 1), "up by one");
+	check(MoveIndexes(state.music, u"a1"_q, QueueMove::Down)
+		== std::pair(0, 1), "down by one");
+	check(MoveIndexes(state.music, u"zz"_q, QueueMove::Up) == none,
+		"an item that is gone moves nowhere");
+	check(MoveIndexes(state.music, u"a1"_q, QueueMove::Next) == none,
+		"the current item is not its own next");
+	check(MoveIndexes(state.music, u"b2"_q, QueueMove::Next) == none,
+		"the next item is next already");
+	check(MoveIndexes(state.music, u"c3"_q, QueueMove::Next)
+		== std::pair(2, 1), "play next from below");
+	{
+		// The menu of c3 was opened, then somebody has removed a1 and
+		// the room went on to c3: the indexes are those of the new queue.
+		auto changed = state.music;
+		changed.queue.erase(begin(changed.queue));
+		changed.state.itemId = u"c3"_q;
+		check(MoveIndexes(changed, u"b2"_q, QueueMove::Next)
+			== std::pair(0, 1), "play next from above, after a change");
+		check(MoveIndexes(changed, u"c3"_q, QueueMove::Up)
+			== std::pair(1, 0), "up after a change");
+		check(MoveIndexes(changed, u"b2"_q, QueueMove::Up) == none,
+			"nothing above after a change");
+		const auto indexes = MoveIndexes(changed, u"b2"_q, QueueMove::Next);
+		check(MoveTarget(changed.queue, indexes.first, indexes.second)
+			== std::pair(true, QString()), "play next goes after the current");
+		changed.state.itemId = QString();
+		check(MoveIndexes(changed, u"b2"_q, QueueMove::Next) == none,
+			"no current item: no next");
+	}
+
+	// One click on a right sends that right only.
+	const auto single = SerializeRight(Right::Queue, false);
+	check(single.size() == 1 && single.contains(u"queue"_q)
+		&& !single.value(u"queue"_q).toBool(true), "one right, one key");
+	check(SerializeRight(Right::Invite, true).value(u"invite"_q).toBool(),
+		"one right switched on");
+
 	check(NextAfterEnd(state.music) == u"b2"_q, "next after the first");
 	state.music.state.itemId = u"c3"_q;
 	check(NextAfterEnd(state.music).isEmpty(), "stop after the last");
@@ -2752,6 +3209,72 @@ void TestLinks(Checker &check) {
 	check(SafeExtension(u"x.Mp3"_q) == u".mp3"_q
 		&& SafeExtension(u"x.tar/../y"_q).isEmpty()
 		&& SafeExtension(u"noext"_q).isEmpty(), "safe extension");
+}
+
+void TestFilesAndRetries(Checker &check) {
+	// The snapshot is asked for again with a growing pause, a few times.
+	check(ReloadRetryDelay(0) == kReloadRetry, "the first retry");
+	check(ReloadRetryDelay(1) == 2 * kReloadRetry, "the pause doubles");
+	check(ReloadRetryDelay(kReloadAttempts - 1) == kReloadRetryMax,
+		"the pause is capped");
+	check(ReloadRetryDelay(kReloadAttempts) == 0
+		&& ReloadRetryDelay(100) == 0
+		&& ReloadRetryDelay(-1) == 0, "the retries end");
+	auto total = crl::time(0);
+	for (auto i = 0; i != 100; ++i) {
+		total += ReloadRetryDelay(i);
+	}
+	check(total > 60'000 && total < 600'000, "minutes of retries, not more");
+
+	// A change of the queue the server finds too frequent is waited out,
+	// a limited number of times. Nothing else of it is ever sent twice.
+	const auto queued = QueueRequest(Cloud::PostRequest(u"/queue/music"_q));
+	check(queued.rateRetries == kQueueRateRetries
+		&& queued.retries < 0
+		&& queued.method == "POST"
+		&& queued.path == u"/queue/music"_q,
+		"too often for the queue: waited out, not an error");
+	check(Cloud::PostRequest(u"/chat"_q).rateRetries == 0
+		&& Cloud::DeleteRequest(u"/chat/1"_q).rateRetries == 0,
+		"only the queue is sent again");
+
+	// The files of the temp folder follow the queues.
+	const auto folder = u"/tmp/rooms/1_K7QM2XPA9Z/"_q;
+	auto state = ParseRoom(TestRoom(), kTestSelf);
+	const auto was = QueueFiles(state, folder);
+	check(was.size() == 3
+		&& was.contains(folder + TestSha('a') + u".mp3"_q)
+		&& was.contains(folder + TestSha('c') + u".mp3"_q),
+		"a file for every item");
+	check(LeftFiles(was, was).empty(), "nothing has left");
+
+	// b2 is removed, the file of a1 is added to the video queue too.
+	state.music.queue.erase(begin(state.music.queue) + 1);
+	auto copy = state.music.queue.front();
+	copy.id = u"v1"_q;
+	copy.kind = Kind::Video;
+	state.video.queue.push_back(copy);
+	const auto now = QueueFiles(state, folder);
+	const auto left = LeftFiles(was, now);
+	check(now.size() == 2, "the same file in two queues is one file");
+	check(left.size() == 1
+		&& left.contains(folder + TestSha('b') + u".mp3"_q)
+		&& left.begin()->second == TestSha('b'),
+		"only what is in no queue has left");
+	check(LeftFiles(now, was).empty(), "an item that came is not left");
+
+	check(InFolder(folder + u"tg_5.audio"_q, folder), "a file of the folder");
+	check(!InFolder(folder, folder), "the folder is not its file");
+	check(!InFolder(folder + u"sub/file"_q, folder), "nothing deeper");
+	check(!InFolder(folder + u".."_q, folder), "not the parent");
+	check(!InFolder(u"/home/me/Music/song.mp3"_q, folder),
+		"a file of the user is never in the folder");
+	check(!InFolder(u"/tmp/rooms/1_K7QM2XPA9Zx/song.mp3"_q, folder),
+		"not a folder with a longer name");
+	check(!InFolder(u"song.mp3"_q, QString()), "no folder, no file");
+
+	check(RoomFolderName(42, u"K7QM2XPA9Z"_q) == u"42_K7QM2XPA9Z"_q,
+		"the name of the temp folder");
 }
 
 void TestSampleRoom(Checker &check) {
@@ -2792,6 +3315,8 @@ bool RunSelfTest(QStringList &log) {
 	check.section("rights and queue");
 	TestLinks(check);
 	check.section("links and names");
+	TestFilesAndRetries(check);
+	check.section("files and retries");
 	TestSampleRoom(check);
 	check.section("sample room");
 	log.push_back(u"room: %1 checks, %2 failed"_q.arg(

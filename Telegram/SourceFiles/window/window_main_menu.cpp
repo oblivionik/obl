@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/window_main_menu.h"
 
 #include "oblivion/oblivion_cloud_social.h"
+#include "oblivion/oblivion_hub.h"
 #include "oblivion/oblivion_interface.h"
 #include "oblivion/oblivion_room.h"
 #include "oblivion/oblivion_unified_chats.h"
@@ -728,6 +729,9 @@ void MainMenu::setupMenu() {
 		// Oblivion round 5: rooms.
 		Oblivion::Rooms::AddMainMenuEntry(_menu, controller);
 		// Oblivion round 5: rooms end.
+		// Oblivion looks: hub.
+		Oblivion::Hub::AddMainMenuEntry(_menu, controller);
+		// Oblivion looks: hub end.
 	} else {
 		addAction(
 			tr::lng_profile_add_contact(),

@@ -26,6 +26,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_cloud_update.h"
 #include "oblivion/oblivion_deleted.h"
 #include "oblivion/oblivion_gift_catalog.h"
+#include "oblivion/oblivion_hub.h"
+#include "oblivion/oblivion_look_ui.h"
 #include "oblivion/oblivion_lottie_editor.h"
 #include "oblivion/oblivion_music_editor.h"
 #include "oblivion/oblivion_online.h"
@@ -913,6 +915,25 @@ void BuildInterfaceSection(SectionBuilder &builder) {
 		.title = tr::lng_oblivion_interface(),
 		.keywords = { u"interface"_q, u"интерфейс"_q },
 	});
+	// Oblivion looks: core.
+	builder.addButton({
+		.id = u"oblivion/look"_q,
+		.title = tr::lng_oblivion_look_title(),
+		.icon = { &st::menuIconPalette },
+		.label = Oblivion::Look::ChosenNameValue(),
+		.onClick = [=] { Oblivion::Look::ShowBox(controller); },
+		.keywords = {
+			u"theme"_q,
+			u"look"_q,
+			u"design"_q,
+			u"colors"_q,
+			u"тема"_q,
+			u"оформление"_q,
+			u"дизайн"_q,
+			u"цвета"_q,
+		},
+	});
+	// Oblivion looks: core end.
 	AddToggle(builder, {
 		.id = u"oblivion/show_seconds"_q,
 		.title = tr::lng_oblivion_show_seconds(),
@@ -1550,7 +1571,10 @@ void BuildSocialSection(SectionBuilder &builder) {
 		.setter = &Oblivion::Settings::setCloudFriends,
 		.keywords = { u"friends"_q, u"menu"_q, u"друзья"_q, u"меню"_q },
 	});
-	AddSectionEnd(builder, tr::lng_oblivion_social_settings_about());
+
+	// For an account that is switched off while its badge or profile is
+	// still public the text says so, and how to hide them.
+	AddSectionEnd(builder, Oblivion::Social::SettingsAboutValue(session));
 }
 // Round 5: social end.
 
@@ -1730,7 +1754,38 @@ void BuildSendOnlineSection(SectionBuilder &builder) {
 }
 // Round 5: send online end.
 
+// Oblivion looks: hub.
+// Every tool of the mod on one screen (oblivion_hub.h), the same screen
+// as «Инструменты Oblivion» of the main menu.
+void BuildHubEntry(SectionBuilder &builder) {
+	const auto controller = builder.controller();
+
+	builder.addSkip();
+	builder.addButton({
+		.id = u"oblivion/hub"_q,
+		.title = tr::lng_oblivion_hub_menu(),
+		.icon = { &st::menuIconShowAll },
+		.onClick = [=] {
+			if (controller) {
+				Oblivion::Hub::Show(controller);
+			}
+		},
+		.keywords = {
+			u"tools"_q,
+			u"hub"_q,
+			u"all"_q,
+			u"инструменты"_q,
+			u"все"_q,
+		},
+	});
+	AddSectionEnd(builder, tr::lng_oblivion_hub_settings_about());
+}
+// Oblivion looks: hub end.
+
 void BuildOblivionSectionContent(SectionBuilder &builder) {
+	// Oblivion looks: hub.
+	BuildHubEntry(builder);
+	// Oblivion looks: hub end.
 	// Round 5.
 	BuildCloudSection(builder);
 	BuildRoomsSection(builder);

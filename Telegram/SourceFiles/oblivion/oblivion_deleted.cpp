@@ -507,7 +507,9 @@ void DeletedMessagesBox(
 
 	store->deletedChanges(
 	) | rpl::filter([=](const DeletedChange &change) {
-		return !peerId || !change.peerId || (change.peerId == peerId);
+		// A saved version of an edited message changes nothing here.
+		return !change.edited
+			&& (!peerId || !change.peerId || (change.peerId == peerId));
 	}) | rpl::on_next([=](const DeletedChange &change) {
 		if (!change.removed && box->scrollTop() > 0) {
 			// Don't rebuild the list under the reader, new records

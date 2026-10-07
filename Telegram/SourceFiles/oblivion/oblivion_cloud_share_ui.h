@@ -35,7 +35,7 @@ namespace Oblivion::Share {
 
 inline constexpr auto kMaxPlaylistTitle = 128;
 inline constexpr auto kMaxPlaylistDescription = 500;
-inline constexpr auto kMaxTrackText = 256;
+inline constexpr auto kMaxTrackText = 128; // limits.track_text.
 inline constexpr auto kMaxPlaylistTracks = 500;
 inline constexpr auto kMaxPresetTitle = 64;
 inline constexpr auto kMaxPresetDescription = 300;
@@ -210,22 +210,60 @@ public:
 	[[nodiscard]] rpl::producer<> changes() const;
 
 	// For the settings sync: everything, and what came from another
-	// device (new presets are added, the known ones are replaced).
+	// device (new presets are added, the known ones are replaced, the
+	// ones deleted there are deleted here).
+	//
+	// A deleted preset leaves its id and the time behind for half a year
+	// ({"id", "time"} in exportRemovedJson()). That is what makes a
+	// deletion stay: without it the preset would come back with the next
+	// copy of a device that still has it. A deletion wins over whatever
+	// another device has done to the same preset meanwhile.
 	[[nodiscard]] QJsonArray exportJson();
-	void mergeJson(const QJsonArray &list);
+	[[nodiscard]] QJsonArray exportRemovedJson();
+	void mergeJson(
+		const QJsonArray &list,
+		const QJsonArray &removed = QJsonArray());
+	// Whether mergeJson() with the same data would change the presets,
+	// and how many presets of this device it would delete («Получить»
+	// says it before it is done).
+	[[nodiscard]] bool mergeChanges(
+		const QJsonArray &list,
+		const QJsonArray &removed);
+	[[nodiscard]] int countRemovals(const QJsonArray &removed);
 
 private:
+	struct Removed {
+		uint64 id = 0;
+		int64 time = 0; // Unixtime.
+	};
+	struct Merged {
+		bool list = false; // The presets have changed.
+		bool removed = false; // Only what is remembered as deleted.
+	};
+
 	void ensureLoaded();
 	void save();
+	Merged merge(const QJsonArray &list, const QJsonArray &removed);
 	bool mergeList(const QJsonArray &list);
+	bool noteRemoved(uint64 id, int64 time);
+	[[nodiscard]] bool wasRemoved(uint64 id) const;
 
 	const QString _path;
 	std::vector<LocalPreset> _list;
+	std::vector<Removed> _removed;
 	bool _loaded = false;
 	rpl::event_stream<> _changes;
 
 };
 [[nodiscard]] Library &PresetLibrary();
+
+// PresetHost::apply that tells whether the editor has taken the stack.
+// An editor may refuse (a locked layer, too many effects: it says so
+// itself) or have nothing to change, and it is asked through a callback
+// that returns nothing, so what tells is its own stack before and after.
+// Null for a host that can't apply.
+[[nodiscard]] Fn<bool(const QByteArray &stack)> CheckedApply(
+	const PresetHost &host);
 
 // ---- What an account remembers about its shared playlists
 // (tdata/oblivion/<id>/shared.json).
@@ -324,10 +362,17 @@ public:
 	void start();
 	void retry();
 	void cancel();
+	// The account was switched off (by the user, by the server): what
+	// was on the way will never answer. The upload stops as a failed one
+	// and retry() goes on from the same track.
+	void disconnected();
 
 	[[nodiscard]] const UploadStatus &status() const {
 		return _status;
 	}
+	// The file of this document is being taken from Telegram for the
+	// upload right now.
+	[[nodiscard]] bool fetching(not_null<DocumentData*> document) const;
 	[[nodiscard]] rpl::producer<UploadStatus> statusValue() const;
 
 	// For what follows this upload from outside, dies with it.
@@ -351,6 +396,7 @@ private:
 	void skip();
 	void fail(const Cloud::Error &error);
 	void finish(UploadStatus::Stage stage);
+	void stopFetching();
 	void clearCurrent();
 	void changed();
 
@@ -375,6 +421,16 @@ private:
 	QString _tempPath;
 	Cloud::TransferId _transfer = 0;
 	base::Timer _watchdog;
+	// The server asks to slow down (429) when tracks are added one right
+	// after another: the same track is added again a little later, and
+	// the rest of this upload keeps that pace instead of being refused
+	// track after track.
+	base::Timer _addAgain;
+	QString _addMedia;
+	bool _addKnown = false;
+	int _addRetries = 0;
+	crl::time _addGap = 0;
+	crl::time _addLast = 0;
 	int _generation = 0;
 	bool _scheduled = false;
 	rpl::lifetime _lifetime;
@@ -415,7 +471,11 @@ public:
 	[[nodiscard]] rpl::producer<> playingChanges() const;
 
 	// «Добавить к себе»: the playlist stays in the list of the user and
-	// its files are kept on this device.
+	// its files are kept on this device. The files are taken one by one;
+	// what was not taken (the app was closed, the connection was lost)
+	// is taken later: when the account connects, a while after a
+	// failure, when the playlist is opened. Tracks the owner adds later
+	// are saved too, the files of removed ones are deleted.
 	void keep(const Playlist &playlist);
 	void forget(const Playlist &playlist);
 	[[nodiscard]] bool kept(const QString &playlistId);
@@ -432,6 +492,11 @@ private:
 		QString playlistId;
 		QString media;
 	};
+	enum class KeepResult {
+		Done,
+		Gone, // Not on the server any more: not asked again.
+		Failed, // No connection: tried again later.
+	};
 
 	[[nodiscard]] QString keptPath(const QString &media) const;
 	[[nodiscard]] DocumentData *makeDocument(
@@ -442,8 +507,14 @@ private:
 	void preload(int index);
 	void setupPlayer();
 	void resetPlaying();
+	void disconnected();
+	bool queueMissing(const Playlist &playlist);
+	void resumeKeeping();
+	void pruneKeepQueue();
+	void dropUnneeded(const std::vector<Track> &tracks);
+	[[nodiscard]] bool neededMedia(const QString &media);
 	void keepNext();
-	void keepDone(const QString &media, bool success);
+	void keepDone(const QString &media, KeepResult result);
 
 	const not_null<Main::Session*> _session;
 	const base::weak_ptr<Cloud::Account> _account;
@@ -461,8 +532,14 @@ private:
 	rpl::event_stream<> _playingChanges;
 
 	std::vector<KeepTask> _keepQueue;
+	// What the server did not give in this launch.
+	base::flat_set<QString> _keepGone;
 	Cloud::TransferId _keepTransfer = 0;
 	bool _keepBusy = false;
+	bool _keepLocal = false; // Busy with a copy on the disk, not a download.
+	int _keepFailures = 0;
+	int _keepGoneRun = 0; // Refusals of the server in a row.
+	base::Timer _keepRetry;
 	rpl::event_stream<> _keptChanges;
 
 	rpl::event_stream<Playlist> _updates;

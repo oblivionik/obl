@@ -1624,6 +1624,8 @@ PRIVATE
     oblivion/oblivion_ghost_button.h
     oblivion/oblivion_gift_catalog.cpp
     oblivion/oblivion_gift_catalog.h
+    oblivion/oblivion_hub.cpp
+    oblivion/oblivion_hub.h
     oblivion/oblivion_interface.cpp
     oblivion/oblivion_interface.h
     oblivion/oblivion_lang.cpp
@@ -1634,6 +1636,12 @@ PRIVATE
     oblivion/oblivion_listen_ui.h
     oblivion/oblivion_local_names.cpp
     oblivion/oblivion_local_names.h
+    oblivion/oblivion_look.cpp
+    oblivion/oblivion_look.h
+    oblivion/oblivion_look_hooks.cpp
+    oblivion/oblivion_look_hooks.h
+    oblivion/oblivion_look_ui.cpp
+    oblivion/oblivion_look_ui.h
     oblivion/oblivion_lottie.cpp
     oblivion/oblivion_lottie.h
     oblivion/oblivion_lottie_doc.cpp

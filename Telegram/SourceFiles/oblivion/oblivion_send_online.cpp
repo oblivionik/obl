@@ -21,9 +21,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "history/history.h"
 #include "history/history_item.h"
+#include "history/history_item_components.h"
 #include "history/history_item_helpers.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "mtproto/facade.h"
+#include "mtproto/mtp_instance.h"
 #include "mtproto/mtproto_response.h"
 #include "oblivion/oblivion_lang.h"
 #include "oblivion/oblivion_online.h"
@@ -96,6 +99,8 @@ const auto kErrorUnavailable = u"OBLIVION_UNAVAILABLE"_q;
 const auto kErrorPaid = u"OBLIVION_PAID"_q;
 const auto kErrorEmpty = u"MESSAGE_EMPTY"_q;
 const auto kErrorSave = u"OBLIVION_NOT_SAVED"_q;
+const auto kErrorChatDeleted = u"OBLIVION_CHAT_DELETED"_q;
+const auto kErrorBlocked = u"OBLIVION_BLOCKED"_q;
 
 enum class State : uchar {
 	Waiting,
@@ -121,6 +126,22 @@ struct Item {
 	QString error;
 	bool forced = false; // Send without waiting for the person.
 	bool asked = false; // The user was told about the problem.
+
+	// Forced not by a click, but by an attempt that did not tell whether
+	// the message got through (see unsure): it is repeated by itself,
+	// without waiting for the person once more, but only within
+	// kResumeWindow of that attempt. Later the user decides.
+	bool resumed = false;
+
+	// An attempt ended in a way that does not tell whether the message
+	// got through (no answer, a server error, the app stopped). The next
+	// attempt repeats the same random id with the same text, so the text
+	// is not changed any more.
+	bool unsure = false;
+
+	// The chat was deleted or the person blocked while the message was
+	// being sent: whatever the answer is, it is not tried again.
+	QString stop;
 };
 
 // The queue of one account: only the rules, no session and no files.
@@ -159,23 +180,33 @@ public:
 	// «Ждать ещё»: an expired one waits again.
 	bool extend(uint64 id, TimeId now, int hours);
 
-	// The waiting ones whose time is over become expired.
+	// The waiting ones whose time is over become expired, the ones a
+	// restart was going to send again too late become not confirmed.
 	std::vector<uint64> expire(TimeId now);
 
 	// The next message for the person, marked as being sent. Nothing
 	// while another one is on its way, while the first in line waits
 	// after an error and while the person is not online (a forced one
-	// does not wait for that).
+	// does not wait for that). A held message (it is being edited or
+	// its removal is being confirmed) does not go, and to keep the order
+	// neither do the ones that wait behind it.
 	[[nodiscard]] std::optional<Item> begin(
 		uint64 peerId,
 		TimeId now,
-		bool online);
+		bool online,
+		const base::flat_set<uint64> &held = {});
 	void sent(uint64 id);
 	void failed(
 		uint64 id,
 		const QString &error,
 		bool permanent,
-		TimeId retryAt);
+		TimeId retryAt,
+		bool unsure = false);
+
+	// The chat was deleted or the person blocked: nothing for them is
+	// sent by itself any more, the waiting ones stay in the list as not
+	// sent, with this reason. False if there was nothing to stop.
+	bool cancel(uint64 peerId, const QString &error);
 
 	// The persons something waits for, forced or not.
 	[[nodiscard]] base::flat_set<uint64> waitedPeers() const;
@@ -225,6 +256,15 @@ private:
 	if (!tags.isEmpty()) {
 		result.insert(u"tags"_q, tags);
 	}
+	if (item.resumed) {
+		result.insert(u"resumed"_q, true);
+	}
+	if (item.unsure) {
+		result.insert(u"unsure"_q, true);
+	}
+	if (!item.stop.isEmpty()) {
+		result.insert(u"stop"_q, item.stop);
+	}
 	return result;
 }
 
@@ -243,6 +283,9 @@ private:
 		.error = data.value(u"error"_q).toString(),
 		.forced = data.value(u"forced"_q).toBool(),
 		.asked = data.value(u"asked"_q).toBool(),
+		.resumed = data.value(u"resumed"_q).toBool(),
+		.unsure = data.value(u"unsure"_q).toBool(),
+		.stop = data.value(u"stop"_q).toString(),
 	};
 	result.text.text = data.value(u"text"_q).toString();
 	const auto size = int(result.text.text.size());
@@ -297,13 +340,24 @@ Queue Queue::Parse(const QByteArray &bytes, TimeId now) {
 		}
 		auto &item = *parsed;
 		if (item.state == State::Sending) {
-			if (now >= item.attempted
+			// Nobody knows whether it got through. The chat that was
+			// deleted meanwhile gets nothing by itself any more.
+			item.unsure = true;
+			if (item.stop.isEmpty()
+				&& now >= item.attempted
 				&& now - item.attempted <= kResumeWindow) {
 				item.state = State::Waiting;
 				item.forced = true;
+				item.resumed = true;
 			} else {
 				item.state = State::Unconfirmed;
 				item.asked = false;
+				item.stop = QString();
+			}
+		} else {
+			item.stop = QString();
+			if (item.state != State::Waiting || !item.forced) {
+				item.resumed = false;
 			}
 		}
 		result._lastId = std::max(result._lastId, item.id);
@@ -375,6 +429,7 @@ bool Queue::canEdit(uint64 id) const {
 		&& (item->state == State::Waiting
 			|| item->state == State::Expired
 			|| item->state == State::Failed)
+		&& !item->unsure
 		&& !(item->forced && item->attempts > 0);
 }
 
@@ -402,6 +457,7 @@ bool Queue::resend(uint64 id) {
 	}
 	item->state = State::Waiting;
 	item->forced = true;
+	item->resumed = false;
 	item->retryAt = 0;
 	item->error = QString();
 	item->asked = false;
@@ -420,12 +476,36 @@ bool Queue::extend(uint64 id, TimeId now, int hours) {
 	return true;
 }
 
+// After an attempt that did not tell whether the message got through (the
+// app stopped, the server answered with its own error or not at all) the
+// message goes again by itself only soon after that attempt, while the
+// server surely remembers its random id and refuses a second copy. Later
+// nobody can tell whether a repeat would be a second message, so the
+// user decides. A clock that went back is not trusted.
+[[nodiscard]] bool ResumeIsOver(const Item &item, TimeId now) {
+	return item.resumed
+		&& (now < item.attempted || now - item.attempted > kResumeWindow);
+}
+
+void MarkUnconfirmed(Item &item) {
+	item.state = State::Unconfirmed;
+	item.forced = false;
+	item.resumed = false;
+	item.retryAt = 0;
+	item.asked = false;
+}
+
 std::vector<uint64> Queue::expire(TimeId now) {
 	auto result = std::vector<uint64>();
 	for (auto &item : _items) {
-		if (item.state == State::Waiting
-			&& !item.forced
-			&& item.deadline <= now) {
+		if (item.state != State::Waiting) {
+			continue;
+		} else if (item.forced) {
+			if (ResumeIsOver(item, now)) {
+				MarkUnconfirmed(item);
+				result.push_back(item.id);
+			}
+		} else if (item.deadline <= now) {
 			item.state = State::Expired;
 			item.asked = false;
 			result.push_back(item.id);
@@ -434,14 +514,24 @@ std::vector<uint64> Queue::expire(TimeId now) {
 	return result;
 }
 
-std::optional<Item> Queue::begin(uint64 peerId, TimeId now, bool online) {
+std::optional<Item> Queue::begin(
+		uint64 peerId,
+		TimeId now,
+		bool online,
+		const base::flat_set<uint64> &held) {
 	auto chosen = (Item*)nullptr;
 	for (auto &item : _items) {
 		if (item.peerId != peerId) {
 			continue;
 		} else if (item.state == State::Sending) {
 			return std::nullopt;
-		} else if (item.state == State::Waiting && item.forced && !chosen) {
+		} else if (item.state != State::Waiting || !item.forced) {
+			continue;
+		} else if (ResumeIsOver(item, now)) {
+			MarkUnconfirmed(item);
+		} else if (!chosen
+			&& !held.contains(item.id)
+			&& item.retryAt <= now) {
 			chosen = &item;
 		}
 	}
@@ -449,12 +539,16 @@ std::optional<Item> Queue::begin(uint64 peerId, TimeId now, bool online) {
 		for (auto &item : _items) {
 			if (item.peerId != peerId || item.state != State::Waiting) {
 				continue;
+			} else if (item.forced || held.contains(item.id)) {
+				// A held one, or one that is repeated a bit later. The
+				// order is kept: the ones after it wait as well.
+				return std::nullopt;
 			} else if (item.deadline <= now) {
 				item.state = State::Expired;
 				item.asked = false;
 				continue;
 			} else if (item.retryAt > now) {
-				// The order is kept: the ones after it wait as well.
+				// The order is kept here too.
 				return std::nullopt;
 			}
 			chosen = &item;
@@ -467,6 +561,7 @@ std::optional<Item> Queue::begin(uint64 peerId, TimeId now, bool online) {
 	chosen->state = State::Sending;
 	chosen->attempted = now;
 	chosen->forced = false;
+	chosen->resumed = false;
 	++chosen->attempts;
 	return *chosen;
 }
@@ -482,20 +577,59 @@ void Queue::failed(
 		uint64 id,
 		const QString &error,
 		bool permanent,
-		TimeId retryAt) {
+		TimeId retryAt,
+		bool unsure) {
 	const auto item = lookup(id);
 	if (!item || item->state != State::Sending) {
 		return;
 	}
-	item->error = error;
-	if (permanent || item->attempts >= kMaxAttempts) {
+	item->unsure = item->unsure || unsure;
+	const auto stopped = !item->stop.isEmpty();
+	item->error = stopped ? base::take(item->stop) : error;
+	if (stopped || permanent) {
 		item->state = State::Failed;
+		item->retryAt = 0;
+		item->asked = false;
+	} else if (item->attempts >= kMaxAttempts) {
+		// Given up. After an attempt with no clear answer the message
+		// may be there already, the user is told exactly that.
+		item->state = item->unsure ? State::Unconfirmed : State::Failed;
 		item->retryAt = 0;
 		item->asked = false;
 	} else {
 		item->state = State::Waiting;
 		item->retryAt = retryAt;
+		if (item->unsure) {
+			// The repeat does not wait for the person to come online once
+			// more: hours later the server may not know the random id any
+			// more and a message that did get through would come twice.
+			// That holds for every later attempt of this message too.
+			item->forced = true;
+			item->resumed = true;
+		}
 	}
+}
+
+bool Queue::cancel(uint64 peerId, const QString &error) {
+	auto result = false;
+	for (auto &item : _items) {
+		if (item.peerId != peerId) {
+			continue;
+		} else if (item.state == State::Waiting) {
+			item.state = State::Failed;
+			item.error = error;
+			item.forced = false;
+			item.resumed = false;
+			item.retryAt = 0;
+			item.asked = false;
+			result = true;
+		} else if (item.state == State::Sending && item.stop != error) {
+			// The request has left already, its answer is waited for.
+			item.stop = error;
+			result = true;
+		}
+	}
+	return result;
 }
 
 base::flat_set<uint64> Queue::waitedPeers() const {
@@ -576,6 +710,7 @@ struct Verdict {
 	bool sent = false;
 	bool permanent = false;
 	TimeId retryAt = 0;
+	bool unsure = false; // The message may have got through.
 };
 
 [[nodiscard]] Verdict Judge(
@@ -589,8 +724,15 @@ struct Verdict {
 		return { .sent = true };
 	} else if (const auto flood = FloodSeconds(type)) {
 		return { .retryAt = now + flood + kFloodMargin };
-	} else if (code < 0 || code >= 500) {
-		return { .retryAt = now + kRetryStep * std::max(attempts, 1) };
+	} else if (code <= 0 || code >= 500) {
+		// No answer of the server about the message itself: a server
+		// error, a lost connection, an answer that could not be read (the
+		// errors made on this device have the code 0). It is repeated
+		// with the same random id, the server refuses a second copy.
+		return {
+			.retryAt = now + kRetryStep * std::max(attempts, 1),
+			.unsure = true,
+		};
 	}
 	return { .permanent = true };
 }
@@ -605,10 +747,14 @@ struct Verdict {
 		&& !user->isInaccessible();
 }
 
-// Why nothing can be sent to the chat right now, empty if it can.
-[[nodiscard]] QString Unavailable(UserData *user) {
-	if (!user || !Eligible(user) || user->isBlocked()) {
+// Why nothing can be sent to the chat right now, empty if it can. A
+// person who is not loaded yet is not a question for this function: that
+// is a reason to wait, not to give up (see Account::flush).
+[[nodiscard]] QString Unavailable(not_null<UserData*> user) {
+	if (!Eligible(user)) {
 		return kErrorUnavailable;
+	} else if (user->isBlocked()) {
+		return kErrorBlocked;
 	} else if (user->starsPerMessageChecked() > 0) {
 		return kErrorPaid;
 	} else if (!Data::CanSendTexts(user)) {
@@ -636,6 +782,11 @@ struct Verdict {
 		if (item.error == kErrorPaid
 			|| item.error.startsWith(u"ALLOW_PAYMENT_REQUIRED"_q)) {
 			return tr::lng_oblivion_sendonline_reason_paid(tr::now);
+		} else if (item.error == kErrorChatDeleted) {
+			return tr::lng_oblivion_sendonline_reason_chat_deleted(tr::now);
+		} else if (item.error == kErrorBlocked
+			|| item.error == u"YOU_BLOCKED_USER"_q) {
+			return tr::lng_oblivion_sendonline_reason_blocked(tr::now);
 		} else if (item.error == kErrorUnavailable
 			|| ranges::contains(kGone, item.error)) {
 			return tr::lng_oblivion_sendonline_reason_unavailable(tr::now);
@@ -655,6 +806,14 @@ struct Verdict {
 	return (state == State::Expired)
 		|| (state == State::Failed)
 		|| (state == State::Unconfirmed);
+}
+
+// For the user it is being sent: the request is out, or it goes as soon
+// as it can without waiting for the person (after «Отправить сейчас»,
+// between the repeats of an attempt that got no clear answer).
+[[nodiscard]] bool OnItsWay(const Item &item) {
+	return (item.state == State::Sending)
+		|| (item.state == State::Waiting && item.forced);
 }
 
 [[nodiscard]] QString Preview(const QString &text, int limit) {
@@ -707,7 +866,7 @@ struct BarContent {
 	for (const auto &item : items) {
 		if (item.peerId != peerId) {
 			continue;
-		} else if (item.state == State::Sending) {
+		} else if (OnItsWay(item)) {
 			sending = sending ? sending : &item;
 		} else if (Problem(item.state)) {
 			++problems;
@@ -922,7 +1081,11 @@ void Bar::paintEvent(QPaintEvent *e) {
 		state = u" · "_q + _content.state;
 		const auto stateWidth = statusFont->width(state);
 		const auto statusWidth = statusFont->width(status);
-		const auto minimal = style::ConvertScale(48);
+
+		// In a narrow chat the message itself is worth more than the
+		// words after it: they stay only while a readable part of the
+		// message fits before them.
+		const auto minimal = style::ConvertScale(140);
 		if (statusWidth + stateWidth <= available) {
 			stateLeft += statusWidth;
 		} else if (available - stateWidth >= minimal) {
@@ -1038,30 +1201,86 @@ struct EditArgs {
 	Fn<bool(TextWithTags)> save;
 };
 
+struct RowAction {
+	QString text;
+	Fn<void()> callback;
+	bool attention = false; // Takes the message away: the link is red.
+};
+
+[[nodiscard]] const style::LinkButton &AttentionLinkStyle() {
+	static const auto result = [] {
+		auto st = st::defaultLinkButton;
+		st.color = st::attentionButtonFg;
+		st.overColor = st::attentionButtonFgOver;
+		return st;
+	}();
+	return result;
+}
+
+// The links of a row, one after another. The ones that don't fit in the
+// width (another language, a large interface scale) go to the next line,
+// none of them is cut by the edge of the box.
+class ActionLinks final : public Ui::RpWidget {
+public:
+	using RpWidget::RpWidget;
+
+	void addLink(not_null<Ui::LinkButton*> link) {
+		_links.push_back(link);
+	}
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+
+private:
+	std::vector<not_null<Ui::LinkButton*>> _links;
+
+};
+
+int ActionLinks::resizeGetHeight(int newWidth) {
+	const auto skip = st::boxLittleSkip * 2;
+	const auto lineSkip = st::boxLittleSkip / 2;
+	auto left = 0;
+	auto top = 0;
+	auto bottom = 0;
+	for (const auto &link : _links) {
+		if (left > 0 && newWidth > 0 && left + link->width() > newWidth) {
+			left = 0;
+			top = bottom + lineSkip;
+		}
+		link->moveToLeft(left, top, newWidth);
+		left += link->width() + skip;
+		bottom = std::max(bottom, top + link->height());
+	}
+	return bottom;
+}
+
 void AddActions(
 		not_null<Ui::VerticalLayout*> container,
-		std::vector<std::pair<QString, Fn<void()>>> actions) {
+		not_null<QWidget*> guard,
+		std::vector<RowAction> actions) {
 	if (actions.empty()) {
 		return;
 	}
-	auto links = object_ptr<Ui::RpWidget>(container);
+	auto links = object_ptr<ActionLinks>(container);
 	const auto raw = links.data();
-	const auto skip = st::boxLittleSkip * 2;
-	auto left = 0;
-	auto height = 0;
-	for (auto &[text, callback] : actions) {
-		const auto link = Ui::CreateChild<Ui::LinkButton>(raw, text);
+	const auto alive = guard.get();
+	for (auto &action : actions) {
+		const auto link = Ui::CreateChild<Ui::LinkButton>(
+			raw,
+			action.text,
+			action.attention ? AttentionLinkStyle() : st::defaultLinkButton);
 
 		// An action may rebuild the list at once and destroy this very
-		// link, so it never runs inside of the click.
-		link->setClickedCallback([=, callback = std::move(callback)] {
-			crl::on_main(link, callback);
+		// link, so it never runs inside of the click. It is kept by the
+		// list, not by the link: a click made right before the list was
+		// rebuilt by something else is not lost, the action looks its
+		// message up again by the id.
+		link->setClickedCallback([=, callback = std::move(action.callback)] {
+			crl::on_main(alive, callback);
 		});
-		link->moveToLeft(left, 0);
-		left += link->width() + skip;
-		height = std::max(height, link->height());
+		raw->addLink(link);
 	}
-	raw->resize(left - skip, height);
+	raw->resizeToWidth(raw->width());
 	const auto &padding = st::boxRowPadding;
 	container->add(
 		std::move(links),
@@ -1073,7 +1292,8 @@ void AddListRow(
 		not_null<Ui::VerticalLayout*> list,
 		const ListRow &data,
 		const ListArgs &args,
-		bool showChat) {
+		bool showChat,
+		bool last) {
 	const auto row = list->add(object_ptr<Ui::VerticalLayout>(list));
 	const auto &padding = st::boxRowPadding;
 	const auto skip = st::boxLittleSkip;
@@ -1086,8 +1306,12 @@ void AddListRow(
 				st::defaultFlatLabel),
 			padding);
 	}
+
+	// The reason and the message take the lines they need: a label of
+	// a style without the minimal width stays one line tall whatever its
+	// text is, the rest of the message would be cut away.
 	const auto status = row->add(
-		object_ptr<Ui::FlatLabel>(row, data.status, st::defaultSubTextLabel),
+		object_ptr<Ui::FlatLabel>(row, data.status, st::boxDividerLabel),
 		padding);
 	if (data.problem) {
 		status->setTextColorOverride(st::attentionButtonFg->c);
@@ -1095,17 +1319,22 @@ void AddListRow(
 		status->setTextColorOverride(st::windowActiveTextFg->c);
 	}
 	row->add(
-		object_ptr<Ui::FlatLabel>(row, data.text, st::defaultFlatLabel),
-		style::margins(padding.left(), skip / 2, padding.right(), 0));
+		object_ptr<Ui::FlatLabel>(row, data.text, st::boxLabel),
+		style::margins(padding.left(), skip / 4, padding.right(), 0));
 
 	const auto id = data.id;
-	auto actions = std::vector<std::pair<QString, Fn<void()>>>();
+	auto actions = std::vector<RowAction>();
 	const auto action = [&](
 			bool allowed,
 			const QString &text,
-			const Fn<void(uint64)> &callback) {
+			const Fn<void(uint64)> &callback,
+			bool attention = false) {
 		if (allowed && callback) {
-			actions.emplace_back(text, [=] { callback(id); });
+			actions.push_back({
+				.text = text,
+				.callback = [=] { callback(id); },
+				.attention = attention,
+			});
 		}
 	};
 	action(
@@ -1123,13 +1352,17 @@ void AddListRow(
 	action(
 		data.canRemove,
 		tr::lng_oblivion_sendonline_action_cancel(tr::now),
-		args.remove);
-	AddActions(row, std::move(actions));
+		args.remove,
+		true);
+	AddActions(row, list, std::move(actions));
 	Ui::AddSkip(row, skip);
 
-	auto line = object_ptr<Ui::PlainShadow>(row);
-	line->resize(line->width(), st::lineWidth);
-	row->add(std::move(line), padding);
+	// The lines are between the messages, not under the last one.
+	if (!last) {
+		auto line = object_ptr<Ui::PlainShadow>(row);
+		line->resize(line->width(), st::lineWidth);
+		row->add(std::move(line), padding);
+	}
 }
 
 void ListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
@@ -1174,8 +1407,8 @@ void ListBox(not_null<Ui::GenericBox*> box, ListArgs &&args) {
 		shared->rows
 	) | rpl::on_next([=](const std::vector<ListRow> &rows) {
 		list->clear();
-		for (const auto &row : rows) {
-			AddListRow(list, row, *shared, showChat);
+		for (auto i = 0, count = int(rows.size()); i != count; ++i) {
+			AddListRow(list, rows[i], *shared, showChat, (i + 1 == count));
 		}
 		list->resizeToWidth(content->width());
 		empty->toggle(rows.empty(), anim::type::instant);
@@ -1193,7 +1426,7 @@ void EditBox(not_null<Ui::GenericBox*> box, EditArgs &&args) {
 		box,
 		st::newGroupDescription,
 		Ui::InputField::Mode::MultiLine,
-		tr::lng_message_ph(),
+		tr::lng_oblivion_sendonline_edit_placeholder(),
 		args.text));
 	field->setMaxLength(kMaxTextLength);
 	field->setSubmitSettings(Ui::InputField::SubmitSettings::CtrlEnter);
@@ -1232,6 +1465,12 @@ void EditBox(not_null<Ui::GenericBox*> box, EditArgs &&args) {
 	return *result;
 }
 
+enum class SendNowResult {
+	Started, // Or on its way already.
+	Gone, // Not in the queue any more.
+	NotLoaded, // The person is not loaded yet, nothing was changed.
+};
+
 // The queue of one account with its file, the triggers and the sending.
 class Account final : public base::has_weak_ptr {
 public:
@@ -1242,14 +1481,30 @@ public:
 	}
 	[[nodiscard]] bool onlineNow(uint64 peerId) const;
 
-	uint64 enqueue(not_null<UserData*> user, const TextWithTags &text);
+	// Zero if the message was not taken, notSaved tells that the reason
+	// is the file that could not be written.
+	uint64 enqueue(
+		not_null<UserData*> user,
+		const TextWithTags &text,
+		bool &notSaved);
 	bool edit(uint64 id, const TextWithTags &text);
-	void remove(uint64 id);
-	void sendNow(uint64 id);
+	bool remove(uint64 id);
+	SendNowResult sendNow(uint64 id);
 	void waitMore(uint64 id);
 	void forget();
 
+	// While a message is being edited or its removal is being confirmed
+	// it is not sent, see Queue::begin(). Every hold() is followed by a
+	// release(), from the lifetime of the box that asked for it.
+	void hold(uint64 id);
+	void release(uint64 id);
+
 private:
+	struct Hold {
+		uint64 peerId = 0;
+		int count = 0;
+	};
+
 	void load();
 	bool save();
 	void changed();
@@ -1259,15 +1514,19 @@ private:
 	void send(const Item &item);
 	void sendDone(uint64 id);
 	void sendFailed(uint64 id, const QString &type, int code);
+	void stopFor(uint64 peerId, const QString &error);
 	void pushWaited();
 	void ask();
 	[[nodiscard]] bool onlineAt(uint64 peerId, TimeId now) const;
+	[[nodiscard]] UserData *loadedUser(uint64 peerId) const;
+	[[nodiscard]] base::flat_set<uint64> heldIds() const;
 
 	const not_null<Main::Session*> _session;
 	const QString _path;
 	Queue _queue;
 	base::Timer _timer;
 	base::flat_map<uint64, TimeId> _seen; // A message came, see kBurst.
+	base::flat_map<uint64, Hold> _holds;
 	bool _forgotten = false;
 
 	rpl::lifetime _lifetime;
@@ -1318,10 +1577,41 @@ Account::Account(not_null<Main::Session*> session)
 			|| !_queue.count(peerId)) {
 			return;
 		}
+
+		// An answer of the person's business bot is not a sign of them.
+		// A message marked as a scheduled one still is: that is how
+		// "send without going online" of another Oblivion looks from
+		// here, and those people often hide their last seen time.
+		const auto author = item->Get<HistoryMessageSigned>();
+		if (author && author->viaBusinessBot) {
+			return;
+		}
 		const auto now = base::unixtime::now();
 		if (item->date() + kFreshMessage >= now) {
 			_seen[peerId] = now;
 			flushLater(peerId);
+		}
+	}, _lifetime);
+
+	// «Удалить чат» on this device: what waits for the person is not
+	// sent any more, it stays in the list as not sent. The chat has left
+	// the chats list by this moment, after «Очистить историю» it is
+	// still there and the bar with the waiting messages stays in sight.
+	// The event comes from the middle of History::clear(), so only the
+	// queue and its file are touched right here.
+	session->data().historyCleared(
+	) | rpl::on_next([=](not_null<const History*> history) {
+		const auto peer = history->peer;
+		if (peer->isUser() && !history->inChatList()) {
+			stopFor(peer->id.value, kErrorChatDeleted);
+		}
+	}, _lifetime);
+
+	session->changes().peerUpdates(
+		Data::PeerUpdate::Flag::IsBlocked
+	) | rpl::on_next([=](const Data::PeerUpdate &update) {
+		if (update.peer->isBlocked()) {
+			stopFor(update.peer->id.value, kErrorBlocked);
 		}
 	}, _lifetime);
 
@@ -1389,8 +1679,7 @@ void Account::pushWaited() {
 	auto ids = base::flat_set<uint64>();
 	if (!_forgotten) {
 		for (const auto peerId : _queue.waitedPeers()) {
-			const auto user = _session->data().userLoaded(
-				peerToUser(PeerId(peerId)));
+			const auto user = loadedUser(peerId);
 			if (user && !user->lastseen().isHidden()) {
 				ids.emplace(peerId);
 			}
@@ -1399,14 +1688,63 @@ void Account::pushWaited() {
 	Online::SetWaitedUsers(_session, std::move(ids));
 }
 
+UserData *Account::loadedUser(uint64 peerId) const {
+	const auto id = PeerId(peerId);
+	return peerIsUser(id)
+		? _session->data().userLoaded(peerToUser(id))
+		: nullptr;
+}
+
 bool Account::onlineAt(uint64 peerId, TimeId now) const {
 	const auto i = _seen.find(peerId);
 	if (i != end(_seen) && i->second <= now && i->second + kBurst >= now) {
 		return true;
 	}
-	const auto user = _session->data().userLoaded(
-		peerToUser(PeerId(peerId)));
+	const auto user = loadedUser(peerId);
 	return user && user->lastseen().isOnline(now);
+}
+
+base::flat_set<uint64> Account::heldIds() const {
+	auto result = base::flat_set<uint64>();
+	for (const auto &[id, hold] : _holds) {
+		result.emplace(id);
+	}
+	return result;
+}
+
+void Account::hold(uint64 id) {
+	const auto item = _queue.find(id);
+	auto &hold = _holds[id];
+	if (item) {
+		hold.peerId = item->peerId;
+	}
+	++hold.count;
+}
+
+void Account::release(uint64 id) {
+	const auto i = _holds.find(id);
+	if (i == end(_holds)) {
+		return;
+	} else if (--i->second.count > 0) {
+		return;
+	}
+	const auto peerId = i->second.peerId;
+	_holds.erase(i);
+	if (peerId && !_forgotten && _queue.count(peerId) > 0) {
+		// The person may have come online meanwhile: what was held (with
+		// its new text) and what waited behind it goes now.
+		flushLater(peerId);
+	}
+}
+
+void Account::stopFor(uint64 peerId, const QString &error) {
+	if (_forgotten || !_queue.cancel(peerId, error)) {
+		return;
+	}
+	save();
+	crl::on_main(this, [=] {
+		changed();
+	});
 }
 
 bool Account::onlineNow(uint64 peerId) const {
@@ -1444,7 +1782,18 @@ void Account::flush(uint64 peerId) {
 	}
 	const auto now = base::unixtime::now();
 	const auto expired = !_queue.expire(now).empty();
-	const auto item = _queue.begin(peerId, now, onlineAt(peerId, now));
+
+	// Two reasons to wait and never to give up: the person is not loaded
+	// yet (right after the start, before the chats arrive), and there is
+	// no connection (a request made now would leave whenever it comes
+	// back, maybe long after the person was online). The timer tries
+	// again, what a restart left to be sent again has its own time limit
+	// in Queue::expire().
+	const auto ready = loadedUser(peerId)
+		&& (_session->mtp().dcstate() == MTP::ConnectedState);
+	const auto item = ready
+		? _queue.begin(peerId, now, onlineAt(peerId, now), heldIds())
+		: std::optional<Item>();
 	if (!item) {
 		if (expired) {
 			save();
@@ -1463,14 +1812,24 @@ void Account::flush(uint64 peerId) {
 
 void Account::send(const Item &item) {
 	const auto id = item.id;
-	const auto user = _session->data().userLoaded(
-		peerToUser(PeerId(item.peerId)));
+	const auto user = loadedUser(item.peerId);
 	const auto refuse = [&](const QString &error) {
 		_queue.failed(id, error, true, 0);
 		save();
 		changed();
 	};
-	if (const auto reason = Unavailable(user); !reason.isEmpty()) {
+	if (!user) {
+		// flush() has just seen the person loaded. Still, "not loaded" is
+		// never a refusal: the message waits and is tried again.
+		_queue.failed(
+			id,
+			QString(),
+			false,
+			base::unixtime::now() + kRetryStep);
+		save();
+		changed();
+		return;
+	} else if (const auto reason = Unavailable(user); !reason.isEmpty()) {
 		refuse(reason);
 		return;
 	}
@@ -1503,7 +1862,23 @@ void Account::send(const Item &item) {
 	}
 
 	// "Send without going online" of the ghost mode, as for any text.
+	//
+	// One difference. A send made by the user reads the chat on the
+	// server at that moment (ReadOnSend), and when the message is
+	// delivered everything before it is marked as read, here and for the
+	// person, on that ground (ReadDelivered in oblivion_sending.cpp).
+	// This send reads nothing, the user may be away and may not have seen
+	// what the person wrote. So the delivery is first announced with an
+	// unknown moment of sending (RefreshSendOptions), and the send itself
+	// joins that announcement: the delivery then reads nothing in a chat
+	// that is read invisibly, unless the user has sent something there
+	// by hand shortly before and nobody wrote since.
 	auto action = Api::SendAction(history, Api::SendOptions());
+	if (Get().offlineSend()) {
+		auto announce = Api::SendOptions();
+		announce.oblivionOffline = true;
+		RefreshSendOptions(announce, peer);
+	}
 	AdjustSendAction(action, sending.text, 1);
 	const auto scheduled = action.options.scheduled;
 
@@ -1614,14 +1989,21 @@ void Account::sendFailed(uint64 id, const QString &type, int code) {
 		sendDone(id);
 		return;
 	}
-	_queue.failed(id, type, verdict.permanent, verdict.retryAt);
+	_queue.failed(
+		id,
+		type,
+		verdict.permanent,
+		verdict.retryAt,
+		verdict.unsure);
 	save();
 	changed();
 }
 
 uint64 Account::enqueue(
 		not_null<UserData*> user,
-		const TextWithTags &text) {
+		const TextWithTags &text,
+		bool &notSaved) {
+	notSaved = false;
 	if (_forgotten) {
 		return 0;
 	}
@@ -1650,6 +2032,7 @@ uint64 Account::enqueue(
 		return 0;
 	} else if (!save()) {
 		_queue.remove(id);
+		notSaved = true;
 		return 0;
 	}
 	changed();
@@ -1666,21 +2049,33 @@ bool Account::edit(uint64 id, const TextWithTags &text) {
 	return true;
 }
 
-void Account::remove(uint64 id) {
-	if (!_forgotten && _queue.remove(id)) {
-		save();
-		changed();
+bool Account::remove(uint64 id) {
+	if (_forgotten || !_queue.remove(id)) {
+		return false;
 	}
+	save();
+	changed();
+	return true;
 }
 
-void Account::sendNow(uint64 id) {
+SendNowResult Account::sendNow(uint64 id) {
 	const auto item = _queue.find(id);
-	const auto peerId = item ? item->peerId : uint64();
-	if (!_forgotten && _queue.resend(id)) {
-		save();
-		changed();
-		flushLater(peerId);
+	if (_forgotten || !item) {
+		return SendNowResult::Gone;
+	} else if (item->state == State::Sending) {
+		return SendNowResult::Started;
 	}
+	const auto peerId = item->peerId;
+	if (!loadedUser(peerId)) {
+		// Otherwise the click would work nobody knows when: at the moment
+		// the chat happens to get loaded.
+		return SendNowResult::NotLoaded;
+	}
+	_queue.resend(id);
+	save();
+	changed();
+	flushLater(peerId);
+	return SendNowResult::Started;
 }
 
 void Account::waitMore(uint64 id) {
@@ -1701,6 +2096,7 @@ void Account::forget() {
 	_queue.clear();
 	_timer.cancel();
 	_seen.clear();
+	_holds.clear();
 	QFile::remove(_path);
 	pushWaited();
 	_forgotten = true;
@@ -1753,11 +2149,12 @@ void Account::ask() {
 		const QString &chat,
 		TimeId now) {
 	const auto problem = Problem(item.state);
+	const auto sending = OnItsWay(item);
 	return {
 		.id = item.id,
 		.chat = chat,
 		.text = Preview(item.text.text, kListTextLength),
-		.status = (item.state == State::Sending)
+		.status = sending
 			? tr::lng_oblivion_sendonline_bar_sending(tr::now)
 			: problem
 			? ReasonText(item)
@@ -1768,7 +2165,7 @@ void Account::ask() {
 				lt_date,
 				MomentText(item.deadline, now)),
 		.problem = problem,
-		.sending = (item.state == State::Sending),
+		.sending = sending,
 		.canEdit = queue.canEdit(item.id),
 		.canSend = (item.state != State::Sending),
 		.canWait = (item.state == State::Expired),
@@ -1802,6 +2199,18 @@ void ShowListFor(
 	Start(session);
 	const auto weak = base::make_weak(controller);
 	const auto show = controller->uiShow();
+
+	// The list may be a moment behind the queue: the message of a row
+	// that was clicked may be gone or on its way already.
+	const auto tellLost = [=](uint64 id) {
+		const auto account = Lookup(session);
+		const auto item = account ? account->queue().find(id) : nullptr;
+		show->showToast(!item
+			? tr::lng_oblivion_sendonline_gone(tr::now)
+			: (item->state == State::Sending)
+			? tr::lng_oblivion_sendonline_busy(tr::now)
+			: tr::lng_oblivion_sendonline_reason_unconfirmed(tr::now));
+	};
 	const auto with = [=](uint64 id, Fn<void(
 			not_null<Window::SessionController*>,
 			not_null<Account*>,
@@ -1809,9 +2218,28 @@ void ShowListFor(
 		const auto strong = weak.get();
 		const auto account = Lookup(session);
 		const auto item = account ? account->queue().find(id) : nullptr;
-		if (strong && item) {
-			callback(strong, account, *item);
+		if (!strong) {
+			return;
+		} else if (!item) {
+			tellLost(id);
+			return;
 		}
+		callback(strong, account, *item);
+	};
+
+	// While the box is there the message is not sent, see Account::hold.
+	// Whatever closes the box (a button, Escape, the passcode lock, the
+	// window) releases it, and the account may be gone by then.
+	const auto holdWhile = [=](
+			not_null<Account*> account,
+			uint64 id,
+			not_null<Ui::RpWidget*> box) {
+		account->hold(id);
+		box->lifetime().add([=, account = base::make_weak(account)] {
+			if (const auto strong = account.get()) {
+				strong->release(id);
+			}
+		});
 	};
 	auto rows = rpl::single(
 		rpl::empty_value()
@@ -1829,13 +2257,24 @@ void ShowListFor(
 					not_null<Window::SessionController*> strong,
 					not_null<Account*> account,
 					const Item &item) {
-				strong->show(Box(EditBox, EditArgs{
+				if (!account->queue().canEdit(id)) {
+					tellLost(id);
+					return;
+				}
+				auto box = Box(EditBox, EditArgs{
 					.text = item.text,
 					.save = [=](TextWithTags text) {
+						// The box closes in any case: a message that can't
+						// be changed any more is not a mistake in the text.
 						const auto account = Lookup(session);
-						return account && account->edit(id, text);
+						if (!account || !account->edit(id, text)) {
+							tellLost(id);
+						}
+						return true;
 					},
-				}));
+				});
+				holdWhile(account, id, box.data());
+				strong->show(std::move(box));
 			});
 		},
 		.sendNow = [=](uint64 id) {
@@ -1844,8 +2283,10 @@ void ShowListFor(
 					not_null<Account*> account,
 					const Item &item) {
 				const auto name = ChatName(session, item);
+				const auto unsure = item.unsure
+					|| (item.state == State::Unconfirmed);
 				strong->show(Ui::MakeConfirmBox({
-					.text = (item.state == State::Unconfirmed)
+					.text = unsure
 						? tr::lng_oblivion_sendonline_unconfirmed_sure(
 							tr::now)
 						: tr::lng_oblivion_sendonline_send_sure(
@@ -1854,8 +2295,16 @@ void ShowListFor(
 							name),
 					.confirmed = [=](Fn<void()> close) {
 						close();
-						if (const auto account = Lookup(session)) {
-							account->sendNow(id);
+						const auto account = Lookup(session);
+						const auto result = account
+							? account->sendNow(id)
+							: SendNowResult::Gone;
+						if (result == SendNowResult::Gone) {
+							tellLost(id);
+						} else if (result == SendNowResult::NotLoaded) {
+							show->showToast(
+								tr::lng_oblivion_sendonline_not_loaded(
+									tr::now));
 						}
 					},
 					.confirmText = tr::lng_send_button(),
@@ -1872,18 +2321,26 @@ void ShowListFor(
 					not_null<Window::SessionController*> strong,
 					not_null<Account*> account,
 					const Item &item) {
-				strong->show(Ui::MakeConfirmBox({
+				if (item.state == State::Sending) {
+					tellLost(id);
+					return;
+				}
+				auto box = Ui::MakeConfirmBox({
 					.text = tr::lng_oblivion_sendonline_cancel_sure(),
 					.confirmed = [=](Fn<void()> close) {
-						close();
-						if (const auto account = Lookup(session)) {
-							account->remove(id);
+						// Removed first: closing the box lets the queue go.
+						const auto account = Lookup(session);
+						if (!account || !account->remove(id)) {
+							tellLost(id);
 						}
+						close();
 					},
 					.confirmText
 						= tr::lng_oblivion_sendonline_action_cancel(),
 					.confirmStyle = &st::attentionBoxButton,
-				}));
+				});
+				holdWhile(account, id, box.data());
+				strong->show(std::move(box));
 			});
 		},
 	}));
@@ -2016,13 +2473,22 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	bar(u"sendonline_bar_failed"_q, kWide, [=] {
 		return ContentFor(items(2, State::Failed, kErrorUnavailable), 7);
 	});
+	bar(u"sendonline_bar_chat_deleted"_q, kWide, [=] {
+		return ContentFor(items(1, State::Failed, kErrorChatDeleted), 7);
+	});
+	bar(u"sendonline_bar_blocked"_q, kNarrow, [=] {
+		return ContentFor(items(3, State::Failed, kErrorBlocked), 7);
+	});
 
 	const auto size = QSize(st::boxWideWidth * 2, 0);
 	const auto anna = [] { return SampleText("Аня Смирнова", "Anna Smirnova"); };
 	const auto boris = [] { return SampleText("Борис", "Boris"); };
+
+	// The links of a row are there only for the actions the list was
+	// given, so the scenes give all of them.
+	const auto nothing = [](uint64) {};
 	RegisterBoxScene(u"sendonline_list"_q, size, [=](
 			std::shared_ptr<Ui::Show> show) {
-		const auto until = SampleText("завтра, 18:40", "tomorrow, 18:40");
 		auto rows = std::vector<ListRow>{
 			{
 				.id = 1,
@@ -2045,7 +2511,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 				.status = tr::lng_oblivion_sendonline_status_waiting(
 					tr::now,
 					lt_date,
-					u"18:41"_q),
+					SampleText("8 окт, 18:41", "8 Oct, 18:41")),
 				.canEdit = true,
 				.canSend = true,
 				.canRemove = true,
@@ -2079,6 +2545,10 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		};
 		return Box(ListBox, ListArgs{
 			.rows = rpl::single(std::move(rows)),
+			.edit = nothing,
+			.sendNow = nothing,
+			.waitMore = nothing,
+			.remove = nothing,
 		});
 	});
 	RegisterBoxScene(u"sendonline_list_chat"_q, size, [=](
@@ -2106,6 +2576,10 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		return Box(ListBox, ListArgs{
 			.rows = rpl::single(std::move(rows)),
 			.showChat = false,
+			.edit = nothing,
+			.sendNow = nothing,
+			.waitMore = nothing,
+			.remove = nothing,
 		});
 	});
 	RegisterBoxScene(u"sendonline_list_empty"_q, size, [](
@@ -2166,6 +2640,8 @@ bool Enqueue(
 	} else if (const auto reason = Unavailable(user); !reason.isEmpty()) {
 		controller->showToast((reason == kErrorPaid)
 			? tr::lng_oblivion_sendonline_reason_paid(tr::now)
+			: (reason == kErrorBlocked)
+			? tr::lng_oblivion_sendonline_reason_blocked(tr::now)
 			: tr::lng_oblivion_sendonline_reason_unavailable(tr::now));
 		return false;
 	} else if (text.text.size() > kMaxTextLength) {
@@ -2174,8 +2650,11 @@ bool Enqueue(
 	}
 	Start(session);
 	const auto account = Lookup(session);
-	if (!account || !account->enqueue(user, text)) {
-		controller->showToast(tr::lng_oblivion_sendonline_too_many(tr::now));
+	auto notSaved = false;
+	if (!account || !account->enqueue(user, text, notSaved)) {
+		controller->showToast(notSaved
+			? tr::lng_oblivion_sendonline_not_saved(tr::now)
+			: tr::lng_oblivion_sendonline_too_many(tr::now));
 		return false;
 	}
 	if (!account->onlineNow(peer->id.value)) {
@@ -2416,6 +2895,40 @@ bool RunSelfTest(QStringList &log) {
 		auto back = Queue::Parse(stopped, t0 + 50);
 		check(back.find(a)->state == State::Unconfirmed,
 			"restart: a clock that went back is not trusted");
+
+		// The chat is not loaded for a while after the start, so the
+		// message can't go at once: the time limit still holds.
+		auto slow = Queue::Parse(stopped, t0 + 110);
+		check(slow.find(a)->resumed
+			&& slow.find(a)->unsure
+			&& slow.expire(t0 + 100 + kResumeWindow).empty()
+			&& slow.readyPeers(t0 + 100 + kResumeWindow)
+				== std::vector<uint64>{ 7, 8 },
+			"restart soon: waits for its chat, still in time");
+		check(slow.expire(t0 + 101 + kResumeWindow)
+				== std::vector<uint64>{ a }
+			&& slow.find(a)->state == State::Unconfirmed
+			&& !slow.find(a)->forced
+			&& slow.unasked() == 1,
+			"restart soon: too late to repeat by itself, the user is asked");
+		check(!slow.begin(7, t0 + 102 + kResumeWindow, true),
+			"restart soon: nothing goes by itself after that");
+		auto twice = Queue::Parse(
+			Queue::Parse(stopped, t0 + 110).serialize(),
+			t0 + 120);
+		check(twice.find(a)->state == State::Waiting
+			&& twice.find(a)->forced
+			&& twice.find(a)->resumed,
+			"restart soon: one more restart keeps the time limit");
+		check(!twice.begin(7, t0 + 101 + kResumeWindow, false)
+			&& twice.find(a)->state == State::Unconfirmed,
+			"restart soon: the limit is checked when sending too");
+		auto clicked = Queue::Parse(stopped, t0 + 110);
+		check(clicked.resend(a)
+			&& !clicked.find(a)->resumed
+			&& clicked.expire(t0 + 5000).empty()
+			&& clicked.begin(7, t0 + 5000, false)->randomId == 411,
+			"restart soon: a click has no time limit");
 	}
 	check.section("restart");
 
@@ -2488,6 +3001,220 @@ bool RunSelfTest(QStringList &log) {
 		check(added == kMaxPerPeer, "limit: messages for one person");
 	}
 	check.section("answers");
+
+	{
+		// A message that is being edited or whose removal is being
+		// confirmed is held: it does not go, the ones behind it wait.
+		auto queue = Queue();
+		const auto a = queue.add(7, u"Anna"_q, text(u"first"_q), 811, t0, 24);
+		const auto b = queue.add(7, u"Anna"_q, text(u"second"_q), 812, t0, 24);
+		const auto c = queue.add(8, u"Boris"_q, text(u"other"_q), 813, t0, 24);
+		check(!queue.begin(7, t0 + 1, true, { a })
+			&& queue.find(a)->state == State::Waiting
+			&& !queue.find(a)->attempts
+			&& queue.find(b)->state == State::Waiting,
+			"hold: the first in line is held, nothing goes for the person");
+		const auto other = queue.begin(8, t0 + 1, true, { a });
+		check(other && other->id == c, "hold: another person is not held");
+		const auto first = queue.begin(7, t0 + 2, true, { b });
+		check(first && first->id == a,
+			"hold: the ones before the held one go");
+		queue.sent(a);
+		check(!queue.begin(7, t0 + 3, true, { b })
+			&& queue.readyPeers(t0 + 3) == std::vector<uint64>{ 7 },
+			"hold: the held one waits");
+		check(queue.edit(b, text(u"second, corrected"_q)),
+			"hold: edited meanwhile");
+		const auto second = queue.begin(7, t0 + 4, true);
+		check(second
+			&& second->id == b
+			&& second->randomId == 812
+			&& second->text.text == u"second, corrected"_q,
+			"hold: released, goes with the new text");
+
+		auto forced = Queue();
+		const auto f = forced.add(7, u"Anna"_q, text(u"now"_q), 821, t0, 24);
+		const auto g = forced.add(7, u"Anna"_q, text(u"next"_q), 822, t0, 24);
+		check(forced.resend(f)
+			&& !forced.begin(7, t0 + 1, false, { f })
+			&& !forced.begin(7, t0 + 1, true, { f })
+			&& forced.find(f)->state == State::Waiting
+			&& forced.find(f)->forced
+			&& forced.find(g)->state == State::Waiting,
+			"hold: «send now» is held too and keeps its place");
+		check(forced.expire(t0 + 25 * hour) == std::vector<uint64>{ g }
+			&& forced.find(f)->state == State::Waiting,
+			"hold: the time limit goes on, a forced one has none");
+		check(forced.remove(f) && !forced.begin(7, t0 + 26 * hour, true),
+			"hold: removed while held, nothing goes");
+	}
+	check.section("held");
+
+	{
+		// The chat is deleted or the person blocked.
+		auto queue = Queue();
+		const auto a = queue.add(7, u"Anna"_q, text(u"first"_q), 911, t0, 24);
+		const auto b = queue.add(7, u"Anna"_q, text(u"second"_q), 912, t0, 24);
+		const auto c = queue.add(7, u"Anna"_q, text(u"third"_q), 913, t0, 1);
+		const auto d = queue.add(7, u"Anna"_q, text(u"fourth"_q), 914, t0, 24);
+		const auto e = queue.add(8, u"Boris"_q, text(u"other"_q), 915, t0, 24);
+		check(queue.begin(7, t0 + 1, true)->id == a
+			&& queue.resend(b)
+			&& queue.expire(t0 + 2 * hour) == std::vector<uint64>{ c },
+			"deleted chat: one on its way, one forced, one expired");
+		queue.markAsked();
+		check(queue.cancel(7, kErrorChatDeleted),
+			"deleted chat: something was waiting");
+		for (const auto id : { b, d }) {
+			const auto item = queue.find(id);
+			check(item->state == State::Failed
+				&& item->error == kErrorChatDeleted
+				&& !item->forced
+				&& !item->asked,
+				"deleted chat: a waiting one is not sent, with the reason");
+		}
+		check(queue.find(a)->state == State::Sending,
+			"deleted chat: the one on its way is left to its answer");
+		check(queue.find(c)->state == State::Expired && queue.find(c)->asked,
+			"deleted chat: an expired one stays as it is");
+		check(queue.find(e)->state == State::Waiting
+			&& queue.waitedPeers() == base::flat_set<uint64>{ 8 },
+			"deleted chat: only this person is not waited for any more");
+		check(queue.unasked() == 2 && !queue.cancel(7, kErrorChatDeleted),
+			"deleted chat: the user is told, once");
+		queue.failed(a, u"FLOOD_WAIT_30"_q, false, t0 + 2 * hour + 40);
+		check(queue.find(a)->state == State::Failed
+			&& queue.find(a)->error == kErrorChatDeleted
+			&& queue.find(a)->stop.isEmpty(),
+			"deleted chat: a temporary error is not tried again");
+		check(!queue.begin(7, t0 + 3 * hour, true)
+			&& queue.readyPeers(t0 + 3 * hour) == std::vector<uint64>{ 8 },
+			"deleted chat: nothing goes by itself");
+		auto same = Queue::Parse(queue.serialize(), t0 + 3 * hour);
+		check(same.serialize() == queue.serialize()
+			&& !same.begin(7, t0 + 3 * hour, true),
+			"deleted chat: stays so after a restart");
+		check(queue.canEdit(b)
+			&& queue.resend(b)
+			&& queue.begin(7, t0 + 3 * hour, false)->id == b,
+			"deleted chat: only a click sends it");
+
+		auto blocked = Queue();
+		const auto s = blocked.add(7, u"Anna"_q, text(u"one"_q), 921, t0, 24);
+		check(blocked.begin(7, t0 + 1, true).has_value()
+			&& blocked.cancel(7, kErrorBlocked)
+			&& blocked.find(s)->state == State::Sending
+			&& blocked.find(s)->stop == kErrorBlocked,
+			"blocked: the one on its way is marked");
+		auto restarted = Queue::Parse(blocked.serialize(), t0 + 5);
+		check(restarted.find(s)->state == State::Unconfirmed
+			&& restarted.find(s)->stop.isEmpty()
+			&& !restarted.begin(7, t0 + 6, true)
+			&& restarted.readyPeers(t0 + 6).empty(),
+			"blocked: a restart does not send it again");
+		blocked.failed(s, u"INTERNAL"_q, false, t0 + 60, true);
+		check(blocked.find(s)->state == State::Failed
+			&& blocked.find(s)->error == kErrorBlocked
+			&& blocked.find(s)->unsure
+			&& !blocked.canEdit(s),
+			"blocked: no clear answer, not tried again");
+	}
+	check.section("deleted chat");
+
+	{
+		// An attempt with no clear answer: the message may be there.
+		auto queue = Queue();
+		const auto a = queue.add(7, u"Anna"_q, text(u"first"_q), 931, t0, 24);
+		check(queue.begin(7, t0, true).has_value(), "unsure: first attempt");
+		queue.failed(a, u"FLOOD_WAIT_5"_q, false, t0 + 10);
+		check(queue.canEdit(a) && !queue.find(a)->unsure,
+			"unsure: a flood wait is a clear «no», the text may change");
+		check(queue.begin(7, t0 + 20, true).has_value(), "unsure: again");
+		const auto lost = Judge(
+			u"CLIENT_RESPONSE_PARSE_FAILED"_q,
+			0,
+			2,
+			t0 + 20);
+		check(!lost.sent
+			&& !lost.permanent
+			&& lost.unsure
+			&& lost.retryAt == t0 + 20 + 2 * kRetryStep,
+			"answers: an answer that could not be read is tried again");
+		check(Judge(u"INTERNAL"_q, 500, 1, t0).unsure
+			&& !Judge(u"FLOOD_WAIT_17"_q, 420, 1, t0).unsure
+			&& !Judge(u"USER_IS_BLOCKED"_q, 400, 1, t0).unsure,
+			"answers: which ones leave a doubt");
+		queue.failed(
+			a,
+			u"INTERNAL"_q,
+			lost.permanent,
+			lost.retryAt,
+			lost.unsure);
+		check(queue.find(a)->state == State::Waiting
+			&& queue.find(a)->unsure
+			&& !queue.canEdit(a)
+			&& !queue.edit(a, text(u"changed"_q))
+			&& queue.find(a)->text.text == u"first"_q,
+			"unsure: the text is not changed any more");
+		const auto b = queue.add(7, u"Anna"_q, text(u"second"_q), 932, t0, 24);
+		check(!queue.begin(7, lost.retryAt - 1, false)
+			&& !queue.begin(7, lost.retryAt - 1, true)
+			&& queue.find(b)->state == State::Waiting
+			&& queue.readyPeers(lost.retryAt - 1) == std::vector<uint64>{ 7 },
+			"unsure: repeated a bit later, the next one waits behind it");
+		auto same = Queue::Parse(queue.serialize(), t0 + 30);
+		check(same.serialize() == queue.serialize() && !same.canEdit(a),
+			"unsure: remembered after a restart");
+		check(same.expire(t0 + 21 + kResumeWindow) == std::vector<uint64>{ a }
+			&& same.find(a)->state == State::Unconfirmed
+			&& !same.begin(7, t0 + 22 + kResumeWindow, false),
+			"unsure: no repeat by itself later than soon after the attempt");
+		const auto next = same.begin(7, t0 + 23 + kResumeWindow, true);
+		check(next && next->id == b,
+			"unsure: the next one is not held by a not confirmed one");
+
+		// The repeats do not wait for the person to come online again.
+		auto at = lost.retryAt;
+		for (auto i = 2; i != kMaxAttempts; ++i) {
+			const auto again = queue.begin(7, at, false);
+			check(again
+				&& again->id == a
+				&& again->randomId == 931
+				&& again->text.text == u"first"_q,
+				"unsure: the same message with the same random id");
+			at += kRetryStep * (i + 1);
+			queue.failed(a, u"INTERNAL"_q, false, at, true);
+		}
+		check(queue.find(a)->state == State::Unconfirmed
+			&& queue.find(a)->attempts == kMaxAttempts
+			&& queue.unasked() == 1,
+			"unsure: given up as not confirmed, the user is asked");
+		check(!queue.begin(7, at + 9000, false) && queue.remove(a),
+			"unsure: never by itself after that, can be removed");
+
+		auto clicked = Queue();
+		const auto c = clicked.add(7, u"A"_q, text(u"one"_q), 941, t0, 24);
+		check(clicked.begin(7, t0, true).has_value(), "unsure: attempt");
+		clicked.failed(c, u"INTERNAL"_q, false, t0 + 60, true);
+		check(clicked.resend(c)
+			&& !clicked.find(c)->resumed
+			&& clicked.find(c)->unsure
+			&& clicked.begin(7, t0 + 1, false)->randomId == 941,
+			"unsure: a click sends it at once, with the same random id");
+		clicked.failed(c, u"FLOOD_WAIT_30"_q, false, t0 + 40);
+		check(clicked.find(c)->state == State::Waiting
+			&& clicked.find(c)->forced
+			&& clicked.find(c)->resumed
+			&& !clicked.begin(7, t0 + 39, true)
+			&& clicked.begin(7, t0 + 40, false).has_value(),
+			"unsure: a clear «no» later does not bring the long wait back");
+		clicked.failed(c, u"FLOOD_WAIT_900"_q, false, t0 + 945);
+		check(!clicked.begin(7, t0 + 945, true)
+			&& clicked.find(c)->state == State::Unconfirmed
+			&& clicked.unasked() == 1,
+			"unsure: a wait that is too long ends with a question");
+	}
+	check.section("unsure");
 
 	return !check.failed();
 }

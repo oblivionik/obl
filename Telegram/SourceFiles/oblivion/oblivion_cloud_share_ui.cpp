@@ -62,6 +62,10 @@ constexpr auto kCardRadius = 10;
 constexpr auto kCardPadding = 12;
 constexpr auto kCardSkip = 8;
 constexpr auto kPillRadius = 9;
+constexpr auto kChipPadding = 12;
+constexpr auto kChipSkip = 5;
+constexpr auto kChipGap = 8;
+constexpr auto kLinkHeight = 40;
 constexpr auto kFetchPart = 0.45;
 constexpr auto kSendPart = 0.5;
 
@@ -78,7 +82,22 @@ constexpr auto kSendPart = 0.5;
 }
 
 [[nodiscard]] QString Percent(float64 part) {
-	return QString::number(int(std::clamp(part, 0., 1.) * 100.)) + u" %"_q;
+	return QString::number(int(std::clamp(part, 0., 1.) * 100.)) + u"%"_q;
+}
+
+// Ui::FormatSizeText() stops at megabytes: a quota of three gigabytes
+// would read as "3072.0 MB".
+[[nodiscard]] QString SizeText(int64 bytes) {
+	constexpr auto kGigabyte = int64(1) << 30;
+	if (bytes < kGigabyte) {
+		return Ui::FormatSizeText(bytes);
+	}
+	const auto tenths = (bytes * 10) / kGigabyte;
+	auto result = QString::number(tenths / 10);
+	if (const auto rest = int(tenths % 10)) {
+		result += QChar('.') + QString::number(rest);
+	}
+	return result + u" GB"_q;
 }
 
 void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
@@ -246,14 +265,16 @@ void Row::paintEvent(QPaintEvent *e) {
 	p.fillRect(e->rect(), over ? st::windowBgOver : st::windowBg);
 	paintRipple(p, 0, 0);
 
-	const auto skip = st::normalFont->spacew * 2;
+	// A cover or a number sits where the icon of a settings button would,
+	// the texts start where its text does: the rows line up with the
+	// buttons above a list.
+	const auto iconCenter = st::settingsButton.iconLeft
+		+ st::menuIconSoundOn.width() / 2;
 	auto left = st::boxRowPadding.left();
 	if (_cover) {
 		const auto size = Scaled(kCoverSize);
-		const auto center = st::settingsButton.iconLeft
-			+ st::menuIconSoundOn.width() / 2;
 		const auto rect = QRect(
-			center - size / 2,
+			iconCenter - size / 2,
 			(height() - size) / 2,
 			size,
 			size);
@@ -282,10 +303,10 @@ void Row::paintEvent(QPaintEvent *e) {
 			? st::windowSubTextFgOver
 			: st::windowSubTextFg);
 		p.drawText(
-			QRect(left - skip, 0, indexWidth, height()),
+			QRect(iconCenter - indexWidth / 2, 0, indexWidth, height()),
 			_index,
 			style::al_center);
-		left += indexWidth;
+		left = st::settingsButton.padding.left();
 	}
 
 	const auto titleTop = _status.isEmpty()
@@ -506,10 +527,11 @@ void SplitPreview::paintLabel(QPainter &p, const QString &text, bool right) {
 		this->height() - skip - height,
 		width,
 		height);
+	// Over a picture, like the time of a photo in a chat.
 	p.setPen(Qt::NoPen);
-	p.setBrush(QColor(0, 0, 0, 120));
+	p.setBrush(st::msgDateImgBg);
 	p.drawRoundedRect(rect, height / 2., height / 2.);
-	p.setPen(QColor(255, 255, 255));
+	p.setPen(st::msgDateImgFg);
 	p.setFont(st::normalFont);
 	p.drawText(rect, text, style::al_center);
 }
@@ -536,7 +558,7 @@ void SplitPreview::paintEvent(QPaintEvent *e) {
 			_after.width() / 2.,
 			_after.height());
 		p.drawImage(QRectF(half, 0, width() - half, height()), _after, part);
-		p.fillRect(half, 0, Scaled(2), height(), QColor(255, 255, 255, 220));
+		p.fillRect(half, 0, Scaled(2), height(), st::msgDateImgFg);
 		paintLabel(p, tr::lng_oblivion_share_preset_before(tr::now), false);
 		paintLabel(p, tr::lng_oblivion_share_preset_after(tr::now), true);
 	}
@@ -647,14 +669,189 @@ void Card::paintEvent(QPaintEvent *e) {
 			st::normalFont->elided(text, available));
 		top += st::normalFont->height;
 	};
-	line(_meta, st::windowSubTextFg);
+	// What it is made of, what the author says about it, whose it is.
 	line(_effects, st::windowActiveTextFg);
 	line(_text, st::windowFg);
+	line(_meta, st::windowSubTextFg);
 }
 
 QImage Card::prepareRippleMask() const {
 	return Ui::RippleAnimation::RoundRectMask(
 		inner().size(),
+		Scaled(kCardRadius));
+}
+
+// ---- A choice of one of a few short names: round chips in a row. Not
+// one more slider right under the slider of the kinds.
+
+class Chip final : public Ui::AbstractButton {
+public:
+	Chip(QWidget *parent, const QString &text);
+
+	void setActive(bool active);
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+	void onStateChanged(State was, StateChangeSource source) override;
+
+private:
+	const QString _text;
+	bool _active = false;
+
+};
+
+Chip::Chip(QWidget *parent, const QString &text)
+: AbstractButton(parent)
+, _text(text) {
+	resize(
+		st::normalFont->width(_text) + 2 * Scaled(kChipPadding),
+		st::normalFont->height + 2 * Scaled(kChipSkip));
+	setAccessibleName(_text);
+}
+
+void Chip::setActive(bool active) {
+	if (_active != active) {
+		_active = active;
+		update();
+	}
+}
+
+void Chip::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+	const auto radius = height() / 2.;
+	p.setPen(Qt::NoPen);
+	p.setBrush(_active
+		? st::windowBgActive
+		: (isOver() || isDown())
+		? st::windowBgRipple
+		: st::windowBgOver);
+	p.drawRoundedRect(QRectF(rect()), radius, radius);
+	p.setFont(st::normalFont);
+	p.setPen(_active ? st::windowFgActive : st::windowSubTextFg);
+	p.drawText(rect(), _text, style::al_center);
+}
+
+void Chip::onStateChanged(State was, StateChangeSource source) {
+	update();
+}
+
+class Chips final : public Ui::RpWidget {
+public:
+	Chips(QWidget *parent, const QStringList &names);
+
+	[[nodiscard]] rpl::producer<int> activated() const {
+		return _activated.events();
+	}
+
+protected:
+	int resizeGetHeight(int newWidth) override;
+
+private:
+	std::vector<not_null<Chip*>> _chips;
+	int _active = 0;
+	rpl::event_stream<int> _activated;
+
+};
+
+Chips::Chips(QWidget *parent, const QStringList &names)
+: RpWidget(parent) {
+	auto index = 0;
+	for (const auto &name : names) {
+		const auto chip = Ui::CreateChild<Chip>(this, name);
+		const auto my = index++;
+		chip->setActive(my == _active);
+		chip->setClickedCallback([=] {
+			if (_active == my) {
+				return;
+			}
+			_active = my;
+			auto other = 0;
+			for (const auto &button : _chips) {
+				button->setActive(other++ == my);
+			}
+			_activated.fire_copy(my);
+		});
+		_chips.push_back(chip);
+	}
+}
+
+int Chips::resizeGetHeight(int newWidth) {
+	const auto gap = Scaled(kChipGap);
+	auto left = 0;
+	auto result = 0;
+	for (const auto &chip : _chips) {
+		chip->moveToLeft(left, 0, newWidth);
+		left += chip->width() + gap;
+		result = std::max(result, chip->height());
+	}
+	return result;
+}
+
+// ---- A link in a rounded field: it does not break in the middle of a
+// word the way a label does, a click copies it.
+
+class LinkField final : public Ui::RippleButton {
+public:
+	explicit LinkField(QWidget *parent);
+
+	void setLink(const QString &link);
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+	QImage prepareRippleMask() const override;
+
+private:
+	QString _text;
+
+};
+
+LinkField::LinkField(QWidget *parent)
+: RippleButton(parent, st::defaultRippleAnimation) {
+	resize(width(), Scaled(kLinkHeight));
+}
+
+void LinkField::setLink(const QString &link) {
+	// Without the scheme: more of the link itself fits.
+	const auto scheme = link.indexOf(u"://"_q);
+	const auto text = (scheme >= 0) ? link.mid(scheme + 3) : link;
+	if (_text != text) {
+		_text = text;
+		setAccessibleName(link);
+		update();
+	}
+}
+
+void LinkField::paintEvent(QPaintEvent *e) {
+	auto p = Painter(this);
+	const auto radius = Scaled(kCardRadius);
+	{
+		auto hq = PainterHighQualityEnabler(p);
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::windowBgOver);
+		p.drawRoundedRect(rect(), radius, radius);
+	}
+	paintRipple(p, 0, 0);
+
+	const auto padding = Scaled(kCardPadding);
+	const auto &icon = st::menuIconCopy;
+	const auto iconLeft = width() - padding - icon.width();
+	icon.paint(p, iconLeft, (height() - icon.height()) / 2, width());
+	const auto available = iconLeft - 2 * padding;
+	if (available > 0) {
+		p.setFont(st::normalFont);
+		p.setPen(st::windowFg);
+		p.drawTextLeft(
+			padding,
+			(height() - st::normalFont->height) / 2,
+			width(),
+			st::normalFont->elided(_text, available, Qt::ElideMiddle));
+	}
+}
+
+QImage LinkField::prepareRippleMask() const {
+	return Ui::RippleAnimation::RoundRectMask(
+		size(),
 		Scaled(kCardRadius));
 }
 
@@ -738,15 +935,17 @@ void UploadBox(not_null<Ui::GenericBox*> box, UploadBoxArgs &&args) {
 			style::margins(0, 0, 0, st::boxLittleSkip)),
 		st::boxRowPadding);
 	const auto link = box->addRow(
-		object_ptr<Ui::SlideWrap<Ui::FlatLabel>>(
+		object_ptr<Ui::SlideWrap<LinkField>>(
 			box,
-			object_ptr<Ui::FlatLabel>(box, state->link.value(), st::boxLabel),
-			style::margins(0, 0, 0, st::boxLittleSkip)),
+			object_ptr<LinkField>(box),
+			style::margins(0, st::boxLittleSkip / 2, 0, st::boxLittleSkip)),
 		st::boxRowPadding);
-	link->entity()->setSelectable(true);
 	link->toggle(false, anim::type::instant);
 
 	const auto show = box->uiShow();
+	link->entity()->setClickedCallback([=] {
+		CopyLink(show, state->link.current());
+	});
 	const auto buttonsKind = [](const UploadStatus &status) {
 		return !status.finished()
 			? 0
@@ -784,11 +983,13 @@ void UploadBox(not_null<Ui::GenericBox*> box, UploadBoxArgs &&args) {
 				}
 			});
 		} else if (kind == 1) {
+			// Three buttons with «Скопировать ссылку» among them are
+			// wider than the box: it is closed with the cross.
 			box->addButton(tr::lng_oblivion_share_copy_link(), [=] {
 				CopyLink(show, state->link.current());
 			});
-			box->addButton(tr::lng_close(), close);
-			box->addLeftButton(tr::lng_oblivion_share_open(), openIt);
+			box->addButton(tr::lng_oblivion_share_open(), openIt);
+			box->addTopButton(st::boxTitleClose, close);
 		} else if (kind == 2) {
 			box->addButton(tr::lng_oblivion_share_retry(), [=] {
 				if (retry) {
@@ -880,7 +1081,7 @@ void UploadBox(not_null<Ui::GenericBox*> box, UploadBoxArgs &&args) {
 			? std::make_optional(st::boxTextFgError->c)
 			: std::nullopt);
 		stage->toggle(!stageText.isEmpty(), anim::type::instant);
-		state->note = notes.join(QChar(' '));
+		state->note = notes.join(QChar('\n'));
 		note->toggle(!notes.isEmpty(), anim::type::instant);
 
 		const auto showLink = status.finished()
@@ -889,6 +1090,7 @@ void UploadBox(not_null<Ui::GenericBox*> box, UploadBoxArgs &&args) {
 		state->link = showLink
 			? Cloud::MakeLink(Cloud::LinkKind::Playlist, status.playlistId)
 			: QString();
+		link->entity()->setLink(state->link.current());
 		link->toggle(showLink, anim::type::instant);
 		if (state->buttons < 0) {
 			rebuildButtons();
@@ -921,6 +1123,7 @@ public:
 		Playlist playlist; // Valid when there is something to show.
 		bool loading = false;
 		QString error;
+		bool gone = false; // Not on the server any more: no «Повторить».
 		bool kept = false;
 		bool keeping = false;
 		int keptTracks = 0;
@@ -962,6 +1165,9 @@ void PlaylistBox(
 		QString playlistId;
 		bool owner = false;
 		bool error = false;
+		bool has = false;
+		int buttons = -1;
+		Fn<void()> rebuildButtons;
 	};
 	const auto state = box->lifetime().make_state<State>();
 	const auto show = box->uiShow();
@@ -1065,7 +1271,8 @@ void PlaylistBox(
 				st::boxMediumSkip,
 				0,
 				st::boxMediumSkip)),
-		style::margins());
+		style::margins(),
+		style::al_top); // A short notice stays in the middle too.
 	const auto retryWrap = content->add(
 		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
 			content,
@@ -1165,7 +1372,7 @@ void PlaylistBox(
 		// Before the click: how much will be saved to this device.
 		state->keepLabel = !data.kept
 			? ((playlist.totalBytes > 0)
-				? Ui::FormatSizeText(playlist.totalBytes)
+				? SizeText(playlist.totalBytes)
 				: QString())
 			: (data.keeping || data.keptTracks < total)
 			? tr::lng_oblivion_share_view_keeping(
@@ -1219,15 +1426,31 @@ void PlaylistBox(
 			? tr::lng_oblivion_share_view_empty(tr::now)
 			: QString();
 		state->notice = text;
+		// A failure is red like in the other boxes; "it is gone" is not
+		// one, it is what has happened to the playlist.
+		notice->entity()->setTextColorOverride(
+			(!data.loading && !data.error.isEmpty() && !data.gone)
+				? std::make_optional(st::boxTextFgError->c)
+				: std::nullopt);
 		notice->toggle(!text.isEmpty(), anim::type::instant);
+		// A playlist that was deleted will not come back with a retry.
 		retryWrap->toggle(
-			!has && !data.loading && !data.error.isEmpty(),
+			!has && !data.loading && !data.error.isEmpty() && !data.gone,
 			anim::type::instant);
 		about->toggle(has && !playlist.tracks.empty(), anim::type::instant);
+
+		state->has = has;
+		if (state->buttons >= 0 && state->buttons != (has ? 1 : 0)) {
+			// Not from inside of a click on one of the buttons.
+			Ui::PostponeCall(box, [=] {
+				if (state->rebuildButtons) {
+					state->rebuildButtons();
+				}
+			});
+		}
 	};
 
-	const auto menuButton = box->addTopButton(st::boxTitleMenu);
-	menuButton->setClickedCallback([=] {
+	const auto showMenu = [=] {
 		if (state->playlistId.isEmpty()) {
 			return;
 		}
@@ -1245,20 +1468,32 @@ void PlaylistBox(
 				&st::menuIconDelete);
 		}
 		state->menu->popup(QCursor::pos());
-	});
+	};
+	// While there is no playlist (it is being loaded, it is gone) there
+	// is no link to copy and nothing for the menu: only «Закрыть».
+	state->rebuildButtons = [=] {
+		const auto mark = state->has ? 1 : 0;
+		if (std::exchange(state->buttons, mark) == mark) {
+			return;
+		}
+		box->clearButtons();
+		box->addButton(tr::lng_close(), [=] {
+			box->closeBox();
+		});
+		if (state->has) {
+			box->addLeftButton(tr::lng_oblivion_share_copy_link(), [=] {
+				CopyLink(show, state->link);
+			});
+			box->addTopButton(st::boxTitleMenu, showMenu);
+		}
+	};
 
 	backend->changes() | rpl::on_next(refresh, box->lifetime());
 	backend->closeRequests() | rpl::on_next([=] {
 		box->closeBox();
 	}, box->lifetime());
 	refresh();
-
-	box->addButton(tr::lng_close(), [=] {
-		box->closeBox();
-	});
-	box->addLeftButton(tr::lng_oblivion_share_copy_link(), [=] {
-		CopyLink(show, state->link);
-	});
+	state->rebuildButtons();
 }
 
 // ---- The list of the shared playlists of the user.
@@ -1305,7 +1540,8 @@ void LibraryBox(not_null<Ui::GenericBox*> box, LibraryArgs &&args) {
 				st::boxMediumSkip,
 				0,
 				st::boxMediumSkip)),
-		style::margins());
+		style::margins(),
+		style::al_top); // A short notice stays in the middle too.
 	Ui::AddSkip(content);
 	Ui::AddDividerText(content, tr::lng_oblivion_share_library_about());
 
@@ -1330,6 +1566,10 @@ void LibraryBox(not_null<Ui::GenericBox*> box, LibraryArgs &&args) {
 			? state->error
 			: tr::lng_oblivion_share_library_empty(tr::now);
 		state->notice = text;
+		notice->entity()->setTextColorOverride(
+			(!state->loading && !state->error.isEmpty())
+				? std::make_optional(st::boxTextFgError->c)
+				: std::nullopt);
 		notice->toggle(!text.isEmpty(), anim::type::instant);
 	};
 	const auto request = [=] {
@@ -1458,7 +1698,8 @@ void MyPresetsBox(not_null<Ui::GenericBox*> box, MyPresetsArgs &&args) {
 				st::boxMediumSkip,
 				0,
 				st::boxMediumSkip)),
-		style::margins());
+		style::margins(),
+		style::al_top);
 
 	const auto applyIt = [=](const LocalPreset &preset) {
 		if (!apply) {
@@ -1584,14 +1825,12 @@ void LinkBox(
 	box->addRow(
 		object_ptr<Ui::FlatLabel>(box, std::move(about), st::boxLabel),
 		RowPadding());
-	const auto label = box->addRow(
-		object_ptr<Ui::FlatLabel>(
-			box,
-			rpl::single(link) | rpl::map(tr::bold),
-			st::boxLabel),
-		RowPadding());
-	label->setSelectable(true);
 	const auto show = box->uiShow();
+	const auto field = box->addRow(object_ptr<LinkField>(box), RowPadding());
+	field->setLink(link);
+	field->setClickedCallback([=] {
+		CopyLink(show, link);
+	});
 	box->addButton(tr::lng_oblivion_share_copy_link(), [=] {
 		CopyLink(show, link);
 	});
@@ -1657,9 +1896,13 @@ void SharePresetBox(not_null<Ui::GenericBox*> box, SharePresetArgs &&args) {
 		object_ptr<Ui::Checkbox>(
 			box,
 			tr::lng_oblivion_share_preset_listed(tr::now),
-			true,
+			false, // The gallery is for everybody: only by a click.
 			st::defaultCheckbox),
-		RowPadding());
+		st::boxRowPadding + style::margins(
+			0,
+			st::boxLittleSkip,
+			0,
+			st::boxLittleSkip));
 	const auto error = box->addRow(
 		object_ptr<Ui::SlideWrap<Ui::FlatLabel>>(
 			box,
@@ -1735,6 +1978,7 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 		rpl::variable<QString> notice;
 		Ui::VerticalLayout *pills = nullptr;
 		Fn<void()> refresh;
+		Fn<void()> showMenu;
 		bool loading = false;
 		bool rendered = false;
 		bool wasSaved = false;
@@ -1756,9 +2000,15 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 	const auto ratio = style::DevicePixelRatio();
 	const auto sample = SampleImage(
 		QSize(kPreviewWidth, kPreviewHeight) * std::min(ratio, 2) / 2);
-	const auto preview = box->addRow(
-		object_ptr<SplitPreview>(box, sample),
-		RowPadding());
+	// Hidden for a preset this build can't open: the sample without any
+	// effect on it would only mislead.
+	const auto previewWrap = box->addRow(
+		object_ptr<Ui::SlideWrap<SplitPreview>>(
+			box,
+			object_ptr<SplitPreview>(box, sample),
+			style::margins(0, 0, 0, st::boxLittleSkip)),
+		st::boxRowPadding);
+	const auto preview = previewWrap->entity();
 	box->addRow(
 		object_ptr<Ui::FlatLabel>(
 			box,
@@ -1813,6 +2063,12 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 			return;
 		}
 		box->clearButtons();
+		// clearButtons() takes the dots of the menu away as well.
+		box->addTopButton(st::boxTitleMenu, [=] {
+			if (state->showMenu) {
+				state->showMenu();
+			}
+		});
 		if (usable && apply) {
 			box->addButton(tr::lng_oblivion_share_preset_apply(), [=] {
 				const auto callback = apply;
@@ -1876,13 +2132,21 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 		state->pills->resizeToWidth(state->pills->width());
 
 		const auto tooNew = preset.full && preset.stack.isEmpty();
+		previewWrap->toggle(!tooNew, anim::type::instant);
+
+		// Saved already and no editor to apply it in: without a word the
+		// box would have nothing but «Закрыть».
+		const auto kept = preset.full
+			&& !preset.stack.isEmpty()
+			&& saved
+			&& saved(preset);
 		const auto message = state->loading
 			? tr::lng_oblivion_share_preset_loading(tr::now)
 			: tooNew
 			? tr::lng_oblivion_share_preset_too_new(tr::now)
 			: preset.hidden
 			? tr::lng_oblivion_share_preset_hidden(tr::now)
-			: state->wasSaved
+			: (state->wasSaved || (kept && !apply))
 			? tr::lng_oblivion_share_preset_kept_hint(tr::now)
 			: QString();
 		state->notice = message;
@@ -1896,8 +2160,7 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 	state->refresh = refresh;
 
 	const auto weakBox = QPointer<Ui::GenericBox>(box.get());
-	const auto menuButton = box->addTopButton(st::boxTitleMenu);
-	menuButton->setClickedCallback([=] {
+	state->showMenu = [=] {
 		const auto &preset = state->preset;
 		state->menu = base::make_unique_q<Ui::PopupMenu>(
 			box,
@@ -1944,7 +2207,7 @@ void PresetBox(not_null<Ui::GenericBox*> box, PresetBoxArgs &&args) {
 				&st::menuIconReport);
 		}
 		state->menu->popup(QCursor::pos());
-	});
+	};
 
 	if (load && !state->preset.full) {
 		state->loading = true;
@@ -2018,13 +2281,18 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 			tr::lng_oblivion_share_kind_video(tr::now),
 		});
 	}
+	// The order is a pair of chips: a second slider right under the first
+	// one reads as its underline.
 	const auto sorts = content->add(
-		object_ptr<Ui::SettingsSlider>(content, st::settingsSlider),
-		st::boxRowPadding + style::margins(0, 0, 0, st::boxLittleSkip));
-	sorts->setSections(std::vector<QString>{
-		tr::lng_oblivion_share_gallery_new(tr::now),
-		tr::lng_oblivion_share_gallery_top(tr::now),
-	});
+		object_ptr<Chips>(content, QStringList{
+			tr::lng_oblivion_share_gallery_new(tr::now),
+			tr::lng_oblivion_share_gallery_top(tr::now),
+		}),
+		st::boxRowPadding + style::margins(
+			0,
+			fixed ? (st::boxLittleSkip / 2) : st::boxLittleSkip,
+			0,
+			st::boxLittleSkip));
 
 	const auto list = content->add(
 		object_ptr<Ui::VerticalLayout>(content),
@@ -2041,7 +2309,8 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 				st::boxMediumSkip,
 				0,
 				st::boxMediumSkip)),
-		style::margins());
+		style::margins(),
+		style::al_top); // A short notice stays in the middle too.
 	const auto moreWrap = content->add(
 		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
 			content,
@@ -2052,6 +2321,19 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 		tr::lng_oblivion_share_gallery_more(),
 		st::settingsButton,
 		{ &st::menuIconShowAll });
+	// The first page did not come: without this the only way to ask
+	// again was to switch the kind or the order there and back.
+	const auto retryWrap = content->add(
+		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+			content,
+			object_ptr<Ui::VerticalLayout>(content)),
+		style::margins());
+	const auto retry = ::Settings::AddButtonWithIcon(
+		retryWrap->entity(),
+		tr::lng_oblivion_share_retry(),
+		st::settingsButton,
+		{ &st::menuIconRestore });
+	retryWrap->toggle(false, anim::type::instant);
 	Ui::AddSkip(content);
 
 	const auto refresh = [=](int from) {
@@ -2076,6 +2358,9 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 			anim::type::instant);
 		moreWrap->toggle(
 			!state->next.isEmpty() && !state->loading,
+			anim::type::instant);
+		retryWrap->toggle(
+			state->error && state->presets.empty() && !state->loading,
 			anim::type::instant);
 	};
 	const auto request = [=](bool reset) {
@@ -2131,7 +2416,7 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 			}
 		}, kinds->lifetime());
 	}
-	sorts->sectionActivated() | rpl::on_next([=](int index) {
+	sorts->activated() | rpl::on_next([=](int index) {
 		const auto sort = index ? u"top"_q : u"new"_q;
 		if (state->sort != sort) {
 			state->sort = sort;
@@ -2140,6 +2425,9 @@ void GalleryBox(not_null<Ui::GenericBox*> box, GalleryArgs &&args) {
 	}, sorts->lifetime());
 	more->setClickedCallback([=] {
 		request(false);
+	});
+	retry->setClickedCallback([=] {
+		request(true);
 	});
 	request(true);
 
@@ -2186,7 +2474,7 @@ void Request(
 			return tr::lng_oblivion_share_error_quota(
 				tr::now,
 				lt_size,
-				Ui::FormatSizeText(quota));
+				SizeText(quota));
 		} else if (limit == u"playlist_tracks"_q) {
 			return tr::lng_oblivion_share_error_tracks(
 				tr::now,
@@ -2201,9 +2489,13 @@ void Request(
 			return tr::lng_oblivion_share_error_daily(
 				tr::now,
 				lt_size,
-				Ui::FormatSizeText(daily));
-		} else if (limit == u"uploads"_q) {
+				SizeText(daily));
+		} else if (limit == u"uploads"_q || limit == u"uploads_address"_q) {
 			return tr::lng_oblivion_share_error_uploads(tr::now);
+		} else if (limit == u"user_tracks"_q) {
+			// All the playlists of the account together: a number of
+			// tracks, or the size of what is written about them.
+			return tr::lng_oblivion_share_error_user_tracks(tr::now);
 		}
 	} else if (error.status == 404) {
 		return tr::lng_oblivion_share_error_gone(tr::now);
@@ -2286,8 +2578,12 @@ void StartUpload(
 			using Stage = UploadStatus::Stage;
 			if (uploader->shownBoxes > 0) {
 				return;
-			} else if (show && show->valid()) {
-				show->showToast((status.stage == Stage::Done)
+			} else if (!Core::IsAppLaunched()
+				|| !Core::App().passcodeLocked()) {
+				// Nothing about a cancelled upload (the user or a logout
+				// has cancelled it), and no name of a playlist over the
+				// passcode lock.
+				Toast(show, (status.stage == Stage::Done)
 					? tr::lng_oblivion_share_upload_done_toast(
 						tr::now,
 						lt_name,
@@ -2340,6 +2636,7 @@ private:
 	Cloud::Sender _sender;
 	Playlist _playlist;
 	QString _error;
+	bool _gone = false; // The error is "not on the server any more".
 	bool _loading = false;
 	int _keptTracks = -1; // Counted on the disk, -1: count again.
 	rpl::event_stream<> _changes;
@@ -2367,6 +2664,7 @@ SessionPlaylistBackend::SessionPlaylistBackend(
 	}) | rpl::on_next([=](const Playlist &playlist) {
 		_playlist = playlist;
 		_error = QString();
+		_gone = false;
 		_keptTracks = -1;
 		_changes.fire({});
 	}, _lifetime);
@@ -2386,11 +2684,22 @@ SessionPlaylistBackend::SessionPlaylistBackend(
 	}) | rpl::on_next([=](const Cloud::Event &event) {
 		if (event.type == u"playlist.deleted"_q) {
 			_error = tr::lng_oblivion_share_error_gone(tr::now);
+			_gone = true;
 			_changes.fire({});
 		} else if (Cloud::JsonInt(event.data.value(u"rev"_q))
 			> _playlist.rev) {
 			reload();
 		}
+	}, _lifetime);
+
+	// The account was switched off while the playlist was on its way:
+	// the core drops the request without calling back.
+	Cloud::For(session).readyValue(
+	) | rpl::filter([=](bool ready) {
+		return !ready && _loading;
+	}) | rpl::on_next([=] {
+		_sender.cancelAll();
+		fail({ .type = Cloud::Error::Type::NotConnected });
 	}, _lifetime);
 	reload();
 }
@@ -2400,6 +2709,7 @@ PlaylistBackend::State SessionPlaylistBackend::state() {
 		.playlist = _playlist,
 		.loading = _loading,
 		.error = _error,
+		.gone = _gone,
 	};
 	if (const auto service = _service.get()) {
 		result.selfId = service->account().userId();
@@ -2437,6 +2747,7 @@ void SessionPlaylistBackend::apply(const Cloud::Response &response) {
 		return;
 	}
 	_error = QString();
+	_gone = false;
 	_playlist = playlist;
 	if (const auto service = _service.get()) {
 		// Fires the update this object listens to as well.
@@ -2448,7 +2759,8 @@ void SessionPlaylistBackend::apply(const Cloud::Response &response) {
 
 void SessionPlaylistBackend::fail(const Cloud::Error &error) {
 	_loading = false;
-	_error = (error.status == 404)
+	_gone = (error.status == 404);
+	_error = _gone
 		? tr::lng_oblivion_share_error_gone(tr::now)
 		: Cloud::ErrorText(error);
 	_changes.fire({});
@@ -2460,6 +2772,7 @@ void SessionPlaylistBackend::reload() {
 	}
 	_loading = true;
 	_error = QString();
+	_gone = false;
 	_changes.fire({});
 	_sender.request(
 		Cloud::GetRequest(u"/v1/playlists/"_q + _id),
@@ -2723,13 +3036,14 @@ void ShareResolved(
 		});
 }
 
-// ---- Presets with a session.
+// ---- Presets with a session. apply is CheckedApply() of the editor:
+// true when the editor has taken the stack.
 
 void ShowPresetWith(
 	base::weak_ptr<Main::Session> weak,
 	std::shared_ptr<Ui::Show> show,
 	Preset preset,
-	Fn<void(const QByteArray &stack)> apply);
+	Fn<bool(const QByteArray &stack)> apply);
 
 void CountUse(const base::weak_ptr<Main::Session> &weak, const QString &id) {
 	Request(
@@ -2743,7 +3057,7 @@ void ShowGalleryWith(
 		base::weak_ptr<Main::Session> weak,
 		std::shared_ptr<Ui::Show> show,
 		const QString &kind,
-		Fn<void(const QByteArray &stack)> apply) {
+		Fn<bool(const QByteArray &stack)> apply) {
 	if (!show || !show->valid()) {
 		return;
 	}
@@ -2794,7 +3108,7 @@ void ShowPresetWith(
 		base::weak_ptr<Main::Session> weak,
 		std::shared_ptr<Ui::Show> show,
 		Preset preset,
-		Fn<void(const QByteArray &stack)> apply) {
+		Fn<bool(const QByteArray &stack)> apply) {
 	if (!preset.valid() || !show || !show->valid()) {
 		return;
 	}
@@ -2818,9 +3132,14 @@ void ShowPresetWith(
 		},
 		.apply = apply
 			? [=](const Preset &preset) {
-				apply(preset.stack);
-				Toast(show, tr::lng_oblivion_share_preset_applied(tr::now));
-				CountUse(weak, preset.id);
+				// The editor may refuse the stack (it says why itself):
+				// no «Набор применён» over that and no use is counted.
+				if (apply(preset.stack)) {
+					Toast(
+						show,
+						tr::lng_oblivion_share_preset_applied(tr::now));
+					CountUse(weak, preset.id);
+				}
 			}
 			: Fn<void(const Preset&)>(),
 		.save = [=](const Preset &preset) {
@@ -2949,15 +3268,18 @@ void WithAccount(
 void ShowMyPresets(PresetHost host) {
 	const auto show = host.show;
 	const auto kind = host.kind;
-	const auto apply = host.apply;
+	const auto apply = CheckedApply(host);
 	show->showBox(Box(MyPresetsBox, MyPresetsArgs{
 		.kind = kind,
 		.list = [] { return PresetLibrary().list(); },
 		.changes = PresetLibrary().changes(),
 		.apply = apply
 			? [=](const LocalPreset &preset) {
-				apply(preset.stack);
-				Toast(show, tr::lng_oblivion_share_preset_applied(tr::now));
+				if (apply(preset.stack)) {
+					Toast(
+						show,
+						tr::lng_oblivion_share_preset_applied(tr::now));
+				}
 			}
 			: Fn<void(const LocalPreset&)>(),
 		.rename = [](uint64 id, const QString &title) {
@@ -3083,17 +3405,35 @@ private:
 
 };
 
-[[nodiscard]] QByteArray SampleVideoStack() {
-	return QByteArray(
-		"[{\"fx\":\"glitch\",\"on\":true,\"mix\":1,\"p\":{}},"
-		"{\"fx\":\"crt\",\"on\":true,\"mix\":0.8,\"p\":{}},"
-		"{\"fx\":\"grain\",\"on\":true,\"mix\":1,\"p\":{}}]");
+// A few different stacks: a list must not show the same line of effects
+// in every row.
+[[nodiscard]] QByteArray SampleVideoStack(int variant = 0) {
+	const auto join = [](std::initializer_list<const char*> ids) -> QByteArray {
+		auto result = QByteArray("[");
+		for (const auto id : ids) {
+			if (result.size() > 1) {
+				result.append(',');
+			}
+			result.append("{\"fx\":\"");
+			result.append(id);
+			result.append("\",\"on\":true,\"mix\":1,\"p\":{}}");
+		}
+		result.append(']');
+		return result;
+	};
+	switch (variant) {
+	case 1: return join({ "rgbsplit", "crt" });
+	case 2: return join({ "glitch", "datamosh" });
+	case 3: return join({ "grain" });
+	}
+	return join({ "glitch", "crt", "grain" });
 }
 
 [[nodiscard]] std::vector<Preset> SamplePresets(const QString &kind) {
 	struct Entry {
 		const char *ru;
 		const char *en;
+		const char *ownerRu;
 		const char *owner;
 		int uses;
 		const char *textRu;
@@ -3103,36 +3443,47 @@ private:
 		{
 			"Кассета 1998",
 			"Tape 1998",
+			"Миша",
 			"Misha",
 			128,
 			"Тёплый шум и полосы, как на старой плёнке.",
 			"Warm noise and lines of an old tape.",
 		},
-		{ "Неоновый сон", "Neon dream", "Anna", 64, "", "" },
+		{
+			"Неоновый сон",
+			"Neon dream",
+			"Аня",
+			"Anna",
+			64,
+			"Цвета разъезжаются, как на вывеске ночью.",
+			"The colours drift apart like a sign at night.",
+		},
 		{
 			"Сломанный телевизор",
 			"Broken TV",
+			"Дима",
 			"Dima",
 			17,
 			"Осторожно: мерцает.",
 			"Careful: it flickers.",
 		},
-		{ "Просто зерно", "Just grain", "Lena", 0, "", "" },
+		{ "Просто зерно", "Just grain", "Лена", "Lena", 0, "", "" },
 	};
-	const auto stack = SanitizeStack(u"video"_q, SampleVideoStack());
-	const auto tags = StackEffects(u"video"_q, stack);
 	auto result = std::vector<Preset>();
 	auto index = 0;
 	for (const auto &entry : entries) {
+		const auto stack = SanitizeStack(
+			u"video"_q,
+			SampleVideoStack(index));
 		auto preset = Preset();
 		preset.id = u"Xy%1abcdefghijklmnopq2"_q.arg(index);
 		preset.link = Cloud::MakeLink(Cloud::LinkKind::Preset, preset.id);
 		preset.kind = u"video"_q;
 		preset.title = Sample(entry.ru, entry.en);
 		preset.text = Sample(entry.textRu, entry.textEn);
-		preset.tags = tags.mid(0, std::max(int(tags.size()) - index, 1));
+		preset.tags = StackEffects(u"video"_q, stack);
 		preset.ownerId = 2000 + index;
-		preset.ownerName = QString::fromUtf8(entry.owner);
+		preset.ownerName = Sample(entry.ownerRu, entry.owner);
 		preset.listed = true;
 		preset.uses = entry.uses;
 		preset.full = true;
@@ -3144,19 +3495,18 @@ private:
 }
 
 [[nodiscard]] std::vector<LocalPreset> SampleLocalPresets() {
-	const auto stack = SanitizeStack(u"video"_q, SampleVideoStack());
 	auto result = std::vector<LocalPreset>();
-	const auto add = [&](const char *ru, const char *en) {
+	const auto add = [&](const char *ru, const char *en, int variant) {
 		result.push_back({
 			.id = uint64(result.size() + 1),
 			.kind = u"video"_q,
 			.title = Sample(ru, en),
-			.stack = stack,
+			.stack = SanitizeStack(u"video"_q, SampleVideoStack(variant)),
 		});
 	};
-	add("Кассета 1998", "Tape 1998");
-	add("Для сторис", "For stories");
-	add("Сломанный телевизор", "Broken TV");
+	add("Кассета 1998", "Tape 1998", 0);
+	add("Для сторис", "For stories", 1);
+	add("Сломанный телевизор", "Broken TV", 2);
 	return result;
 }
 
@@ -3285,16 +3635,48 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	view(u"share_playlist_loading"_q, { .loading = true }, {});
 	view(u"share_playlist_gone"_q, {
 		.error = tr::lng_oblivion_share_error_gone(tr::now),
+		.gone = true,
+	}, {});
+	view(u"share_playlist_offline"_q, {
+		.error = tr::lng_oblivion_cloud_error_network(tr::now),
 	}, {});
 
 	RegisterBoxScene(u"share_library"_q, size, [=](
 			std::shared_ptr<Ui::Show> show) {
-		auto second = SamplePlaylist(false);
-		second.id = u"Zz1abcdefghijklmnopq55"_q;
-		second.title = Sample("Утро без кофе", "Morning without coffee");
-		second.ownerName = Sample("Аня", "Anna");
+		// Summaries, as the list of the server gives them: every playlist
+		// with its own name, length and author.
+		const auto summary = [&](
+				const QString &id,
+				const QString &title,
+				const QString &owner,
+				int tracks,
+				int seconds) {
+			auto result = guest;
+			result.id = id;
+			result.title = title;
+			result.ownerName = owner;
+			result.full = false;
+			result.tracks.clear();
+			result.trackCount = tracks;
+			result.totalDuration = seconds * int64(1000);
+			return result;
+		};
 		return Box(LibraryBox, LibraryArgs{
-			.kept = { own, guest, second },
+			.kept = {
+				own,
+				summary(
+					u"Qw9abcdefghijklmnopq77"_q,
+					Sample("Синтвейв на вечер", "Evening synthwave"),
+					Sample("Миша", "Misha"),
+					24,
+					5832),
+				summary(
+					u"Zz1abcdefghijklmnopq55"_q,
+					Sample("Утро без кофе", "Morning without coffee"),
+					Sample("Аня", "Anna"),
+					12,
+					2768),
+			},
 		});
 	});
 	RegisterBoxScene(u"share_library_empty"_q, size, [](
@@ -3353,7 +3735,18 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.save = [](const Preset &preset) {},
 		});
 	});
+	// Opened by a link in a chat: no editor to apply it in, it can be
+	// saved, and after that the box tells where to find it.
 	RegisterBoxScene(u"share_preset_from_link"_q, size, [](
+			std::shared_ptr<Ui::Show> show) {
+		auto preset = SamplePresets(u"video"_q)[1];
+		return Box(PresetBox, PresetBoxArgs{
+			.preset = std::move(preset),
+			.save = [](const Preset &preset) {},
+			.saved = [](const Preset &preset) { return false; },
+		});
+	});
+	RegisterBoxScene(u"share_preset_saved"_q, size, [](
 			std::shared_ptr<Ui::Show> show) {
 		auto preset = SamplePresets(u"video"_q)[1];
 		return Box(PresetBox, PresetBoxArgs{
@@ -3602,7 +3995,7 @@ void FillPresetsMenu(not_null<Ui::PopupMenu*> menu, PresetHost host) {
 		});
 	});
 	menu->addAction(tr::lng_oblivion_share_preset_gallery(tr::now), [=] {
-		const auto apply = host.apply;
+		const auto apply = CheckedApply(host);
 		WithAccount(show, [=](not_null<Main::Session*> session) {
 			ShowGalleryWith(base::make_weak(session), show, kind, apply);
 		});

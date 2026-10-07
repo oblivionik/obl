@@ -4,5 +4,9 @@
     <file alias="art/oblivion/telegram_icon.png">../../art/oblivion_icon/telegram_original_1024.png</file>
     <file alias="art/oblivion/squircle_mask.png">../../art/oblivion_icon/squircle_mask.png</file>
     <file alias="art/oblivion/previous_icon.png">../../art/oblivion_icon/oblivion_previous_1024.png</file>
+    <file alias="art/oblivion/portal_icon.png">../../art/oblivion_icon/oblivion_portal_512.png</file>
+    <file alias="art/oblivion/ghost_icon.png">../../art/oblivion_icon/oblivion_ghost_512.png</file>
+    <file alias="art/oblivion/shadow_icon.png">../../art/oblivion_icon/oblivion_shadow_512.png</file>
+    <file alias="art/oblivion/horizon_icon.png">../../art/oblivion_icon/oblivion_horizon_512.png</file>
   </qresource>
 </RCC>

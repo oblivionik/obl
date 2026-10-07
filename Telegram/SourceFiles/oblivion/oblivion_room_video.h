@@ -58,6 +58,16 @@ class SessionController;
 // window of the room; a file goes to the relay only by a click («Добавить»
 // in the tab, a dropped file, «Добавить видео в комнату» in the menu of
 // a video message).
+//
+// The disk and the memory of this device. The room itself removes the
+// file of an item that has left the queues and its folder after the
+// window was closed. The player adds a budget for what is still in the
+// queue: what was watched earlier goes first when the files it has
+// brought take more than that or the disk is short, and nothing is
+// brought when the disk has no room for it (the tab says so). Only the
+// files Room::download() has made are ever removed, never a file of the
+// user. The streaming reader keeps all it has read in the memory, so the
+// player is reopened in the middle of a long video.
 namespace Oblivion::Rooms {
 
 // «Добавить видео в комнату» for the context menu of a video message:
@@ -83,6 +93,7 @@ enum class VideoState {
 	Loading, // The file is being downloaded, nothing can be shown yet.
 	Buffering, // It plays, but the download is behind.
 	Failed, // The file could not be downloaded.
+	NoSpace, // The disk of this device has no room for the file.
 	Unplayable, // The file is here, the player can't play it.
 	Paused, // The room is on pause.
 	Starting, // Waiting for the moment or for the first frame.
@@ -164,5 +175,47 @@ struct VideoStep {
 // «Играть следующим»: the index to move the item with the index to, by
 // the index of the current one. -1: it is there already.
 [[nodiscard]] int VideoPlayNextIndex(int index, int current);
+
+// Whether a picture of the room keeps the display of the device on: only
+// while it moves and is really shown (not on pause, not behind another
+// tab, not while the user watches something else).
+[[nodiscard]] bool VideoKeepsDisplayOn(
+	VideoState state,
+	bool playing,
+	bool picture,
+	bool shown);
+
+// A file of the room on the disk of this device.
+struct VideoFile {
+	QString media;
+	int64 bytes = 0;
+	crl::time usedAt = 0; // When it was the current item the last time.
+	bool kept = false; // Current, next, being downloaded, of the music.
+};
+
+struct VideoSpace {
+	std::vector<QString> evict; // The files to remove, in this order.
+	bool enough = true; // The new file fits after that.
+};
+
+// What goes before a new file is brought. files: all the room has here
+// with the new one among them (kept), budget: how much they may take
+// together, available: the free bytes of the disk (negative: not known),
+// needed: how many of them the new file takes with a reserve.
+[[nodiscard]] VideoSpace PlanVideoSpace(
+	std::vector<VideoFile> files,
+	int64 budget,
+	int64 available,
+	int64 needed);
+
+// The streaming reader never lets go of what it has read from a file
+// without a cache. The player is reopened (a pause of a part of a second)
+// when that is a lot: read bytes were given to it, sinceLast milliseconds
+// have passed after the previous time, left milliseconds of the item are
+// still to be played.
+[[nodiscard]] bool VideoReaderRestart(
+	int64 read,
+	crl::time sinceLast,
+	int64 left);
 
 } // namespace Oblivion::Rooms

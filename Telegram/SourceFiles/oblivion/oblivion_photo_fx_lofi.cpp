@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/invoke_queued.h"
 #include "lang/lang_keys.h"
+#include "oblivion/oblivion_lang.h"
 #include "oblivion/oblivion_photo_editor.h"
 #include "oblivion/oblivion_photo_editor_controls.h"
 #include "oblivion/oblivion_photo_panels.h"
@@ -4342,11 +4343,12 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 				: nullptr;
 			const auto count = param ? int(std::lround(param->max)) : 0;
 			for (auto i = 1; i <= count; ++i) {
+				// The tile is called the way the slider calls its value.
 				sources.push_back({
-					QString::number(i),
+					param->name.now() + QChar(' ') + QString::number(i),
 					{ MakeFx("digicam.reflection", {
 						{ "variant", FxValue::Integer(i) },
-						{ "strength", FxValue::Integer(80) },
+						{ "strength", FxValue::Integer(100) },
 					}) },
 				});
 			}
@@ -4360,19 +4362,25 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		[](not_null<Ui::RpWidget*> parent) {
 			auto sources = std::vector<GallerySource>();
 			if (FindFx("digicam.ccd")) {
-				// Violet, magenta, blue, orange, green and white.
+				// The tiles are named by the color, not by its code.
+				struct Tint {
+					const char *ru = nullptr;
+					const char *en = nullptr;
+					QColor color;
+				};
+				const auto russian = CurrentLanguageIsRussian();
 				for (const auto &tint : {
-					QColor(64, 0, 255),
-					QColor(255, 0, 255),
-					QColor(0, 0, 255),
-					QColor(255, 128, 0),
-					QColor(0, 255, 0),
-					QColor(255, 255, 255),
+					Tint{ "Фиолетовое свечение", "Violet bloom", { 64, 0, 255 } },
+					Tint{ "Пурпурное свечение", "Magenta bloom", { 255, 0, 255 } },
+					Tint{ "Синее свечение", "Blue bloom", { 0, 0, 255 } },
+					Tint{ "Оранжевое свечение", "Orange bloom", { 255, 128, 0 } },
+					Tint{ "Зелёное свечение", "Green bloom", { 0, 255, 0 } },
+					Tint{ "Белое свечение", "White bloom", { 255, 255, 255 } },
 				}) {
 					sources.push_back({
-						tint.name().toUpper(),
+						QString::fromUtf8(russian ? tint.ru : tint.en),
 						{ MakeFx("digicam.ccd", {
-							{ "tint", FxValue::Color(tint) },
+							{ "tint", FxValue::Color(tint.color) },
 							{ "bloom", FxValue::Integer(160) },
 						}) },
 					});

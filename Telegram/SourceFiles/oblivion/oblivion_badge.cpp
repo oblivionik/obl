@@ -18,6 +18,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "mainwindow.h"
 #include "mtproto/sender.h"
 #include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_lang.h"
@@ -763,6 +764,46 @@ int PaintMarkAfterName(
 void ScheduleChanges();
 void SyncSetting();
 
+// Whether Qt leaves this widget out when a parent of it is updated. A
+// widget that says it paints all of its pixels (Qt::WA_OpaquePaintEvent:
+// the chats list, the lists of messages and of peers), one that fills its
+// background or paints on screen, and a window of its own are taken out
+// of what QWidget::update() of a parent repaints: each of them has to be
+// asked by itself.
+[[nodiscard]] bool PaintsByItself(not_null<QWidget*> widget) {
+	return widget->isWindow()
+		|| widget->testAttribute(Qt::WA_OpaquePaintEvent)
+		|| widget->testAttribute(Qt::WA_PaintOnScreen)
+		|| widget->autoFillBackground();
+}
+
+// Everything inside root, at any depth, that update() of root leaves out.
+[[nodiscard]] std::vector<not_null<QWidget*>> SelfPainted(
+		not_null<QWidget*> root) {
+	auto result = std::vector<not_null<QWidget*>>();
+	for (const auto child : root->findChildren<QWidget*>()) {
+		if (PaintsByItself(child)) {
+			result.push_back(child);
+		}
+	}
+	return result;
+}
+
+// The whole window is painted anew, the chats list and the other lists
+// that paint opaquely included. Only paint events come of it: the helper
+// Ui::ForceFullRepaint() is not used on purpose, it shows a widget over
+// the window for a moment and the list under the mouse gets a leave
+// event (the chats list then drops the hover and stops holding its order
+// under the pointer, see Dialogs::InnerWidget::leaveEventHook).
+void RepaintWhole(not_null<QWidget*> window) {
+	window->update();
+	for (const auto &widget : SelfPainted(window)) {
+		if (widget->isVisible()) {
+			widget->update();
+		}
+	}
+}
+
 // The badge of one account: the users known by a marker in the bio, the
 // old marker in the own bio and the requests that remove it. The marker
 // is never written any more: the badge is published through Oblivion
@@ -991,8 +1032,24 @@ rpl::producer<> State::changes() const {
 	return _changes.events();
 }
 
+// The widgets that follow the badge by themselves (the mark of a profile,
+// the top bar of a chat) are told. The rows of the chats list and of the
+// other lists paint the mark together with a name (Ui::PeerBadge) and
+// learn that a peer has got or lost the badge only when they are painted,
+// so the windows of the account are repainted as a whole: without it a
+// badge list that arrives from the cloud would show up row by row, as
+// the mouse moves over the list. update() of the window alone is not
+// enough for that: Qt leaves out exactly those lists, they paint
+// opaquely (see RepaintWhole). This happens when the list or a setting
+// has changed, not often.
 void State::fireChanges() {
 	_changes.fire({});
+	if (_forgotten) {
+		return;
+	}
+	for (const auto &window : _session->windows()) {
+		RepaintWhole(window->widget());
+	}
 }
 
 QString State::aboutLoaded(
@@ -3159,6 +3216,37 @@ void TestGlyph(Checker &check) {
 	check(!qAlpha(none.pixel(1, 1)), "glyph: an empty rectangle is skipped");
 }
 
+// Which widgets of a window are asked to repaint by themselves after the
+// badge list has changed. The widgets are never shown here: only the
+// choice is checked (the chats list is such a widget inside plain ones).
+void TestRepaint(Checker &check) {
+	QWidget root; // Deletes the rest with itself.
+	const auto plain = new QWidget(&root);
+	const auto list = new QWidget(plain);
+	list->setAttribute(Qt::WA_OpaquePaintEvent);
+	const auto row = new QWidget(list);
+	const auto nested = new QWidget(row);
+	nested->setAttribute(Qt::WA_OpaquePaintEvent);
+	const auto filled = new QWidget(&root);
+	filled->setAutoFillBackground(true);
+
+	const auto found = SelfPainted(&root);
+	const auto has = [&](QWidget *widget) {
+		return ranges::contains(found, not_null<QWidget*>(widget));
+	};
+	check(has(list), "repaint: a list that paints opaquely is asked itself");
+	check(has(nested), "repaint: also one inside another such list");
+	check(has(filled), "repaint: and a widget that fills its background");
+	check(
+		!has(plain) && !has(row),
+		"repaint: the plain widgets are painted with their parents");
+	check(found.size() == 3, "repaint: nobody is asked twice");
+	check(PaintsByItself(&root), "repaint: a window is asked by itself");
+	check(
+		SelfPainted(row).size() == 1,
+		"repaint: only what is inside the widget is looked at");
+}
+
 } // namespace
 
 bool Has(not_null<PeerData*> peer) {
@@ -3340,6 +3428,8 @@ bool RunSelfTest(QStringList &log) {
 	check.section("disk");
 	TestGlyph(check);
 	check.section("glyph");
+	TestRepaint(check);
+	check.section("repaint");
 	log.push_back(u"badge: %1 checks passed, %2 failed"_q.arg(
 		QString::number(check.passed()),
 		QString::number(check.failed())));

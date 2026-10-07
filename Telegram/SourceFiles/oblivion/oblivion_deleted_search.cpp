@@ -356,6 +356,7 @@ struct VersionsArgs {
 	std::vector<EditVersion> versions;
 	std::optional<TextWithEntities> current;
 	TimeId found = 0; // When the version that was found was replaced.
+	TimeId now = 0; // A fixed "now" for the snapshots.
 	Ui::Text::MarkedContext context;
 	Fn<void()> jump;
 };
@@ -363,8 +364,12 @@ struct VersionsArgs {
 struct BoxArgs {
 	std::shared_ptr<Ui::Show> show;
 	Fn<std::vector<Entry>()> collect;
-	rpl::producer<> changes;
+
+	// The store has changed. True: records were removed (the results may
+	// show what is not there any more), false: only added.
+	rpl::producer<bool> changes;
 	uint64 peerId = 0;
+	QString peerName; // Of that chat, it may have no records yet.
 	QString query;
 	bool deleted = true;
 	bool edited = true;
@@ -399,6 +404,22 @@ struct BoxArgs {
 			: u"d MMM yyyy"_q).remove(QChar('.'));
 }
 
+// The day with the whole name of the month and the time: "6 октября, 11:41".
+[[nodiscard]] QString FullDate(TimeId when, TimeId now) {
+	if (when <= 0) {
+		return QString();
+	}
+	const auto moment = QDateTime::fromSecsSinceEpoch(when);
+	const auto today = QDateTime::fromSecsSinceEpoch(now).date();
+	return DateLocale().toString(
+		moment.date(),
+		(moment.date().year() == today.year())
+			? u"d MMMM"_q
+			: u"d MMMM yyyy"_q)
+		+ u", "_q
+		+ moment.time().toString(u"HH:mm"_q);
+}
+
 [[nodiscard]] TimeId DayStart(const QDate &date) {
 	return TimeId(QDateTime(date, QTime(0, 0)).toSecsSinceEpoch());
 }
@@ -431,8 +452,12 @@ void ApplyPeriod(Query &query, const PeriodChoice &period, TimeId now) {
 	case PeriodType::Year:
 		return tr::lng_oblivion_dsearch_period_year(tr::now);
 	case PeriodType::Day:
-		return DateLocale().toString(period.day, u"d MMM yyyy"_q).remove(
-			QChar('.'));
+		// The chip is short: the year is there only when it is not this one.
+		return DateLocale().toString(
+			period.day,
+			(period.day.year() == QDate::currentDate().year())
+				? u"d MMM"_q
+				: u"d MMM yyyy"_q).remove(QChar('.'));
 	}
 	return QString();
 }
@@ -475,6 +500,35 @@ void ApplyPeriod(Query &query, const PeriodChoice &period, TimeId now) {
 	return result;
 }
 
+[[nodiscard]] bool SameRecord(const Entry &a, const Entry &b) {
+	return (a.source == b.source)
+		&& (a.peerId == b.peerId)
+		&& (a.messageId == b.messageId)
+		&& (a.date == b.date)
+		&& (a.changed == b.changed);
+}
+
+// The chat the box was opened from may have nothing saved yet: it still
+// has its name on the chip and its place in the menu.
+void AddPresetChat(
+		std::vector<ChatOption> &chats,
+		uint64 peerId,
+		const QString &name) {
+	if (peerId
+		&& !name.isEmpty()
+		&& !ranges::contains(chats, peerId, &ChatOption::peerId)) {
+		chats.push_back({ .peerId = peerId, .name = name });
+	}
+}
+
+// The chip: its text, the arrow and what is around them. Three chips with
+// their usual texts have to fit in one row of the box.
+constexpr auto kChipLeft = 10;
+constexpr auto kChipTextSkip = 5;
+constexpr auto kChipArrow = 8;
+constexpr auto kChipRight = 9;
+constexpr auto kChipsSkip = 6;
+
 // A rounded button with a text and a small arrow that opens a menu.
 class Chip final : public Ui::AbstractButton {
 public:
@@ -507,11 +561,11 @@ void Chip::setContent(const QString &text, bool active) {
 }
 
 int Chip::naturalWidth() const {
-	return Scaled(12)
+	return Scaled(kChipLeft)
 		+ st::normalFont->width(_text)
-		+ Scaled(6)
-		+ Scaled(8)
-		+ Scaled(10);
+		+ Scaled(kChipTextSkip)
+		+ Scaled(kChipArrow)
+		+ Scaled(kChipRight);
 }
 
 void Chip::onStateChanged(State was, StateChangeSource source) {
@@ -531,10 +585,14 @@ void Chip::paintEvent(QPaintEvent *e) {
 	p.drawRoundedRect(rect(), radius, radius);
 
 	const auto &font = st::normalFont;
-	const auto left = Scaled(12);
-	const auto arrow = Scaled(8);
-	const auto right = Scaled(10);
-	const auto available = width() - left - Scaled(6) - arrow - right;
+	const auto left = Scaled(kChipLeft);
+	const auto arrow = Scaled(kChipArrow);
+	const auto right = Scaled(kChipRight);
+	const auto available = width()
+		- left
+		- Scaled(kChipTextSkip)
+		- arrow
+		- right;
 	const auto color = _active ? st::windowFgActive->c : st::windowFg->c;
 	p.setFont(font);
 	p.setPen(color);
@@ -597,32 +655,24 @@ Filters::Filters(QWidget *parent)
 
 int Filters::resizeGetHeight(int newWidth) {
 	const auto &padding = st::boxRowPadding;
-	const auto skip = Scaled(8);
-	const auto top = Scaled(6);
+	const auto skip = Scaled(kChipsSkip);
 	const auto height = _chat->height();
-	const auto available = newWidth - padding.left() - padding.right();
-	auto period = _period->naturalWidth();
-	auto kind = _kind->naturalWidth();
-	auto chat = _chat->naturalWidth();
-	const auto minimal = Scaled(64);
-	auto extra = chat + period + kind + 2 * skip - available;
-	const auto shrink = [&](int &width) {
-		if (extra > 0) {
-			const auto by = std::min(extra, std::max(width - minimal, 0));
-			width -= by;
-			extra -= by;
+	const auto available = std::max(
+		newWidth - padding.left() - padding.right(),
+		0);
+
+	// The chips keep their texts whole: with the long name of a chat the
+	// one that does not fit goes to the next row. Only a chip that is
+	// wider than the whole row is cut.
+	auto left = 0;
+	auto top = Scaled(6);
+	for (const auto &chip : { _chat, _period, _kind }) {
+		const auto width = std::min(chip->naturalWidth(), available);
+		if (left > 0 && available > 0 && left + width > available) {
+			left = 0;
+			top += height + skip;
 		}
-	};
-	shrink(chat);
-	shrink(kind);
-	shrink(period);
-	auto left = padding.left();
-	for (const auto &[chip, width] : {
-		std::pair{ _chat, chat },
-		std::pair{ _period, period },
-		std::pair{ _kind, kind },
-	}) {
-		chip->setGeometry(left, top, width, height);
+		chip->setGeometry(padding.left() + left, top, width, height);
 		left += width + skip;
 	}
 	return top + height + Scaled(10);
@@ -639,7 +689,9 @@ public:
 		std::vector<QString> words);
 	void setSearching(bool searching);
 
-	[[nodiscard]] rpl::producer<int> activated() const {
+	// The entry itself, not its place: the box may have newer entries
+	// already while this list still shows the results for the old ones.
+	[[nodiscard]] rpl::producer<Entry> activated() const {
 		return _activated.events();
 	}
 
@@ -672,7 +724,7 @@ private:
 	std::vector<Match> _matches;
 	std::vector<QString> _words;
 	base::flat_map<int, std::unique_ptr<RowView>> _views;
-	rpl::event_stream<int> _activated;
+	rpl::event_stream<Entry> _activated;
 	int _hovered = -1;
 	int _pressed = -1;
 	bool _searching = false;
@@ -703,14 +755,46 @@ void ResultsList::setResults(
 		std::shared_ptr<const Corpus> corpus,
 		std::vector<Match> &&matches,
 		std::vector<QString> words) {
+	// The results may be replaced under the cursor (the store has
+	// changed). A row that is being clicked stays so only while it shows
+	// the very same record, a click never opens another one.
+	const auto entryAt = [&](int row) {
+		return (row >= 0 && row < int(_matches.size()) && _corpus)
+			? &_corpus->entries[_matches[row].index]
+			: nullptr;
+	};
+	const auto pressed = _pressed;
+	const auto was = entryAt(pressed);
+	const auto wasEntry = was ? std::make_optional(*was) : std::nullopt;
+
 	_corpus = std::move(corpus);
 	_matches = std::move(matches);
 	_words = std::move(words);
+
+	// A widget can't be taller than QWIDGETSIZE_MAX, with a full store
+	// and a large interface scale the rows would not fit. What is cut is
+	// the end of the list: the weakest matches, the oldest records.
+	const auto limit = std::max(QWIDGETSIZE_MAX / rowHeight() - 1, 1);
+	if (int(_matches.size()) > limit) {
+		_matches.resize(limit);
+	}
 	_views.clear();
 	_searching = false;
 	_hovered = _pressed = -1;
-	setCursor(style::cur_default);
 	resizeToWidth(width());
+
+	const auto now = entryAt(pressed);
+	if (wasEntry && now && SameRecord(*wasEntry, *now)) {
+		_pressed = pressed;
+	}
+	const auto under = underMouse()
+		? rowAt(mapFromGlobal(QCursor::pos()))
+		: -1;
+	if (under >= 0) {
+		setHovered(under);
+	} else {
+		setCursor(style::cur_default);
+	}
 	update();
 }
 
@@ -757,8 +841,12 @@ void ResultsList::mouseReleaseEvent(QMouseEvent *e) {
 	const auto pressed = std::exchange(_pressed, -1);
 	if (e->button() == Qt::LeftButton
 		&& pressed >= 0
-		&& pressed == rowAt(e->pos())) {
-		_activated.fire_copy(_matches[pressed].index);
+		&& pressed == rowAt(e->pos())
+		&& _corpus) {
+		const auto index = _matches[pressed].index;
+		if (index >= 0 && index < int(_corpus->entries.size())) {
+			_activated.fire_copy(_corpus->entries[index]);
+		}
 	}
 }
 
@@ -767,8 +855,11 @@ void ResultsList::leaveEventHook(QEvent *e) {
 }
 
 ResultsList::RowView &ResultsList::viewFor(int row) {
+	// The found words are bold and colored: both kinds of marks are kept
+	// only together with TextParseMarkdown (nothing is parsed from the
+	// text itself, the marks come ready).
 	static const auto kOptions = TextParseOptions{
-		TextParseColorized,
+		TextParseColorized | TextParseMarkdown,
 		0,
 		0,
 		Qt::LayoutDirectionAuto,
@@ -787,8 +878,9 @@ ResultsList::RowView &ResultsList::viewFor(int row) {
 	view->badge = view->deleted
 		? tr::lng_oblivion_dsearch_badge_deleted(tr::now)
 		: tr::lng_oblivion_dsearch_badge_edited(tr::now);
+	// The day (or the minute) the row shows on the right is not repeated.
 	const auto changed = ShortDate(entry.changed, _now);
-	if (!changed.isEmpty()) {
+	if (!changed.isEmpty() && changed != view->date) {
 		view->badge += ' ' + changed;
 	}
 	view->sender = entry.sender;
@@ -863,7 +955,8 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 		(clip.top() + clip.height() + height - 1) / height,
 		int(_matches.size()));
 	const auto &name = st::semiboldFont;
-	const auto &small = st::normalFont;
+	const auto &plain = st::normalFont;
+	const auto count = int(_matches.size());
 	for (auto row = from; row < till; ++row) {
 		const auto &view = viewFor(row);
 		const auto y = row * height;
@@ -872,7 +965,7 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 		}
 		auto top = y + Scaled(8);
 
-		const auto dateWidth = small->width(view.date);
+		const auto dateWidth = plain->width(view.date);
 		const auto chatWidth = available - dateWidth - Scaled(12);
 		p.setFont(name);
 		p.setPen(st::windowBoldFg);
@@ -883,7 +976,7 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 			(name->width(view.chat) > chatWidth)
 				? name->elided(view.chat, std::max(chatWidth, 0))
 				: view.chat);
-		p.setFont(small);
+		p.setFont(plain);
 		p.setPen(st::windowSubTextFg);
 		p.drawTextRight(right, top, width(), view.date, dateWidth);
 		top += name->height;
@@ -893,7 +986,7 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 			: st::windowActiveTextFg);
 		p.drawTextLeft(left, top, width(), view.badge);
 		if (!view.sender.isEmpty()) {
-			const auto badgeWidth = small->width(view.badge);
+			const auto badgeWidth = plain->width(view.badge);
 			const auto sender = u" · "_q + view.sender;
 			const auto senderWidth = available - badgeWidth;
 			p.setPen(st::windowSubTextFg);
@@ -901,11 +994,11 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 				left + badgeWidth,
 				top,
 				width(),
-				(small->width(sender) > senderWidth)
-					? small->elided(sender, std::max(senderWidth, 0))
+				(plain->width(sender) > senderWidth)
+					? plain->elided(sender, std::max(senderWidth, 0))
 					: sender);
 		}
-		top += small->height + Scaled(2);
+		top += plain->height + Scaled(2);
 
 		p.setPen(st::windowFg);
 		view.snippet.draw(p, {
@@ -914,12 +1007,16 @@ void ResultsList::paintEvent(QPaintEvent *e) {
 			.availableWidth = available,
 			.elisionLines = 2,
 		});
-		p.fillRect(
-			left,
-			y + height - st::lineWidth,
-			available,
-			st::lineWidth,
-			st::shadowFg);
+
+		// The lines are between the rows, not under the last one.
+		if (row + 1 < count) {
+			p.fillRect(
+				left,
+				y + height - st::lineWidth,
+				available,
+				st::lineWidth,
+				st::shadowFg);
+		}
 	}
 }
 
@@ -934,17 +1031,28 @@ void VersionsBox(not_null<Ui::GenericBox*> box, VersionsArgs &&args) {
 	if (!args.sender.isEmpty() && args.sender != args.chat) {
 		header.append(u" · "_q + args.sender);
 	}
+	// The texts are as long as messages are: they take the lines they need
+	// (a label of a style without the minimal width is one line tall
+	// whatever it is given, the rest of its text is cut away).
 	content->add(
 		object_ptr<Ui::FlatLabel>(
 			content,
 			rpl::single(header),
-			st::defaultFlatLabel),
+			st::boxLabel),
 		padding);
 
+	const auto now = args.now ? args.now : base::unixtime::now();
+	auto first = true;
 	const auto addVersion = [&](
 			const QString &title,
 			const TextWithEntities &text,
 			bool found) {
+		// The lines are between the versions, not under the last one.
+		if (!std::exchange(first, false)) {
+			auto line = object_ptr<Ui::PlainShadow>(content);
+			line->resize(line->width(), st::lineWidth);
+			content->add(std::move(line), padding);
+		}
 		Ui::AddSkip(content, st::boxLittleSkip);
 		const auto label = content->add(
 			object_ptr<Ui::FlatLabel>(
@@ -956,24 +1064,21 @@ void VersionsBox(not_null<Ui::GenericBox*> box, VersionsArgs &&args) {
 			label->setTextColorOverride(st::windowActiveTextFg->c);
 		}
 		const auto body = content->add(
-			object_ptr<Ui::FlatLabel>(content, st::defaultFlatLabel),
+			object_ptr<Ui::FlatLabel>(content, st::boxLabel),
 			style::margins(
 				padding.left(),
-				st::boxLittleSkip / 2,
+				st::boxLittleSkip / 4,
 				padding.right(),
 				st::boxLittleSkip));
 		body->setMarkedText(text, args.context);
 		body->setSelectable(true);
-		auto line = object_ptr<Ui::PlainShadow>(content);
-		line->resize(line->width(), st::lineWidth);
-		content->add(std::move(line), padding);
 	};
 	for (const auto &version : args.versions) {
 		addVersion(
 			tr::lng_oblivion_dsearch_version_was(
 				tr::now,
 				lt_date,
-				langDateTimeFull(base::unixtime::parse(version.replaced))),
+				FullDate(version.replaced, now)),
 			version.text,
 			args.found && (version.replaced == args.found));
 	}
@@ -983,7 +1088,6 @@ void VersionsBox(not_null<Ui::GenericBox*> box, VersionsArgs &&args) {
 			*args.current,
 			false);
 	}
-	Ui::AddSkip(content, st::boxLittleSkip);
 
 	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
 	if (const auto jump = args.jump) {
@@ -1003,6 +1107,15 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		base::Timer rebuild;
 		int corpusGeneration = 0;
 		int searchGeneration = 0;
+
+		// The store got new records while the list was scrolled down:
+		// they are shown when it is back at the top or the search is
+		// changed, the list is not rebuilt under the reader.
+		bool stale = false;
+
+		// The user has changed the search: its results start from the
+		// top. A refresh in the background leaves the list where it is.
+		bool scrollToTop = false;
 	};
 	const auto state = box->lifetime().make_state<State>();
 	const auto show = args.show;
@@ -1010,6 +1123,8 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 	const auto open = args.open;
 	const auto sync = args.sync;
 	const auto fixedNow = args.now;
+	const auto presetId = args.peerId;
+	const auto presetName = args.peerName;
 	const auto now = [=] {
 		return fixedNow ? fixedNow : base::unixtime::now();
 	};
@@ -1067,7 +1182,9 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 				? QString()
 				: QString::number(matches.size());
 			list->setResults(corpus, std::move(matches), words);
-			box->scrollToY(0);
+			if (base::take(state->scrollToTop)) {
+				box->scrollToY(0);
+			}
 		};
 		if (sync) {
 			apply(Search(*corpus, query));
@@ -1091,7 +1208,12 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 				state->chats,
 				peerId,
 				&ChatOption::peerId);
-			chat = (i != end(state->chats) && !i->name.isEmpty())
+			// The chat the search was opened from is "this chat", the way
+			// the search of Telegram calls it: the three chips with their
+			// short texts stay in one row. The name is in the menu.
+			chat = (peerId == presetId)
+				? tr::lng_oblivion_dsearch_chat_this(tr::now)
+				: (i != end(state->chats) && !i->name.isEmpty())
 				? i->name
 				: tr::lng_oblivion_dsearch_unknown_chat(tr::now);
 		}
@@ -1111,6 +1233,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 			return;
 		}
 		state->chats = CollectChats(*corpus, state->query.peerId);
+		AddPresetChat(state->chats, presetId, presetName);
 		state->corpus = std::move(corpus);
 		refreshChips();
 		runSearch();
@@ -1119,6 +1242,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		if (!collect) {
 			return;
 		}
+		state->stale = false;
 		auto entries = collect();
 		const auto generation = ++state->corpusGeneration;
 		if (sync) {
@@ -1134,6 +1258,18 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 	};
 	state->rebuild.setCallback(rebuild);
 
+	// The search was changed by the user: the results start from the
+	// top, and it is the moment to take in what the store got meanwhile.
+	const auto searchAnew = [=] {
+		state->scrollToTop = true;
+		if (state->stale) {
+			state->rebuild.cancel();
+			rebuild();
+		} else {
+			runSearch();
+		}
+	};
+
 	const auto showMenu = [=](Fn<void(not_null<Ui::PopupMenu*>)> fill) {
 		state->menu = base::make_unique_q<Ui::PopupMenu>(
 			box.get(),
@@ -1147,7 +1283,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 				return [=] {
 					state->query.peerId = peerId;
 					refreshChips();
-					runSearch();
+					searchAnew();
 				};
 			};
 			menu->addAction(
@@ -1170,7 +1306,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 				return [=] {
 					state->period = { .type = type };
 					refreshChips();
-					runSearch();
+					searchAnew();
 				};
 			};
 			for (const auto type : {
@@ -1199,7 +1335,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 							.day = date,
 						};
 						refreshChips();
-						runSearch();
+						searchAnew();
 						close();
 					}),
 					.maxDate = today,
@@ -1214,7 +1350,7 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 					state->query.deleted = deleted;
 					state->query.edited = edited;
 					refreshChips();
-					runSearch();
+					searchAnew();
 				};
 			};
 			menu->addAction(KindName(true, true), choose(true, true));
@@ -1230,30 +1366,44 @@ void SearchBox(not_null<Ui::GenericBox*> box, BoxArgs &&args) {
 		const auto text = query.trimmed();
 		if (state->query.text != text) {
 			state->query.text = text;
-			runSearch();
+			searchAnew();
 		}
 	});
 	field->setSubmittedCallback([](Qt::KeyboardModifiers) {
 	});
 
 	list->activated(
-	) | rpl::on_next([=](int index) {
-		const auto corpus = state->corpus;
-		if (open
-			&& corpus
-			&& index >= 0
-			&& index < int(corpus->entries.size())) {
-			open(corpus->entries[index]);
+	) | rpl::on_next([=](const Entry &entry) {
+		if (open) {
+			open(entry);
 		}
 	}, list->lifetime());
 
-	std::move(
-		args.changes
-	) | rpl::on_next([=] {
+	const auto rebuildSoon = [=] {
 		if (!state->rebuild.isActive()) {
 			state->rebuild.callOnce(kRebuildDelay);
 		}
+	};
+	std::move(
+		args.changes
+	) | rpl::on_next([=](bool removed) {
+		if (!removed && box->scrollTop() > 0) {
+			// Messages are deleted somewhere all the time. The list is not
+			// rebuilt under the reader for that: the new records appear
+			// when it is back at the top or the search is changed.
+			state->stale = true;
+			return;
+		}
+		rebuildSoon();
 	}, box->lifetime());
+	box->setInitScrollCallback([=] {
+		box->scrolls(
+		) | rpl::on_next([=] {
+			if (state->stale && box->scrollTop() <= 0) {
+				rebuildSoon();
+			}
+		}, box->lifetime());
+	});
 
 	refreshChips();
 	rebuild();
@@ -1470,14 +1620,16 @@ constexpr auto kSampleNow = TimeId(1791362460); // 7 October 2026.
 		std::shared_ptr<Ui::Show> show,
 		const QString &query,
 		bool withEntries,
-		uint64 peerId = 0) {
+		uint64 peerId = 0,
+		const QString &peerName = QString()) {
 	return Box(SearchBox, BoxArgs{
 		.show = show,
 		.collect = [=] {
 			return withEntries ? SampleEntries() : std::vector<Entry>();
 		},
-		.changes = rpl::never<>(),
+		.changes = rpl::never<bool>(),
 		.peerId = peerId,
+		.peerName = peerName,
 		.query = query,
 		.now = kSampleNow,
 		.sync = true,
@@ -1506,6 +1658,15 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 	RegisterBoxScene(u"deleted_search_nothing_saved"_q, size, [](
 			std::shared_ptr<Ui::Show> show) {
 		return SampleSearchBox(show, QString(), false);
+	});
+	RegisterBoxScene(u"deleted_search_chat_without_records"_q, size, [](
+			std::shared_ptr<Ui::Show> show) {
+		return SampleSearchBox(
+			show,
+			QString(),
+			true,
+			104,
+			SampleText("Мама", "Mom"));
 	});
 	RegisterBoxScene(u"deleted_search_versions"_q, size, [](
 			std::shared_ptr<Ui::Show> show) {
@@ -1537,6 +1698,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 				"We meet at 6:30 at the ticket office, I have the "
 				"tickets.") },
 			.found = now - 86400,
+			.now = now,
 			.jump = [] {},
 		});
 	});
@@ -1606,8 +1768,16 @@ void Show(
 	controller->show(Box(SearchBox, BoxArgs{
 		.show = controller->uiShow(),
 		.collect = [=] { return CollectEntries(session, store); },
-		.changes = store->deletedChanges() | rpl::to_empty,
+		.changes = store->deletedChanges(
+		) | rpl::map([](const DeletedChange &change) {
+			return change.removed;
+		}),
 		.peerId = peer ? peer->id.value : uint64(),
+		.peerName = (!peer
+			? QString()
+			: peer->isSelf()
+			? tr::lng_saved_messages(tr::now)
+			: peer->name()),
 		.open = open,
 	}));
 }
@@ -1796,12 +1966,23 @@ bool RunSelfTest(QStringList &log) {
 			"period: one day");
 		ApplyPeriod(query, {}, now);
 		check(!query.from && !query.till, "period: all");
-		const auto chats = CollectChats(*corpus, 0);
+		auto chats = CollectChats(*corpus, 0);
 		check(chats.size() == 3
 			&& chats[0].peerId == 1
 			&& chats[0].count == 2
 			&& chats[2].peerId == 3,
 			"chats: sorted by the number of the records");
+		AddPresetChat(chats, 2, u"Renamed"_q);
+		AddPresetChat(chats, 0, u"Nobody"_q);
+		AddPresetChat(chats, 9, QString());
+		check(chats.size() == 3 && chats[1].name == u"Club"_q,
+			"chats: a chat with records is not added twice");
+		AddPresetChat(chats, 9, u"New chat"_q);
+		check(chats.size() == 4
+			&& chats[3].peerId == 9
+			&& chats[3].name == u"New chat"_q
+			&& !chats[3].count,
+			"chats: the opened chat has its name with nothing saved");
 	}
 	check.section("filters");
 

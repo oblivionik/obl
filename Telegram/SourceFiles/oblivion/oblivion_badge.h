@@ -80,6 +80,13 @@ namespace Oblivion::Badge {
 // Fires on the main thread (from the event loop, never from inside the
 // code that applies an update) after the result of Has() could have
 // changed for any peer: the names that show the badge are to be repainted.
+// Right before it the main windows of the accounts are asked to repaint
+// as a whole: the window and, each by itself, every visible widget inside
+// it that Qt leaves out of an update of its parent (the lists that paint
+// opaquely, the chats list first of all). So a list in a main window that
+// paints names through Ui::PeerBadge needs no subscription of its own; a
+// widget that keeps something computed from Has() (a width, a cached
+// text) or lives in another window still has to subscribe.
 [[nodiscard]] rpl::producer<> Changes();
 
 // The badge list of the cloud (or the setting that shows it) has changed:

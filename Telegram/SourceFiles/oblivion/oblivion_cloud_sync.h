@@ -23,7 +23,9 @@ class SessionController;
 // presets of the editors. It is compressed and sealed with AES-256-GCM,
 // the key is PBKDF2-HMAC-SHA256 of the sync password (600 000 rounds, a
 // random salt), everything on this device: the server stores bytes it
-// can't read and nothing is ever sent in the clear.
+// can't read and nothing is ever sent in the clear. The number of rounds
+// is fixed here: a copy whose header claims fewer is not opened, and a
+// new copy is never sealed with fewer, whatever the server gives back.
 //
 // The password is never stored. After a successful «Отправить» or
 // «Получить» the derived key is kept on the device (sealed with a key
@@ -36,6 +38,13 @@ class SessionController;
 // by default): local changes are sent a little after they are made, a
 // newer copy of another device is applied when this device has nothing
 // unsent. When both have changed nothing is overwritten: the box asks.
+// The automatic mode never makes a copy where there is none: the first
+// one, and a new one after «Удалить копию с сервера», is made by
+// «Отправить». «Удалить копию с сервера» switches the mode off as well.
+//
+// A preset deleted on one device is deleted on the others (the copy
+// carries the ids of the deleted ones for half a year), instead of
+// coming back from a device that still has it.
 namespace Oblivion::Sync {
 
 // Called by Cloud::SessionStarted() / Cloud::SessionLoggedOut().

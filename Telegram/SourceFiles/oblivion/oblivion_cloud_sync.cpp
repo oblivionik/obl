@@ -7,7 +7,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "oblivion/oblivion_cloud_sync.h"
 
-#include "base/call_delayed.h"
 #include "base/timer.h"
 #include "base/unique_qptr.h"
 #include "base/unixtime.h"
@@ -44,6 +43,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_widgets.h"
 
 #include <QtCore/QCryptographicHash>
+#include <QtCore/QHash>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
@@ -55,9 +55,16 @@ namespace {
 
 constexpr auto kBlobVersion = 1;
 constexpr auto kKdfPbkdf2Sha256 = 1;
+// What this build seals with.
 constexpr auto kIterations = 600'000;
-constexpr auto kMinIterations = 1000;
+// The strength of the key is decided here and never by the bytes of the
+// server: no build of Oblivion has sealed a copy with fewer rounds, so a
+// header that claims fewer was not written by the app. Such a copy is
+// not opened, its header is not reused and not remembered.
+constexpr auto kMinIterations = kIterations;
 constexpr auto kMaxIterations = 5'000'000;
+// Only for the self-test, where the real count would take seconds.
+constexpr auto kTestIterations = 1000;
 constexpr auto kSaltSize = 16;
 constexpr auto kHeaderSize = 4 + 1 + 1 + 4 + kSaltSize;
 constexpr auto kSealOverhead = 12 + 16;
@@ -69,6 +76,8 @@ constexpr auto kMaxPassword = 256;
 constexpr auto kMaxDeviceName = 64;
 constexpr auto kSendDelay = crl::time(60'000);
 constexpr auto kStartDelay = crl::time(8'000);
+constexpr auto kRecheckDelay = crl::time(3'000);
+constexpr auto kMaxRefused = 2;
 
 // What belongs to this device or to an account of Telegram and is never
 // put into the copy: the icon of the app, what depends on a model or on
@@ -172,7 +181,14 @@ struct BlobHeader {
 	return result;
 }
 
-[[nodiscard]] std::optional<BlobHeader> ParseHeader(const QByteArray &blob) {
+// The header of a copy, if its rounds are inside minIterations ..
+// kMaxIterations. The minimum is kMinIterations everywhere a key is made
+// from a password; a lower one is given only where the key is there
+// already (OpenBlob: the seal itself proves who wrote the header) and by
+// the self-test.
+[[nodiscard]] std::optional<BlobHeader> ParseHeader(
+		const QByteArray &blob,
+		int minIterations = kMinIterations) {
 	if (blob.size() < kHeaderSize + kSealOverhead
 		|| blob.size() > kMaxBlob
 		|| !blob.startsWith(Magic())
@@ -184,14 +200,38 @@ struct BlobHeader {
 		| (uint32(uchar(blob[7])) << 16)
 		| (uint32(uchar(blob[8])) << 8)
 		| uint32(uchar(blob[9]));
-	// A copy somebody has planted must not make the app count for hours.
-	if (iterations < uint32(kMinIterations)
+	// A copy somebody has planted must neither make the key weak nor make
+	// the app count for hours.
+	if (iterations < uint32(std::max(minIterations, 1))
 		|| iterations > uint32(kMaxIterations)) {
 		return std::nullopt;
 	}
 	return BlobHeader{
 		.iterations = int(iterations),
 		.salt = blob.mid(10, kSaltSize),
+	};
+}
+
+// What a new copy is sealed with. The salt of the copy of the server is
+// kept, so that the devices with the same password go on with the same
+// key, but only together with rounds that are not below the minimum of
+// this build. Without such a copy (none at all, or a weak or unreadable
+// header) it is the salt this device has used before, so that a copy
+// made anew after «Удалить копию с сервера» still fits the other
+// devices, or a fresh salt with the full count.
+[[nodiscard]] BlobHeader HeaderForSend(
+		const QByteArray &remoteBlob,
+		const BlobHeader &used = BlobHeader()) {
+	if (const auto parsed = ParseHeader(remoteBlob)) {
+		return *parsed;
+	} else if (used.salt.size() == kSaltSize
+		&& used.iterations >= kMinIterations
+		&& used.iterations <= kMaxIterations) {
+		return used;
+	}
+	return BlobHeader{
+		.iterations = kIterations,
+		.salt = Cloud::RandomBytes(kSaltSize),
 	};
 }
 
@@ -221,7 +261,7 @@ struct BlobHeader {
 [[nodiscard]] std::optional<QByteArray> OpenBlob(
 		const QByteArray &key,
 		const QByteArray &blob) {
-	if (key.size() != 32 || !ParseHeader(blob)) {
+	if (key.size() != 32 || !ParseHeader(blob, 1)) {
 		return std::nullopt;
 	}
 	const auto packed = Cloud::AesGcmOpen(
@@ -249,6 +289,10 @@ struct Payload {
 	bool valid = false;
 	QJsonObject settings;
 	QJsonArray presets;
+	// The presets that were deleted, { id, time }: a preset that is gone
+	// on one device goes on the others too instead of coming back from
+	// them. A build that does not know the field ignores it.
+	QJsonArray removed;
 	QString device;
 	int64 savedAt = 0; // Unixtime.
 	int appBuild = 0;
@@ -262,6 +306,9 @@ struct Payload {
 	object.insert(u"saved_at"_q, double(payload.savedAt));
 	object.insert(u"settings"_q, payload.settings);
 	object.insert(u"presets"_q, payload.presets);
+	if (!payload.removed.isEmpty()) {
+		object.insert(u"presets_removed"_q, payload.removed);
+	}
 	return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -280,6 +327,7 @@ struct Payload {
 	result.valid = true;
 	result.settings = settings.toObject();
 	result.presets = object.value(u"presets"_q).toArray();
+	result.removed = object.value(u"presets_removed"_q).toArray();
 	result.device = Cloud::JsonText(
 		object.value(u"device"_q),
 		kMaxDeviceName);
@@ -302,6 +350,63 @@ struct Payload {
 	object.insert(u"presets"_q, presets);
 	return Cloud::Sha256(
 		QJsonDocument(object).toJson(QJsonDocument::Compact));
+}
+
+// The same presets, in whatever order two devices keep them. The time of
+// saving is not compared: a merge does not replace a preset for it.
+[[nodiscard]] bool SamePresets(const QJsonArray &a, const QJsonArray &b) {
+	if (a.size() != b.size()) {
+		return false;
+	}
+	const auto clean = [](const QJsonValue &value) {
+		auto object = value.toObject();
+		object.remove(u"time"_q);
+		return object;
+	};
+	auto known = QHash<QString, QJsonObject>();
+	for (const auto &value : a) {
+		const auto object = clean(value);
+		known.insert(object.value(u"id"_q).toString(), object);
+	}
+	if (known.size() != a.size()) {
+		// Something that is not a list of presets with ids.
+		return (a == b);
+	}
+	for (const auto &value : b) {
+		const auto object = clean(value);
+		const auto i = known.find(object.value(u"id"_q).toString());
+		if (i == known.end() || i.value() != object) {
+			return false;
+		}
+		known.erase(i);
+	}
+	return true;
+}
+
+// The automatic mode has found a copy on the server that is not the one
+// this device has seen last. What is done about it:
+enum class Incoming {
+	Apply, // This device has nothing unsent: the copy is taken.
+	Same, // The copy brings nothing new and nothing here waits to be sent.
+	Ahead, // It brings nothing new, this device has more: sent over it.
+	Conflict, // Both have something the other has not: the user decides.
+};
+
+// unsent: this device has changed since its last send or receive.
+// brings: taking the copy would change something on this device.
+// same: this device would send exactly what the copy has.
+//
+// A copy that brings nothing is never a conflict: that is the case of
+// two accounts of one installation (they share the settings, one of them
+// has just applied the same change). And something is sent over a copy
+// only by a device that has changes of its own, so two devices that see
+// the settings differently (other builds) can't send in turns for ever.
+[[nodiscard]] Incoming JudgeIncoming(bool unsent, bool brings, bool same) {
+	return brings
+		? (unsent ? Incoming::Conflict : Incoming::Apply)
+		: (unsent && !same)
+		? Incoming::Ahead
+		: Incoming::Same;
 }
 
 // The key of the sync on this device, between the launches.
@@ -445,6 +550,8 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		rpl::variable<QString> hint;
 		base::unique_qptr<Ui::PopupMenu> menu;
 		bool hintIsError = false;
+		int buttons = -1;
+		Fn<void()> rebuildButtons;
 	};
 	const auto state = box->lifetime().make_state<State>();
 	const auto send = std::move(args.send);
@@ -455,13 +562,10 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 	box->setTitle(tr::lng_oblivion_sync_title());
 	box->setWidth(st::boxWideWidth);
 
+	// What is on the server and what to do comes first, the long words
+	// about the encryption are the small print at the bottom: a wall of
+	// text above the only field pushed everything else out of sight.
 	const auto content = box->verticalLayout();
-	content->add(
-		object_ptr<Ui::FlatLabel>(
-			content,
-			tr::lng_oblivion_sync_about(),
-			st::boxLabel),
-		st::boxRowPadding + style::margins(0, 0, 0, st::boxMediumSkip));
 	content->add(
 		object_ptr<Ui::FlatLabel>(
 			content,
@@ -477,7 +581,7 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 			0,
 			st::boxLittleSkip / 2,
 			0,
-			st::boxMediumSkip));
+			st::boxLittleSkip / 2));
 
 	state->placeholder = tr::lng_oblivion_sync_password(tr::now);
 	// The password field is not an RpWidget: it lives in a holder.
@@ -532,11 +636,13 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		}
 		return text;
 	};
+	// An arrow out of the tray and an arrow into it: a pair that reads as
+	// "to the server" and "from the server".
 	const auto sendButton = ::Settings::AddButtonWithIcon(
 		content,
 		tr::lng_oblivion_sync_send(),
 		st::settingsButton,
-		{ &st::menuIconExport });
+		{ &st::menuIconExportTheme });
 	sendButton->setClickedCallback([=] {
 		const auto value = password();
 		if (value && send && !state->status.busy) {
@@ -552,7 +658,7 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		receiveWrap->entity(),
 		tr::lng_oblivion_sync_receive(),
 		st::settingsButton,
-		{ &st::menuIconDownload }
+		{ &st::menuIconImportTheme }
 	)->setClickedCallback([=] {
 		const auto value = password();
 		if (value && receive && !state->status.busy) {
@@ -560,7 +666,11 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		}
 	});
 	Ui::AddSkip(content);
-	Ui::AddDividerText(content, tr::lng_oblivion_sync_not_synced());
+	Ui::AddDividerText(
+		content,
+		rpl::single(tr::lng_oblivion_sync_about(tr::now)
+			+ u"\n\n"_q
+			+ tr::lng_oblivion_sync_not_synced(tr::now)));
 
 	const auto apply = [=](const BoxStatus &status) {
 		state->status = status;
@@ -594,9 +704,16 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 				WhenText(status.synced)));
 		}
 		if (status.automatic) {
-			lines.push_back(status.remembered
-				? tr::lng_oblivion_sync_auto_on(tr::now)
-				: tr::lng_oblivion_sync_auto_needs(tr::now));
+			// Without a copy on the server nothing is sent by itself: a
+			// copy the user has deleted does not come back.
+			const auto absent = !status.exists
+				&& !status.loading
+				&& status.error.isEmpty();
+			lines.push_back(!status.remembered
+				? tr::lng_oblivion_sync_auto_needs(tr::now)
+				: absent
+				? tr::lng_oblivion_sync_auto_paused(tr::now)
+				: tr::lng_oblivion_sync_auto_on(tr::now));
 		}
 		state->about = lines.join(QChar('\n'));
 		about->setTextColorOverride(
@@ -614,6 +731,12 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		if (!state->hintIsError) {
 			showHint(QString());
 		}
+		if (state->rebuildButtons) {
+			// Not from inside of a click on one of the buttons.
+			Ui::PostponeCall(box, [=] {
+				state->rebuildButtons();
+			});
+		}
 	};
 	std::move(args.status) | rpl::on_next(apply, box->lifetime());
 	if (args.errors) {
@@ -628,8 +751,7 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		showHint(QString());
 	}
 
-	const auto top = box->addTopButton(st::boxTitleMenu);
-	top->setClickedCallback([=] {
+	const auto showMenu = [=] {
 		state->menu = base::make_unique_q<Ui::PopupMenu>(
 			box,
 			st::popupMenuWithIcons);
@@ -650,15 +772,31 @@ void SyncBox(not_null<Ui::GenericBox*> box, SyncBoxArgs &&args) {
 		} else {
 			state->menu->popup(QCursor::pos());
 		}
-	});
+	};
+	// The dots are there only while their menu has something in it: with
+	// no copy on the server and no remembered password a click on them
+	// did nothing at all.
+	state->rebuildButtons = [=] {
+		const auto &status = state->status;
+		const auto mark = ((status.remembered && forget)
+			|| (status.exists && erase)) ? 1 : 0;
+		if (std::exchange(state->buttons, mark) == mark) {
+			return;
+		}
+		box->clearButtons();
+		box->addButton(tr::lng_close(), [=] {
+			box->closeBox();
+		});
+		if (mark) {
+			box->addTopButton(st::boxTitleMenu, showMenu);
+		}
+	};
+	state->rebuildButtons();
 
 	box->setFocusCallback([=] {
 		if (!state->status.remembered) {
 			field->setFocusFast();
 		}
-	});
-	box->addButton(tr::lng_close(), [=] {
-		box->closeBox();
 	});
 }
 
@@ -690,13 +828,18 @@ private:
 		QJsonObject all; // The whole oblivion.json.
 		QJsonObject settings; // The part that is sent.
 		QJsonArray presets;
-		QByteArray hash;
+		QJsonArray removed; // The deleted presets, sent along.
+		QByteArray hash; // Of the settings and the presets.
 	};
 
 	[[nodiscard]] Local local() const;
+	[[nodiscard]] bool connected() const;
 	void changed();
 	void setBusy(bool busy);
+	void release();
 	void fail(const QString &text);
+	void disconnected();
+	void eraseConfirmed(std::shared_ptr<Ui::Show> show);
 	void fetch(Fn<void()> done, Fn<void(const Cloud::Error &error)> fail);
 	void applyRemote(const Cloud::Response &response);
 	// done gets an empty key if the password is needed and was not given.
@@ -716,6 +859,7 @@ private:
 	void autoSend();
 	void remoteChanged(int64 rev);
 	void autoCheck();
+	[[nodiscard]] bool takeIncoming();
 	[[nodiscard]] bool automatic() const;
 
 	const not_null<Main::Session*> _session;
@@ -730,7 +874,15 @@ private:
 	bool _busy = false;
 	bool _conflict = false;
 	bool _applying = false;
+	// The revision of an event that came while something was on the way
+	// (0: the copy was deleted), -1 without one.
+	int64 _missedRev = -1;
+	// Grows when everything that was on the way is dropped.
+	int _generation = 0;
+	// Automatic sends in a row the server has refused with 412.
+	int _refused = 0;
 	base::Timer _sendTimer;
+	base::Timer _checkTimer;
 	rpl::event_stream<BoxStatus> _changes;
 	rpl::event_stream<QString> _errors;
 	rpl::lifetime _lifetime;
@@ -743,7 +895,8 @@ Syncer::Syncer(not_null<Main::Session*> session)
 , _path(AccountFolder(session) + u"sync.json"_q)
 , _sealKey(SealKeyFor(session))
 , _sender(&Cloud::For(session))
-, _sendTimer([=] { autoSend(); }) {
+, _sendTimer([=] { autoSend(); })
+, _checkTimer([=] { autoCheck(); }) {
 	auto file = QFile(_path);
 	if (file.open(QIODevice::ReadOnly)) {
 		_remembered = ParseRemembered(file.readAll(), _sealKey);
@@ -764,23 +917,43 @@ Syncer::Syncer(not_null<Main::Session*> session)
 		remoteChanged(Cloud::JsonInt(event.data.value(u"rev"_q)));
 	}, _lifetime);
 
-	// Once after the launch: what has another device sent meanwhile?
+	// After the launch and after «Включить снова»: what has another
+	// device sent meanwhile? And when the account is switched off (by the
+	// user, by a ban, by a protocol that is too old) the core drops what
+	// was on the way without calling back, so nothing here may go on
+	// waiting for an answer.
 	account->readyValue(
-	) | rpl::filter([](bool ready) {
-		return ready;
-	}) | rpl::take(1) | rpl::on_next([=] {
-		base::call_delayed(kStartDelay, this, [=] {
-			autoCheck();
-		});
+	) | rpl::on_next([=](bool ready) {
+		if (ready) {
+			_checkTimer.callOnce(kStartDelay);
+		} else {
+			disconnected();
+		}
 	}, _lifetime);
 }
 
-bool Syncer::automatic() const {
+bool Syncer::connected() const {
 	const auto account = _account.get();
+	return account && account->ready();
+}
+
+bool Syncer::automatic() const {
 	return Get().cloudSettingsAutoSync()
-		&& account
-		&& account->ready()
+		&& connected()
 		&& _remembered.valid();
+}
+
+void Syncer::disconnected() {
+	++_generation;
+	_sender.cancelAll();
+	_sendTimer.cancel();
+	_checkTimer.cancel();
+	_missedRev = -1;
+	if (_loading || _busy) {
+		_loading = false;
+		_busy = false;
+		changed();
+	}
 }
 
 BoxStatus Syncer::status() const {
@@ -811,15 +984,29 @@ void Syncer::changed() {
 }
 
 void Syncer::setBusy(bool busy) {
-	if (_busy != busy) {
-		_busy = busy;
+	if (_busy == busy) {
+		return;
+	} else if (busy) {
+		_busy = true;
 		changed();
+	} else {
+		release();
+	}
+}
+
+// Whatever was on the way is over. An event of another device that came
+// meanwhile was not looked at: it is now.
+void Syncer::release() {
+	_busy = false;
+	changed();
+	const auto missed = std::exchange(_missedRev, int64(-1));
+	if (missed >= 0 && missed != _remembered.rev && automatic()) {
+		_checkTimer.callOnce(kRecheckDelay);
 	}
 }
 
 void Syncer::fail(const QString &text) {
-	_busy = false;
-	changed();
+	release();
 	_errors.fire_copy(text);
 }
 
@@ -828,6 +1015,7 @@ Syncer::Local Syncer::local() const {
 	result.all = QJsonDocument::fromJson(Get().syncSnapshot()).object();
 	result.settings = PortableSettings(result.all);
 	result.presets = Share::PresetLibrary().exportJson();
+	result.removed = Share::PresetLibrary().exportRemovedJson();
 	result.hash = ContentHash(result.settings, result.presets);
 	return result;
 }
@@ -845,17 +1033,28 @@ void Syncer::applyRemote(const Cloud::Response &response) {
 void Syncer::fetch(
 		Fn<void()> done,
 		Fn<void(const Cloud::Error &error)> fail) {
+	const auto got = [=] {
+		if (!_remote.exists && _remembered.rev) {
+			// The copy this device was in sync with is gone: deleted
+			// from another device or together with the data of the
+			// account. Whatever appears there later is another copy.
+			_remembered.rev = 0;
+			_sendTimer.cancel();
+			saveRemembered();
+		}
+		done();
+	};
 	_sender.request(
 		Cloud::GetRequest(u"/v1/me/settings"_q),
 		crl::guard(this, [=](const Cloud::Response &response) {
 			applyRemote(response);
-			done();
+			got();
 		}),
 		crl::guard(this, [=](const Cloud::Error &error) {
 			if (error.status == 404 && !error.is("feature_disabled")) {
 				_remote = Remote();
 				_remote.known = true;
-				done();
+				got();
 			} else if (fail) {
 				fail(error);
 			}
@@ -866,12 +1065,20 @@ void Syncer::refresh() {
 	if (_loading) {
 		return;
 	}
-	_loading = true;
 	_error = QString();
+	if (!connected()) {
+		// A request that is not sent never answers.
+		_error = Cloud::ErrorText({
+			.type = Cloud::Error::Type::NotConnected,
+		});
+		changed();
+		return;
+	}
+	_loading = true;
 	changed();
 	fetch([=] {
 		_loading = false;
-		if (_remote.rev <= _remembered.rev) {
+		if (!_remote.exists || _remote.rev == _remembered.rev) {
 			_conflict = false;
 		}
 		changed();
@@ -885,12 +1092,12 @@ void Syncer::refresh() {
 void Syncer::keyFor(
 		const QString &password,
 		Fn<void(QByteArray key, BlobHeader header)> done) {
-	const auto parsed = _remote.exists
-		? ParseHeader(_remote.blob)
-		: std::nullopt;
 	if (password.isEmpty()) {
 		// The key this device remembers fits a copy made with the same
 		// salt (by this device or by one that has received from it).
+		const auto parsed = _remote.exists
+			? ParseHeader(_remote.blob)
+			: std::nullopt;
 		const auto fits = _remembered.valid()
 			&& (!parsed
 				|| (parsed->salt == _remembered.header.salt
@@ -900,19 +1107,22 @@ void Syncer::keyFor(
 			fits ? _remembered.header : BlobHeader());
 		return;
 	}
-	// The salt of the copy of the server is kept: the devices that have
-	// the same password go on with the same key.
-	const auto header = parsed
-		? *parsed
-		: BlobHeader{
-			.iterations = kIterations,
-			.salt = Cloud::RandomBytes(kSaltSize),
-		};
+	// The salt of the copy of the server is kept (the devices that have
+	// the same password go on with the same key), the number of rounds
+	// is never taken from there below the minimum of this build.
+	const auto header = HeaderForSend(
+		_remote.exists ? _remote.blob : QByteArray(),
+		_remembered.valid() ? _remembered.header : BlobHeader());
 	const auto weak = base::make_weak(this);
+	const auto generation = _generation;
 	crl::async([=] {
 		auto key = DeriveKey(password, header);
 		crl::on_main(weak, [=, key = std::move(key)] {
-			done(key, header);
+			// Not after «Отключиться»: what has asked for the key is
+			// dropped already.
+			if (_generation == generation) {
+				done(key, header);
+			}
 		});
 	});
 }
@@ -952,11 +1162,19 @@ void Syncer::put(
 		const BlobHeader &header,
 		Fn<void()> done,
 		Fn<void(const Cloud::Error &error)> fail) {
+	if (header.iterations < kMinIterations) {
+		// Never a copy with a key that is weaker than this build makes.
+		if (fail) {
+			fail({ .type = Cloud::Error::Type::Protocol });
+		}
+		return;
+	}
 	const auto now = local();
 	const auto blob = SealBlob(key, header, SerializePayload({
 		.valid = true,
 		.settings = now.settings,
 		.presets = now.presets,
+		.removed = now.removed,
 		.device = DeviceName(),
 		.savedAt = base::unixtime::now(),
 		.appBuild = Update::kOblivionBuild,
@@ -1007,8 +1225,12 @@ void Syncer::put(
 void Syncer::send(std::shared_ptr<Ui::Show> show, const QString &password) {
 	if (_busy) {
 		return;
+	} else if (!connected()) {
+		fail(Cloud::ErrorText({ .type = Cloud::Error::Type::NotConnected }));
+		return;
 	}
 	setBusy(true);
+	const auto generation = _generation;
 	const auto putError = [=](const Cloud::Error &error) {
 		if (error.status == 412) {
 			// Another device was faster.
@@ -1051,6 +1273,8 @@ void Syncer::send(std::shared_ptr<Ui::Show> show, const QString &password) {
 					if (!strong) {
 						return;
 					}
+					// It may have been dropped while the box was shown.
+					strong->setBusy(true);
 					strong->put(key, header, crl::guard(strong, [=] {
 						strong->setBusy(false);
 						if (show->valid()) {
@@ -1062,7 +1286,8 @@ void Syncer::send(std::shared_ptr<Ui::Show> show, const QString &password) {
 				.cancelled = [=](Fn<void()> close) {
 					close();
 					if (const auto strong = weak.get()) {
-						if (!*confirmed) {
+						if (!*confirmed
+							&& strong->_generation == generation) {
 							strong->setBusy(false);
 						}
 					}
@@ -1082,7 +1307,7 @@ void Syncer::applyPayload(const Payload &payload, const Local &was) {
 		Get().syncApply(
 			QJsonDocument(merged).toJson(QJsonDocument::Indented));
 	}
-	Share::PresetLibrary().mergeJson(payload.presets);
+	Share::PresetLibrary().mergeJson(payload.presets, payload.removed);
 	_applying = false;
 	_remembered.rev = _remote.rev;
 	_remembered.hash = local().hash;
@@ -1094,8 +1319,12 @@ void Syncer::receive(
 		const QString &password) {
 	if (_busy) {
 		return;
+	} else if (!connected()) {
+		fail(Cloud::ErrorText({ .type = Cloud::Error::Type::NotConnected }));
+		return;
 	}
 	setBusy(true);
+	const auto generation = _generation;
 	fetch([=] {
 		changed();
 		if (!_remote.exists) {
@@ -1123,6 +1352,10 @@ void Syncer::receive(
 			const auto was = local();
 			const auto merged = MergeSettings(was.all, payload.settings);
 			const auto count = CountDifferences(was.all, merged);
+			// The saved presets that were deleted on the other device
+			// and are still here: they go too, and the box says so.
+			const auto dropped = Share::PresetLibrary().countRemovals(
+				payload.removed);
 			const auto weak = base::make_weak(this);
 			const auto finish = [=] {
 				const auto strong = weak.get();
@@ -1133,13 +1366,13 @@ void Syncer::receive(
 				strong->remember(key, header);
 				strong->setBusy(false);
 				if (show->valid()) {
-					show->showToast(count
+					show->showToast((count || dropped)
 						? tr::lng_oblivion_sync_received(tr::now)
 						: tr::lng_oblivion_sync_received_same(tr::now));
 				}
 			};
-			if (!count) {
-				// Nothing to replace: nothing to ask about.
+			if (!count && !dropped) {
+				// Nothing to replace or delete: nothing to ask about.
 				finish();
 				return;
 			} else if (!show->valid()) {
@@ -1149,16 +1382,28 @@ void Syncer::receive(
 			const auto device = payload.device.isEmpty()
 				? tr::lng_oblivion_sync_device_unknown(tr::now)
 				: payload.device;
-			const auto confirmed = std::make_shared<bool>(false);
-			show->showBox(Ui::MakeConfirmBox({
-				.text = tr::lng_oblivion_sync_receive_sure(
+			auto text = count
+				? tr::lng_oblivion_sync_receive_sure(
 					tr::now,
 					lt_count,
 					count,
 					lt_date,
 					WhenText(_remote.updated),
 					lt_device,
-					device),
+					device)
+				: QString();
+			if (dropped) {
+				if (!text.isEmpty()) {
+					text += u"\n\n"_q;
+				}
+				text += tr::lng_oblivion_sync_receive_presets(
+					tr::now,
+					lt_count,
+					dropped);
+			}
+			const auto confirmed = std::make_shared<bool>(false);
+			show->showBox(Ui::MakeConfirmBox({
+				.text = text,
 				.confirmed = [=](Fn<void()> close) {
 					*confirmed = true;
 					close();
@@ -1167,7 +1412,8 @@ void Syncer::receive(
 				.cancelled = [=](Fn<void()> close) {
 					close();
 					if (const auto strong = weak.get()) {
-						if (!*confirmed) {
+						if (!*confirmed
+							&& strong->_generation == generation) {
 							strong->setBusy(false);
 						}
 					}
@@ -1186,46 +1432,93 @@ void Syncer::erase(std::shared_ptr<Ui::Show> show) {
 		.text = tr::lng_oblivion_sync_erase_sure(),
 		.confirmed = [=](Fn<void()> close) {
 			close();
-			const auto strong = weak.get();
-			if (!strong) {
-				return;
+			if (const auto strong = weak.get()) {
+				strong->eraseConfirmed(show);
 			}
-			strong->_sender.request(
-				Cloud::DeleteRequest(u"/v1/me/settings"_q),
-				crl::guard(strong, [=](const Cloud::Response &response) {
-					strong->_remote = Remote();
-					strong->_remote.known = true;
-					strong->_remembered.rev = 0;
-					strong->_remembered.hash = QByteArray();
-					strong->_conflict = false;
-					strong->saveRemembered();
-					strong->changed();
-					if (show->valid()) {
-						show->showToast(
-							tr::lng_oblivion_sync_erased(tr::now));
-					}
-				}),
-				crl::guard(strong, [=](const Cloud::Error &error) {
-					Cloud::ShowError(show, error);
-				}));
 		},
 		.confirmText = tr::lng_box_delete(),
 		.confirmStyle = &st::attentionBoxButton,
 	}));
 }
 
+void Syncer::eraseConfirmed(std::shared_ptr<Ui::Show> show) {
+	if (!connected()) {
+		Cloud::ShowError(show, { .type = Cloud::Error::Type::NotConnected });
+		return;
+	}
+	// A send that is on the way (the automatic one) must not put the copy
+	// back after it is deleted.
+	++_generation;
+	_sender.cancelAll();
+	_sendTimer.cancel();
+	_missedRev = -1;
+	_loading = false;
+	_busy = true;
+	changed();
+
+	const auto erased = [=] {
+		_remote = Remote();
+		_remote.known = true;
+		_remembered.rev = 0;
+		_conflict = false;
+		_busy = false;
+		_missedRev = -1;
+		_sendTimer.cancel();
+		saveRemembered();
+
+		// «Удалить копию» means that the settings stay on the devices
+		// only. With the automatic mode left on the very next change of
+		// a setting would send them to the server again, so it is
+		// switched off together with the copy (the toast says so). The
+		// other devices of the user don't make a copy by themselves
+		// either: see autoSend().
+		const auto automatic = Get().cloudSettingsAutoSync();
+		Get().setCloudSettingsAutoSync(false);
+		changed();
+		if (show && show->valid()) {
+			show->showToast(automatic
+				? tr::lng_oblivion_sync_erased_auto(tr::now)
+				: tr::lng_oblivion_sync_erased(tr::now));
+		}
+	};
+	_sender.request(
+		Cloud::DeleteRequest(u"/v1/me/settings"_q),
+		crl::guard(this, [=](const Cloud::Response &response) {
+			erased();
+		}),
+		crl::guard(this, [=](const Cloud::Error &error) {
+			if (error.status == 404 && !error.is("feature_disabled")) {
+				// It is gone already (deleted from another device).
+				erased();
+				return;
+			}
+			release();
+			Cloud::ShowError(show, error);
+		}));
+}
+
 // ---- The automatic mode. Everything here is quiet: no boxes, no
 // toasts, a failure waits for the next change or the next launch.
+//
+// It works only between a copy that is on the server and this device: a
+// copy is never made by it where there is none. The first copy, and a
+// new one after «Удалить копию с сервера» (here or on another device),
+// is made by «Отправить» only.
 
 void Syncer::localChanged() {
-	if (_applying || !automatic()) {
+	if (_applying
+		|| !automatic()
+		|| (_remote.known && !_remote.exists)) {
 		return;
 	}
 	_sendTimer.callOnce(kSendDelay);
 }
 
 void Syncer::autoSend() {
-	if (!automatic() || _busy || _conflict) {
+	if (!automatic()
+		|| _busy
+		|| _conflict
+		|| (_remote.known && !_remote.exists)) {
 		return;
 	}
 	const auto now = local();
@@ -1234,35 +1527,110 @@ void Syncer::autoSend() {
 	}
 	_busy = true;
 	const auto done = [=] {
-		_busy = false;
-		changed();
+		release();
 	};
-	const auto proceed = [=] {
-		if (_remote.exists && _remote.rev > _remembered.rev) {
-			// Another device has sent something this one has not seen,
-			// and this one has changes of its own: the user decides.
-			_conflict = true;
+	fetch([=] {
+		if (!_remote.exists) {
+			// Deleted meanwhile: not made again from here.
+			done();
+			return;
+		} else if (_remote.rev != _remembered.rev && !takeIncoming()) {
+			// Another device has sent something this one has not seen:
+			// it is taken, or it is the same already, or both have
+			// changed and the user decides.
 			done();
 			return;
 		}
-		put(_remembered.key, _remembered.header, done, [=](
+		const auto sent = [=] {
+			_refused = 0;
+			done();
+		};
+		put(_remembered.key, _remembered.header, sent, [=](
 				const Cloud::Error &error) {
-			if (error.status == 412) {
+			if (error.status == 412 && ++_refused >= kMaxRefused) {
+				// The server keeps saying that its copy is not the one
+				// that was just looked at. Not again and again: the box
+				// asks the user.
+				_refused = 0;
 				_conflict = true;
+			} else if (error.status == 412) {
+				// Another device was faster by a moment. Its event may
+				// have come while this one was sending: looked at soon.
+				_missedRev = std::max(
+					_missedRev,
+					Cloud::JsonInt(error.details.value(u"rev"_q), 0));
 			}
 			done();
 		});
-	};
-	fetch(proceed, [=](const Cloud::Error &error) {
+	}, [=](const Cloud::Error &error) {
 		done();
 	});
 }
 
 void Syncer::remoteChanged(int64 rev) {
-	if (!automatic() || _busy || rev <= _remembered.rev) {
+	if (!automatic()) {
+		return;
+	} else if (_busy) {
+		// The own send tells about itself too: release() sorts it out.
+		_missedRev = std::max(rev, int64(0));
+		return;
+	} else if (rev > 0 && rev == _remembered.rev) {
 		return;
 	}
+	// A new copy, or (rev 0) the copy was deleted from another device.
 	autoCheck();
+}
+
+// The copy of the server is not the one this device has seen last. True:
+// it brings nothing new and this device has changes of its own that go
+// over it. False: there is nothing to send (the copy was taken, or it is
+// the same already, or the user has to decide).
+bool Syncer::takeIncoming() {
+	// A refused send is explained: there is a copy that was not seen.
+	_refused = 0;
+	const auto was = local();
+	const auto parsed = ParseHeader(_remote.blob);
+	const auto fits = parsed
+		&& (parsed->salt == _remembered.header.salt)
+		&& (parsed->iterations == _remembered.header.iterations);
+	const auto plain = fits
+		? OpenBlob(_remembered.key, _remote.blob)
+		: std::nullopt;
+	const auto payload = plain ? ParsePayload(*plain) : Payload();
+	if (!payload.valid) {
+		// Another password, or a copy this build can't read.
+		_conflict = true;
+		return false;
+	}
+	auto &library = Share::PresetLibrary();
+	const auto unsent = (was.hash != _remembered.hash);
+	const auto brings
+		= (MergeSettings(was.all, payload.settings) != was.all)
+		|| library.mergeChanges(payload.presets, payload.removed);
+	const auto same = (was.settings == payload.settings)
+		&& SamePresets(was.presets, payload.presets);
+	const auto verdict = JudgeIncoming(unsent, brings, same);
+	if (verdict == Incoming::Conflict) {
+		_conflict = true;
+		return false;
+	} else if (verdict == Incoming::Apply) {
+		applyPayload(payload, was);
+		_remembered.time = base::unixtime::now();
+		saveRemembered();
+		return false;
+	}
+	// Nothing of it changes this device. What was deleted elsewhere is
+	// still noted, so that it is not sent back from here later.
+	_applying = true;
+	library.mergeJson(QJsonArray(), payload.removed);
+	_applying = false;
+	_remembered.rev = _remote.rev;
+	_conflict = false;
+	if (verdict == Incoming::Same) {
+		_remembered.hash = was.hash;
+	}
+	saveRemembered();
+	return (verdict == Incoming::Ahead);
 }
 
 void Syncer::autoCheck() {
@@ -1271,35 +1639,23 @@ void Syncer::autoCheck() {
 	}
 	_busy = true;
 	const auto done = [=] {
-		_busy = false;
-		changed();
+		release();
 	};
 	fetch([=] {
-		if (!_remote.exists || _remote.rev <= _remembered.rev) {
-			done();
-			// Changes made while the app was closed or offline.
-			localChanged();
-			return;
-		}
-		const auto was = local();
-		const auto parsed = ParseHeader(_remote.blob);
-		const auto fits = parsed
-			&& (parsed->salt == _remembered.header.salt)
-			&& (parsed->iterations == _remembered.header.iterations);
-		const auto plain = fits
-			? OpenBlob(_remembered.key, _remote.blob)
-			: std::nullopt;
-		const auto payload = plain ? ParsePayload(*plain) : Payload();
-		if (!payload.valid || was.hash != _remembered.hash) {
-			// Another password, or both devices have changed something.
-			_conflict = true;
+		if (!_remote.exists) {
+			// No copy (it was deleted): nothing to take and nothing is
+			// sent by itself.
 			done();
 			return;
 		}
-		applyPayload(payload, was);
-		_remembered.time = base::unixtime::now();
-		saveRemembered();
+		const auto unsent = (_remote.rev == _remembered.rev)
+			|| takeIncoming();
 		done();
+		if (unsent) {
+			// Changes made while the app was closed or offline, or what
+			// this device has over the copy it has just looked at.
+			localChanged();
+		}
 	}, [=](const Cloud::Error &error) {
 		done();
 	});
@@ -1383,8 +1739,11 @@ int Checker::failed() const {
 }
 
 void TestBlob(Checker &check) {
+	// The mechanics are checked with a small number of rounds (the real
+	// one takes a part of a second for every key), the rules about the
+	// number itself are checked below without making a key.
 	const auto header = BlobHeader{
-		.iterations = kMinIterations,
+		.iterations = kTestIterations,
 		.salt = QByteArray::fromHex("000102030405060708090a0b0c0d0e0f"),
 	};
 	const auto password = QString::fromUtf8("correct horse \xD0\xB6");
@@ -1398,7 +1757,7 @@ void TestBlob(Checker &check) {
 	check(DeriveKey(password, otherSalt) != key,
 		"kdf: another salt, another key");
 	auto moreRounds = header;
-	moreRounds.iterations = kMinIterations + 1;
+	moreRounds.iterations = kTestIterations + 1;
 	check(DeriveKey(password, moreRounds) != key,
 		"kdf: other rounds, another key");
 
@@ -1410,7 +1769,7 @@ void TestBlob(Checker &check) {
 	check(!blob.contains("settings") && !blob.contains("zzzzzzzz"),
 		"blob: nothing of the plain text is seen");
 	check(blob.size() < plain.size(), "blob: compressed");
-	const auto parsed = ParseHeader(blob);
+	const auto parsed = ParseHeader(blob, kTestIterations);
 	check(parsed
 		&& parsed->salt == header.salt
 		&& parsed->iterations == header.iterations,
@@ -1434,22 +1793,73 @@ void TestBlob(Checker &check) {
 	check(!OpenBlob(key, header2), "blob: a changed salt is noticed");
 	check(!OpenBlob(key, blob.left(blob.size() - 5)),
 		"blob: a cut copy is refused");
-	check(!ParseHeader(QByteArray()), "header: empty");
-	check(!ParseHeader(QByteArray(100, 'x')), "header: no magic");
+	check(!ParseHeader(QByteArray(), 1), "header: empty");
+	check(!ParseHeader(QByteArray(100, 'x'), 1), "header: no magic");
 	auto newer = blob;
 	newer[4] = char(kBlobVersion + 1);
-	check(!ParseHeader(newer), "header: a newer version is refused");
+	check(!ParseHeader(newer, 1), "header: a newer version is refused");
 	auto slow = blob;
 	slow[6] = char(0x7F);
-	check(!ParseHeader(slow), "header: too many rounds are refused");
+	check(!ParseHeader(slow, 1), "header: too many rounds are refused");
 	auto fast = blob;
 	fast[6] = fast[7] = fast[8] = char(0);
 	fast[9] = char(1);
-	check(!ParseHeader(fast), "header: too few rounds are refused");
-	check(!ParseHeader(blob + QByteArray(kMaxBlob, 'x')),
+	check(!ParseHeader(fast, kTestIterations),
+		"header: too few rounds are refused");
+	auto none = blob;
+	none[6] = none[7] = none[8] = none[9] = char(0);
+	check(!ParseHeader(none, 0), "header: no rounds at all are refused");
+	check(!ParseHeader(blob + QByteArray(kMaxBlob, 'x'), 1),
 		"header: a huge copy is refused");
 	check(SealBlob(key.left(8), header, plain).isEmpty(),
 		"blob: a bad key seals nothing");
+
+	// The strength of the key is the business of this device, not of the
+	// bytes the server gives back.
+	check(kMinIterations >= 600'000 && kIterations >= kMinIterations,
+		"kdf: never fewer than 600 000 rounds");
+	check(!ParseHeader(blob),
+		"kdf: a copy with a weak header is not opened with a password");
+	const auto planted = HeaderForSend(blob);
+	check(planted.iterations == kIterations
+		&& planted.salt.size() == kSaltSize
+		&& planted.salt != header.salt,
+		"kdf: a planted weak header does not survive a send");
+	const auto full = BlobHeader{
+		.iterations = kIterations,
+		.salt = QByteArray(kSaltSize, 'q'),
+	};
+	// Only the header matters here: the key is not the one of a password.
+	const auto fullBlob = SealBlob(key, full, plain);
+	check(ParseHeader(fullBlob).has_value(),
+		"kdf: a copy with the full count is taken");
+	const auto kept = HeaderForSend(fullBlob);
+	check(kept.iterations == kIterations && kept.salt == full.salt,
+		"kdf: the salt of a copy with the full count is kept");
+	auto more = full;
+	more.iterations = kIterations * 2;
+	check(HeaderForSend(SealBlob(key, more, plain)).iterations
+		== kIterations * 2,
+		"kdf: more rounds of a newer build are kept");
+	const auto fresh = HeaderForSend(QByteArray());
+	check(fresh.iterations == kIterations
+		&& fresh.salt.size() == kSaltSize
+		&& HeaderForSend(QByteArray()).salt != fresh.salt,
+		"kdf: no copy, the full count and a fresh salt every time");
+	check(HeaderForSend(QByteArray(200, 'x')).iterations == kIterations,
+		"kdf: garbage on the server, the full count");
+	const auto again = HeaderForSend(QByteArray(), full);
+	check(again.salt == full.salt && again.iterations == kIterations,
+		"kdf: no copy, the salt this device has used before is kept");
+	check(HeaderForSend(blob, full).salt == full.salt,
+		"kdf: a weak copy, the salt this device has used before");
+	auto other = full;
+	other.salt = QByteArray(kSaltSize, 'w');
+	check(HeaderForSend(fullBlob, other).salt == full.salt,
+		"kdf: the salt of a good copy goes before the one used here");
+	check(HeaderForSend(QByteArray(), header).iterations == kIterations
+		&& HeaderForSend(QByteArray(), header).salt != header.salt,
+		"kdf: a weak header used before is not used again");
 	check.section("blob");
 }
 
@@ -1532,10 +1942,15 @@ void TestSettings(Checker &check) {
 	check(ContentHash(portable, QJsonArray()) != hash,
 		"hash: a preset changes it");
 
+	const auto removed = QJsonArray{ QJsonObject{
+		{ u"id"_q, u"9"_q },
+		{ u"time"_q, 1759800000. },
+	} };
 	const auto payload = Payload{
 		.valid = true,
 		.settings = portable,
 		.presets = presets,
+		.removed = removed,
 		.device = u"MacBook"_q,
 		.savedAt = 1759800000,
 		.appBuild = 5000000,
@@ -1544,10 +1959,17 @@ void TestSettings(Checker &check) {
 	check(back.valid
 		&& back.settings == portable
 		&& back.presets == presets
+		&& back.removed == removed
 		&& back.device == u"MacBook"_q
 		&& back.savedAt == 1759800000
 		&& back.appBuild == 5000000,
 		"payload: reads back the same");
+	auto older = payload;
+	older.removed = QJsonArray();
+	check(ParsePayload(SerializePayload(older)).valid
+		&& ParsePayload(SerializePayload(older)).removed.isEmpty()
+		&& !SerializePayload(older).contains("presets_removed"),
+		"payload: a copy without deleted presets is a copy of before");
 	check(!ParsePayload(QByteArray("[]")).valid, "payload: not an object");
 	check(!ParsePayload(QByteArray("{\"v\":2,\"settings\":{}}")).valid,
 		"payload: a newer version is refused");
@@ -1557,12 +1979,15 @@ void TestSettings(Checker &check) {
 
 	// The whole way: this device seals, another one opens and merges.
 	const auto header = BlobHeader{
-		.iterations = kMinIterations,
+		.iterations = kTestIterations,
 		.salt = QByteArray(kSaltSize, 's'),
 	};
 	const auto key = DeriveKey(u"secret password"_q, header);
 	const auto blob = SealBlob(key, header, SerializePayload(payload));
-	const auto otherKey = DeriveKey(u"secret password"_q, *ParseHeader(blob));
+	const auto otherHeader = ParseHeader(blob, kTestIterations);
+	const auto otherKey = DeriveKey(
+		u"secret password"_q,
+		otherHeader.value_or(BlobHeader()));
 	const auto opened = OpenBlob(otherKey, blob);
 	check(opened.has_value(), "round trip: the same password opens");
 	if (opened) {
@@ -1579,7 +2004,7 @@ void TestSettings(Checker &check) {
 
 	const auto sealKey = QByteArray(32, 'k');
 	const auto remembered = Remembered{
-		.header = header,
+		.header = { .iterations = kIterations, .salt = header.salt },
 		.key = key,
 		.rev = 12,
 		.hash = hash,
@@ -1593,7 +2018,7 @@ void TestSettings(Checker &check) {
 	check(restored.valid()
 		&& restored.key == key
 		&& restored.header.salt == header.salt
-		&& restored.header.iterations == header.iterations
+		&& restored.header.iterations == kIterations
 		&& restored.rev == 12
 		&& restored.hash == hash
 		&& restored.time == 1759800000,
@@ -1604,7 +2029,72 @@ void TestSettings(Checker &check) {
 		"remembered: an empty file");
 	check(SerializeRemembered(remembered, QByteArray()).isEmpty(),
 		"remembered: nothing is written without a local key");
+	auto weak = remembered;
+	weak.header.iterations = kTestIterations;
+	const auto weakStored = SerializeRemembered(weak, sealKey);
+	check(!weakStored.isEmpty()
+		&& !ParseRemembered(weakStored, sealKey).valid(),
+		"remembered: a key of a weak header is not taken back");
 	check.section("settings");
+}
+
+// The automatic mode: what is done with a copy of the server this device
+// has not seen.
+void TestIncoming(Checker &check) {
+	check(JudgeIncoming(false, true, false) == Incoming::Apply,
+		"incoming: nothing unsent here, the copy is taken");
+	check(JudgeIncoming(true, true, false) == Incoming::Conflict,
+		"incoming: both have changed, the user decides");
+	check(JudgeIncoming(true, false, true) == Incoming::Same,
+		"incoming: the same change made here already is not a conflict");
+	check(JudgeIncoming(true, false, false) == Incoming::Ahead,
+		"incoming: a copy that brings nothing is sent over");
+	check(JudgeIncoming(false, false, false) == Incoming::Same
+		&& JudgeIncoming(false, false, true) == Incoming::Same,
+		"incoming: a device without changes of its own never sends");
+	check(JudgeIncoming(false, true, true) == Incoming::Apply,
+		"incoming: taken even if the two look the same");
+
+	// Two accounts of one installation share oblivion.json: the first one
+	// applies its copy, for the second one the same copy brings nothing.
+	auto all = QJsonObject();
+	all.insert(u"ghost_read"_q, true);
+	all.insert(u"fake_stars"_q, 100.);
+	all.insert(u"app_icon"_q, u"night"_q);
+	auto received = QJsonObject();
+	received.insert(u"ghost_read"_q, false);
+	received.insert(u"fake_stars"_q, 100.);
+	const auto first = MergeSettings(all, received);
+	check(first != all, "incoming: the first account takes the change");
+	check(MergeSettings(first, received) == first,
+		"incoming: the same copy brings nothing to the second account");
+	check(PortableSettings(first) == received,
+		"incoming: and the second account has nothing to send");
+
+	const auto a = QJsonObject{
+		{ u"id"_q, u"1"_q },
+		{ u"title"_q, u"A"_q },
+		{ u"time"_q, 5. },
+	};
+	const auto b = QJsonObject{
+		{ u"id"_q, u"2"_q },
+		{ u"title"_q, u"B"_q },
+		{ u"time"_q, 6. },
+	};
+	auto later = a;
+	later.insert(u"time"_q, 99.);
+	auto renamed = a;
+	renamed.insert(u"title"_q, u"C"_q);
+	check(SamePresets(QJsonArray{ a, b }, QJsonArray{ b, later }),
+		"presets: the same in another order and saved at another time");
+	check(!SamePresets(QJsonArray{ a, b }, QJsonArray{ a }),
+		"presets: one is missing");
+	check(!SamePresets(QJsonArray{ a, b }, QJsonArray{ renamed, b }),
+		"presets: one is renamed");
+	check(!SamePresets(QJsonArray{ a, b }, QJsonArray{ a, a }),
+		"presets: one twice is not two");
+	check(SamePresets(QJsonArray(), QJsonArray()), "presets: none and none");
+	check.section("incoming");
 }
 
 // ---- Snapshot scenes.
@@ -1621,9 +2111,13 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			auto errors = error.isEmpty()
 				? rpl::producer<QString>(rpl::never<QString>())
 				: rpl::producer<QString>(rpl::single(error));
+			// With the actions of the menu: its dots are shown only when
+			// there is something to choose there.
 			return Box(SyncBox, SyncBoxArgs{
 				.status = rpl::single(status),
 				.errors = std::move(errors),
+				.forget = [] {},
+				.erase = [] {},
 			});
 		});
 	};
@@ -1649,6 +2143,12 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		.size = 12'345,
 		.remembered = true,
 		.conflict = true,
+		.automatic = true,
+		.synced = when - 86400,
+	});
+	// The copy was deleted: the automatic mode waits for «Отправить».
+	scene(u"sync_box_deleted"_q, {
+		.remembered = true,
 		.automatic = true,
 		.synced = when - 86400,
 	});
@@ -1686,6 +2186,33 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.confirmText = tr::lng_oblivion_sync_receive_confirm(),
 		});
 	});
+	RegisterBoxScene(u"sync_receive_presets"_q, size, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Ui::MakeConfirmBox({
+			.text = tr::lng_oblivion_sync_receive_sure(
+				tr::now,
+				lt_count,
+				7,
+				lt_date,
+				WhenText(when),
+				lt_device,
+				u"MacBook Air"_q)
+				+ u"\n\n"_q
+				+ tr::lng_oblivion_sync_receive_presets(
+					tr::now,
+					lt_count,
+					2),
+			.confirmText = tr::lng_oblivion_sync_receive_confirm(),
+		});
+	});
+	RegisterBoxScene(u"sync_erase_sure"_q, size, [=](
+			std::shared_ptr<Ui::Show> show) {
+		return Ui::MakeConfirmBox({
+			.text = tr::lng_oblivion_sync_erase_sure(),
+			.confirmText = tr::lng_box_delete(),
+			.confirmStyle = &st::attentionBoxButton,
+		});
+	});
 });
 
 } // namespace
@@ -1693,7 +2220,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 void Start(not_null<Main::Session*> session) {
 	// The watcher of the automatic mode. Nothing is sent by it while the
 	// account has not agreed, has no remembered key or the mode is off.
-	SyncerFor(session);
+	(void)SyncerFor(session);
 }
 
 void Forget(not_null<Main::Session*> session) {
@@ -1742,6 +2269,7 @@ bool RunSelfTest(QStringList &log) {
 	auto check = Checker(log);
 	TestBlob(check);
 	TestSettings(check);
+	TestIncoming(check);
 	const auto update = Update::RunSelfTest(log);
 	return !check.failed() && update;
 }

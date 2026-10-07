@@ -54,6 +54,11 @@ struct EditVersion {
 struct DeletedChange {
 	uint64 peerId = 0; // Zero for all chats.
 	bool removed = false; // Records were removed, not only appended.
+
+	// Oblivion round 5: a version of an edited message was saved (or old
+	// versions were dropped, with removed), the deleted records are the
+	// same. Only the search in the saved messages looks into the edits.
+	bool edited = false;
 };
 
 // Oblivion round 5 (oblivion_deleted_search.h): a message with all of

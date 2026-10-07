@@ -43,7 +43,9 @@ class Show;
 //
 //  - A tab is created when it is first shown and lives till the window
 //    is closed. The window gives it the whole area under the tabs strip
-//    (setGeometry), it paints its own background over st::windowBg.
+//    (setGeometry), it paints its own background over st::windowBg, or
+//    calls PaintRoomGround() below to lie on the page of the look («Тема
+//    Oblivion») the way the tabs of the rooms themselves do.
 //    context.active tells when it is the visible one (pause what should
 //    not run in the background).
 //  - An overlay is created with the window above every tab and has the
@@ -159,11 +161,15 @@ void PaintGlyph(
 	const QColor &color);
 
 // A round userpic with the initials of the name, coloured by the id.
+// With «Тишина» (see the looks below) it is a rounded square.
 void PaintUserpic(
 	QPainter &p,
 	QRect rect,
 	uint64 userId,
 	const QString &name);
+// The outline PaintUserpic() fills, with the pen and the brush that are
+// set: for a ring around a userpic or a «+N» that stands in a row of them.
+void PaintUserpicShape(QPainter &p, QRectF rect);
 
 // A cover of a track: the image, or a gradient made of the seed with
 // a note on it while there is none.
@@ -173,6 +179,57 @@ void PaintCover(
 	const QImage &cover,
 	const QString &seed,
 	int radius);
+// The radius PaintCover() really uses («Тишина» has almost square
+// covers), for what is painted over a cover.
+[[nodiscard]] int CoverRadius(int radius);
+
+// ---- The looks («Тема Oblivion», oblivion_look.h) in the room window.
+// With the plain look each of these paints or returns exactly what the
+// window has always had, so a tab that uses them changes nothing by
+// default. A tab repaints by itself when the look changes (the window
+// updates everything inside); a layout that uses the values below is
+// redone on Oblivion::Look::Updates().
+
+// The page behind a widget of the room window (at any depth): the window
+// background with the plain look, otherwise the ground of the look, laid
+// out in the whole window, so the glow of «Ночной эфир» goes on from one
+// widget to the next.
+void PaintRoomGround(
+	QPainter &p,
+	not_null<const QWidget*> widget,
+	QRect clip);
+
+// «Родной, но лучше» and «Ночной эфир» put the content of a tab into
+// cards that lie on the ground.
+[[nodiscard]] bool RoomHasCards();
+// From the edge of a tab to a card, 0 without cards.
+[[nodiscard]] int RoomCardMargin();
+// From the edge of a tab to the content (inside a card when there are
+// cards).
+[[nodiscard]] int RoomContentPadding();
+// Paints nothing without cards or for an empty rect.
+void PaintRoomCard(QPainter &p, QRect rect);
+
+// What lies under the mouse: a row (a rounded rect) or a round button.
+[[nodiscard]] QColor RoomHoverColor(bool down = false);
+void PaintRoomHover(QPainter &p, QRectF rect, bool down = false);
+
+// A section label («Очередь», «Участники») in a line as high as
+// st::semiboldFont: with the plain look in the "plain" colour, with
+// «Ночной эфир» and «Тишина» small and in capitals. Returns the width of
+// the text as it was painted.
+int PaintRoomLabel(
+	QPainter &p,
+	int left,
+	int top,
+	const QString &text,
+	int width,
+	const QColor &plain);
+
+// A pill with a text on it (a preset of rights) and the colour of that
+// text.
+void PaintRoomPill(QPainter &p, QRectF rect, bool over);
+[[nodiscard]] QColor RoomPillTextColor();
 
 // A round button with a glyph. accent: filled with the active colour.
 class GlyphButton final : public Ui::AbstractButton {
@@ -182,6 +239,10 @@ public:
 	void setGlyph(Glyph glyph);
 	void setHighlighted(bool highlighted); // The glyph in the active colour.
 	void setDimmed(bool dimmed); // Looks disabled (no right), still clicks.
+	// The main button of a tab («Play»). It matters only with «Ночной
+	// эфир»: the main accent button is the white circle there, the other
+	// accent buttons get the gradient.
+	void setPrimary(bool primary);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -192,6 +253,7 @@ private:
 	bool _accent = false;
 	bool _highlighted = false;
 	bool _dimmed = false;
+	bool _primary = false;
 
 };
 

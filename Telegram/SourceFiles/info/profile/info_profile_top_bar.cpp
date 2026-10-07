@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/profile/info_profile_top_bar.h"
 
 #include "oblivion/oblivion_badge.h"
+#include "oblivion/oblivion_look_hooks.h"
 #include "oblivion/oblivion_settings.h"
 #include "api/api_peer_colors.h"
 #include "api/api_peer_photo.h"
@@ -2777,6 +2778,17 @@ void TopBar::paintEvent(QPaintEvent *e) {
 	}
 	if (!_hasGradientBg) {
 		paintEdges(p);
+		// Oblivion looks: what the look adds to a profile that has no
+		// colour of its own, nothing with the plain look.
+		if (!_solidBg) {
+			Oblivion::Look::PaintProfileTop(p, {
+				.bar = rect(),
+				.userpic = geometry,
+				.roundEdges = _roundEdges,
+				.actions = _hasActions,
+				.ring = _peer->isUser() && _storySegments.empty(),
+			});
+		}
 	} else {
 		const auto x = (width()
 			- _cachedGradient.width() / style::DevicePixelRatio())

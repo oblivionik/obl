@@ -880,13 +880,23 @@ void DeletedStore::addEdit(
 		list.erase(begin(list));
 		--_editsTotal;
 	}
-	if (_editsTotal > kMaxEditVersions) {
+	const auto trim = (_editsTotal > kMaxEditVersions);
+	if (trim) {
 		trimEdits();
 		rewriteEdits();
 	} else if (_editsLines
 		> std::max(2 * _editsTotal, kMinEditLinesForCompact)) {
 		rewriteEdits();
 	}
+
+	// Oblivion round 5: the search box that is open learns about the new
+	// version (see DeletedChange::edited), the list of the deleted ones
+	// leaves these out.
+	_deletedChanges.fire({
+		.peerId = peerId,
+		.removed = trim,
+		.edited = true,
+	});
 }
 
 std::vector<EditVersion> DeletedStore::edits(

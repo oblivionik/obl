@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "oblivion/oblivion_room_video.h"
 
 #include "base/call_delayed.h"
+#include "base/power_save_blocker.h"
 #include "base/timer.h"
 #include "base/unique_qptr.h"
 #include "base/unixtime.h"
@@ -68,6 +69,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtCore/QLocale>
 #include <QtCore/QMimeData>
 #include <QtCore/QPointer>
+#include <QtCore/QStorageInfo>
 #include <QtCore/QUrl>
 #include <QtGui/QCursor>
 #include <QtGui/QDragEnterEvent>
@@ -77,6 +79,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainterPath>
 #include <QtGui/QScreen>
+#include <QtGui/QWindow>
 
 #include <map>
 
@@ -116,6 +119,14 @@ constexpr auto kControlsHide = crl::time(2600);
 constexpr auto kControlsFade = crl::time(160);
 constexpr auto kSpinnerPeriod = crl::time(1100);
 constexpr auto kQuietRestart = crl::time(1500);
+constexpr auto kLostResetsLimit = 2;
+constexpr auto kDiskBudget = int64(3072) * 1024 * 1024;
+constexpr auto kDiskReserve = int64(512) * 1024 * 1024;
+constexpr auto kReadLimit = int64(384) * 1024 * 1024;
+constexpr auto kRecycleInterval = crl::time(10 * 60 * 1000);
+constexpr auto kRecycleEndMargin = int64(20'000);
+constexpr auto kNonIdlePeriod = crl::time(5000);
+constexpr auto kVolumeSaveDelay = crl::time(150);
 
 [[nodiscard]] int Scaled(int value) {
 	return style::ConvertScale(value);
@@ -164,6 +175,39 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 		+ u".part"_q;
 }
 
+// Whether path is what Room::download() makes for a media in the folder
+// of the room: "<sha256>" with the extension of the item.
+[[nodiscard]] bool OwnMediaFile(
+		not_null<Room*> room,
+		const QString &media,
+		const QString &path) {
+	return Cloud::ValidMediaId(media)
+		&& path.startsWith(RoomFolderPath(room) + media);
+}
+
+// Removes what Room::download() has made for a media in a folder: the
+// files "<sha256>", "<sha256>.<ext>" and the unfinished ".part" of them.
+// Nothing else is ever removed by the player: neither a file of the user
+// that was added from another place, nor a cover, nor a video saved from
+// Telegram. Returns the bytes that were freed.
+int64 RemoveMediaFilesIn(const QString &folder, const QString &media) {
+	if (folder.isEmpty() || !Cloud::ValidMediaId(media)) {
+		return 0;
+	}
+	auto result = int64(0);
+	const auto mask = QString(media + u"*"_q);
+	const auto list = QDir(folder).entryInfoList(
+		QStringList{ mask },
+		QDir::Files);
+	for (const auto &info : list) {
+		const auto size = int64(info.size());
+		if (QFile::remove(info.absoluteFilePath())) {
+			result += size;
+		}
+	}
+	return result;
+}
+
 // ---- A file that may still be growing, read by parts.
 
 // Main thread only.
@@ -171,9 +215,21 @@ struct FileState {
 	QString complete; // The whole file, when it is here.
 	QString part; // Where the download is being written.
 	int64 size = 0;
+	int64 served = 0; // The bytes given to the player that reads it now.
 	bool failed = false;
 	rpl::event_stream<> changes;
 };
+
+// The whole file a player was given is not where it was any more, or is
+// not the same one: a file of the user may be moved, renamed or removed
+// while it is in the queue, a file of the room may be cleaned away.
+[[nodiscard]] bool WholeFileLost(const FileState &state) {
+	if (state.complete.isEmpty()) {
+		return false;
+	}
+	const auto info = QFileInfo(state.complete);
+	return !info.isFile() || (int64(info.size()) != state.size);
+}
 
 [[nodiscard]] QByteArray ReadPart(
 		const QString &path,
@@ -353,6 +409,7 @@ void FileLoader::process() {
 		return;
 	}
 	for (auto &part : taken.parts) {
+		_state->served += int64(part.bytes.size());
 		_parts.fire(std::move(part));
 		if (!weak) {
 			return;
@@ -495,9 +552,12 @@ struct VideoEngine::Private {
 		int64 total = 0;
 		int failures = 0;
 		crl::time failedAt = 0;
+		crl::time usedAt = 0; // When it was the current item.
 		bool requested = false;
 		bool complete = false;
 		bool failed = false;
+		bool noSpace = false; // Failed: the disk has no room for it.
+		bool own = false; // Made by Room::download() in the room folder.
 
 		[[nodiscard]] int percent() const {
 			if (complete) {
@@ -547,6 +607,9 @@ struct VideoEngine::Private {
 	[[nodiscard]] Source *findSource(const QString &media);
 	Source &ensureSource(const QueueItem &item);
 	void dropSource(Source &source);
+	void resetSource(Source &source);
+	[[nodiscard]] bool fileLost(const Source &source) const;
+	[[nodiscard]] bool makeSpace(const QueueItem &item);
 	void cleanupSources();
 	void preloadNext();
 	void fileReady(const QString &media, const QString &path);
@@ -606,9 +669,11 @@ struct VideoEngine::Private {
 	QImage held;
 	QSize frameSize;
 	crl::time prepareLead = kPrepareLeadDefault;
+	crl::time recycledAt = 0; // The player was reopened to free the memory.
 	int64 seenRev = -1;
 	int restarts = 0;
 	int playerFailures = 0;
+	int lostResets = 0;
 	int mutedTicks = 0;
 	double speed = 1.;
 	bool enabled = false;
@@ -698,13 +763,79 @@ void VideoEngine::Private::dropSource(Source &source) {
 	}
 }
 
+// The source is asked for anew: from the disk if its file is (again)
+// here, from the relay if it is not.
+void VideoEngine::Private::resetSource(Source &source) {
+	if (source.file && documentFile == source.file.get()) {
+		closeDocument();
+	}
+	dropSource(source);
+	source = Source();
+}
+
+bool VideoEngine::Private::fileLost(const Source &source) const {
+	return source.complete && source.file && WholeFileLost(*source.file);
+}
+
+// The room itself removes the file of an item that has left both queues
+// and the whole folder some time after its window was closed. This is
+// about what is still in the queue of the video. Before a file is brought
+// from the relay, what was watched earlier is removed while the files the
+// player has here take more than the budget or the disk is short (such
+// an item is downloaded again when its turn comes). Never the current
+// item, the next one, a file of the queue of the music or the one the
+// player of the app holds now. false: there is no room for the file even
+// so.
+bool VideoEngine::Private::makeSpace(const QueueItem &item) {
+	const auto &data = room->player(Kind::Video);
+	const auto next = data.find(NextAfterEnd(data));
+	const auto &music = room->player(Kind::Music).queue;
+	const auto song = Media::Player::instance()->current(
+		AudioMsgId::Type::Song).audio();
+	const auto played = song ? song->filepath(true) : QString();
+	auto files = std::vector<VideoFile>();
+	for (const auto &[media, source] : sources) {
+		if (!source.own) {
+			continue;
+		}
+		files.push_back({
+			.media = media,
+			.bytes = source.complete ? source.ready : source.total,
+			.usedAt = source.usedAt,
+			.kept = !source.complete
+				|| (media == item.media)
+				|| (media == currentMedia)
+				|| (next && media == next->media)
+				|| ranges::contains(music, media, &QueueItem::media)
+				|| OwnMediaFile(room, media, played),
+		});
+	}
+	const auto storage = QStorageInfo(cWorkingDir());
+	const auto available = (storage.isValid() && storage.isReady())
+		? int64(storage.bytesAvailable())
+		: int64(-1);
+	const auto have = int64(QFileInfo(PartPathGuess(room, item)).size());
+	const auto needed = std::max(item.size - have, int64(0)) + kDiskReserve;
+	const auto plan = PlanVideoSpace(
+		std::move(files),
+		kDiskBudget,
+		available,
+		needed);
+	for (const auto &media : plan.evict) {
+		sources.erase(media);
+		RemoveMediaFilesIn(RoomFolderPath(room), media);
+	}
+	return plan.enough;
+}
+
 VideoEngine::Private::Source &VideoEngine::Private::ensureSource(
 		const QueueItem &item) {
 	auto &source = sources[item.media];
 	if (source.failed
-		&& source.failures < kRetryLimit
+		&& (source.noSpace || source.failures < kRetryLimit)
 		&& (crl::now() - source.failedAt > kRetryDelay)) {
 		source.failed = false;
+		source.noSpace = false;
 		source.requested = false;
 		source.file = nullptr;
 	}
@@ -724,12 +855,22 @@ VideoEngine::Private::Source &VideoEngine::Private::ensureSource(
 		source.file->complete = local;
 		source.file->size = size;
 		source.complete = true;
+		source.own = OwnMediaFile(room, item.media, local);
 		source.ready = source.total = size;
+		return source;
+	}
+	source.own = true;
+	source.total = item.size;
+	if (!makeSpace(item)) {
+		// Asked again by itself in a while and by «Повторить».
+		source.own = false;
+		source.failed = true;
+		source.noSpace = true;
+		source.failedAt = crl::now();
 		return source;
 	}
 	source.file->part = PartPathGuess(room, item);
 	source.file->size = item.size;
-	source.total = item.size;
 	const auto media = item.media;
 	const auto guard = owner.get();
 	source.transfer = room->download(
@@ -797,6 +938,7 @@ void VideoEngine::Private::fileReady(
 		source->file->size = size;
 	}
 	source->complete = true;
+	source->own = OwnMediaFile(room, media, path);
 	source->ready = source->total = size;
 	source->file->complete = path;
 	source->file->changes.fire({});
@@ -874,6 +1016,7 @@ void VideoEngine::Private::openDocument(const Source &source) {
 
 	closeDocument();
 	documentFile = source.file.get();
+	documentFile->served = 0;
 	document = std::make_shared<Media::Streaming::Document>(
 		std::make_unique<FileLoader>(source.file));
 	instance = std::make_unique<Media::Streaming::Instance>(
@@ -1243,12 +1386,21 @@ void VideoEngine::Private::sync() {
 		playerError = false;
 		shownOnce = false;
 		seenRev = -1;
+		lostResets = 0;
+		recycledAt = 0;
 		corrector.reset();
+		if (const auto waited = findSource(currentMedia)) {
+			if (waited->noSpace) {
+				// There was no room for it while it was the next one:
+				// what was played before it may go now.
+				resetSource(*waited);
+			}
+		}
 		frames.fire({});
 	}
 	auto &source = ensureSource(*item);
+	source.usedAt = crl::now();
 	preloadNext();
-	const auto percent = source.percent();
 	if (playerError) {
 		playerError = false;
 		closeDocument();
@@ -1258,15 +1410,27 @@ void VideoEngine::Private::sync() {
 			// Could not be played while it grows: once more when the
 			// whole file is here.
 			progressiveFailed = true;
+		} else if (fileLost(source) && lostResets < kLostResetsLimit) {
+			// The file was moved or removed while it was in the queue:
+			// it is asked for anew, the relay has its copy.
+			++lostResets;
+			resetSource(source);
+			ensureSource(*item);
+			source.usedAt = crl::now();
 		} else if (++playerFailures >= kPlayerFailuresLimit) {
 			unplayable = true;
 		}
 	}
+	const auto percent = source.percent();
 	if (source.failed) {
 		closeDocument();
-		setStatus({ .state = VideoState::Failed });
+		setStatus({
+			.state = source.noSpace
+				? VideoState::NoSpace
+				: VideoState::Failed,
+		});
 		report(item->id, false, percent);
-		if (source.failures < kRetryLimit) {
+		if (source.noSpace || source.failures < kRetryLimit) {
 			timer.callOnce(kRetryDelay + 200);
 		}
 		return;
@@ -1284,6 +1448,26 @@ void VideoEngine::Private::sync() {
 		setStatus({ .state = VideoState::Loading, .percent = percent });
 		report(item->id, false, percent);
 		return;
+	}
+	if (document
+		&& documentFile == source.file.get()
+		&& session.running
+		&& session.ready
+		&& !session.waiting
+		&& !session.finished
+		&& data.state.playing
+		&& VideoReaderRestart(
+			documentFile->served,
+			(recycledAt > 0) ? (crl::now() - recycledAt) : kRecycleInterval,
+			item->duration
+				- PositionAt(data.state, item->duration, room->now()))) {
+		// The reader of the player holds in the memory every byte it has
+		// read from the file. A new one starts empty: the picture stands
+		// for a part of a second (the last frame stays), the player is
+		// prepared at the place the room will have, as after any jump.
+		recycledAt = crl::now();
+		closeDocument();
+		restarts = 0;
 	}
 	if (!document || documentFile != source.file.get()) {
 		openDocument(source);
@@ -1653,16 +1837,17 @@ void VideoEngine::rejoin() {
 void VideoEngine::retry() {
 	const auto p = _private.get();
 	if (const auto source = p->findSource(p->currentMedia)) {
-		if (source->failed) {
-			source->failed = false;
-			source->failures = 0;
-			source->requested = false;
-			source->file = nullptr;
+		// A whole file that is not where it was any more (a file of the
+		// user that was moved or removed, a drive that was unplugged) is
+		// not opened again: the copy of the relay is taken.
+		if (source->failed || p->fileLost(*source)) {
+			p->resetSource(*source);
 		}
 	}
 	p->unplayable = false;
 	p->playerFailures = 0;
 	p->progressiveFailed = false;
+	p->lostResets = 0;
 	p->sync();
 }
 
@@ -1991,6 +2176,66 @@ int VideoPlayNextIndex(int index, int current) {
 	return (index < current) ? current : (current + 1);
 }
 
+bool VideoKeepsDisplayOn(
+		VideoState state,
+		bool playing,
+		bool picture,
+		bool shown) {
+	if (!playing || !picture || !shown) {
+		return false;
+	}
+	switch (state) {
+	case VideoState::Synced:
+	case VideoState::Catching:
+	case VideoState::Starting:
+	case VideoState::Buffering:
+		return true;
+	default:
+		return false;
+	}
+}
+
+VideoSpace PlanVideoSpace(
+		std::vector<VideoFile> files,
+		int64 budget,
+		int64 available,
+		int64 needed) {
+	auto result = VideoSpace();
+	auto taken = int64(0);
+	for (const auto &file : files) {
+		taken += std::max(file.bytes, int64(0));
+	}
+	std::stable_sort(
+		begin(files),
+		end(files),
+		[](const VideoFile &a, const VideoFile &b) {
+			return a.usedAt < b.usedAt;
+		});
+	const auto tight = [&] {
+		return (available >= 0) && (available < needed);
+	};
+	for (const auto &file : files) {
+		if (taken <= budget && !tight()) {
+			break;
+		} else if (file.kept || file.bytes <= 0) {
+			continue;
+		}
+		taken -= file.bytes;
+		if (available >= 0) {
+			available += file.bytes;
+		}
+		result.evict.push_back(file.media);
+	}
+	result.enough = !tight();
+	return result;
+}
+
+bool VideoReaderRestart(int64 read, crl::time sinceLast, int64 left) {
+	return (read >= kReadLimit)
+		&& (sinceLast >= kRecycleInterval)
+		&& (left >= kRecycleEndMargin);
+}
+
 void AddVideoToRoomAction(
 		not_null<Ui::PopupMenu*> menu,
 		not_null<Window::SessionController*> controller,
@@ -2070,13 +2315,15 @@ void FillSeedGradient(QPainter &p, QRect rect, const QString &seed) {
 }
 
 // A small picture of a queue item: its cover cropped to the frame, or
-// a gradient made of the seed with a play sign.
+// a gradient made of the seed with a play sign (not for the item that is
+// on: its own sign is painted over the picture).
 void PaintThumb(
 		QPainter &p,
 		QRect rect,
 		const QImage &cover,
 		const QString &seed,
-		int radius) {
+		int radius,
+		bool sign) {
 	auto path = QPainterPath();
 	path.addRoundedRect(QRectF(rect), radius, radius);
 	p.save();
@@ -2098,16 +2345,18 @@ void PaintThumb(
 				part.height()));
 	} else {
 		FillSeedGradient(p, rect, seed);
-		const auto side = std::min(rect.width(), rect.height()) * 0.5;
-		PaintGlyph(
-			p,
-			Glyph::Play,
-			QRectF(
-				rect.x() + (rect.width() - side) / 2.,
-				rect.y() + (rect.height() - side) / 2.,
-				side,
-				side),
-			White(170));
+		if (sign) {
+			const auto side = std::min(rect.width(), rect.height()) * 0.5;
+			PaintGlyph(
+				p,
+				Glyph::Play,
+				QRectF(
+					rect.x() + (rect.width() - side) / 2.,
+					rect.y() + (rect.height() - side) / 2.,
+					side,
+					side),
+				White(170));
+		}
 	}
 	p.restore();
 }
@@ -2182,6 +2431,8 @@ void PaintSpinner(QPainter &p, QRectF rect, const QColor &color) {
 			percent);
 	case VideoState::Failed:
 		return tr::lng_oblivion_rvideo_state_failed(tr::now);
+	case VideoState::NoSpace:
+		return tr::lng_oblivion_rvideo_state_no_space(tr::now);
 	case VideoState::Unplayable:
 		return tr::lng_oblivion_rvideo_state_unplayable(tr::now);
 	case VideoState::Paused: {
@@ -2242,6 +2493,7 @@ public:
 	}
 
 protected:
+	bool eventHook(QEvent *e) override;
 	void paintEvent(QPaintEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
@@ -2277,6 +2529,7 @@ private:
 	[[nodiscard]] bool checkControl();
 	void refresh();
 	void refreshPosition();
+	void updateKeepAwake();
 	void updateControls();
 	void controlsOpacityChanged();
 	void updateGeometry();
@@ -2306,6 +2559,8 @@ private:
 	rpl::event_stream<> _addRequests;
 	base::Timer _tick;
 	base::Timer _hideTimer;
+	base::Timer _volumeSave;
+	std::unique_ptr<base::PowerSaveBlocker> _keepAwake;
 	Ui::Animations::Simple _controlsAnimation;
 	Ui::Animations::Basic _spinner;
 	QRect _playRect;
@@ -2320,7 +2575,9 @@ private:
 	float64 _seeking = -1.;
 	float64 _pendingSeek = -1.;
 	crl::time _pendingSeekTill = 0;
+	crl::time _nonIdleAt = 0;
 	int _volumeBeforeMute = 100;
+	int _volumeWanted = -1; // Dragged to, not written to the settings yet.
 	bool _over = false;
 	bool _controlsShown = true;
 	bool _suspended = false;
@@ -2343,8 +2600,16 @@ Surface::Surface(
 , _sample(std::move(sample))
 , _seek(Ui::CreateChild<Ui::MediaSlider>(this, st::mediaviewPlayback))
 , _volume(Ui::CreateChild<Ui::MediaSlider>(this, st::mediaviewPlayback))
-, _tick([=] { refreshPosition(); })
-, _hideTimer([=] { updateControls(); }) {
+, _tick([=] {
+	refreshPosition();
+	updateKeepAwake();
+})
+, _hideTimer([=] { updateControls(); })
+, _volumeSave([=] {
+	if (_volumeWanted >= 0) {
+		Oblivion::Get().setRoomVideoVolume(std::exchange(_volumeWanted, -1));
+	}
+}) {
 	setMouseTracking(true);
 	setAttribute(Qt::WA_OpaquePaintEvent);
 	if (_fullscreen) {
@@ -2381,16 +2646,27 @@ Surface::Surface(
 	_volume->setAlwaysDisplayMarker(true);
 	_volume->setMoveByWheel(true);
 	_volume->setValue(Oblivion::Get().roomVideoVolume() / 100.);
-	const auto applyVolume = [=](float64 value) {
-		Oblivion::Get().setRoomVideoVolume(
-			int(base::SafeRound(std::clamp(value, 0., 1.) * 100.)));
+	const auto volumeFor = [](float64 value) {
+		return int(base::SafeRound(std::clamp(value, 0., 1.) * 100.));
 	};
-	_volume->setChangeProgressCallback(applyVolume);
-	_volume->setChangeFinishedCallback(applyVolume);
+	// Every change of the setting is a write of the settings file: while
+	// the slider is dragged (or the wheel is turned) the volume follows a
+	// few times a second, not with every pixel.
+	_volume->setChangeProgressCallback([=](float64 value) {
+		_volumeWanted = volumeFor(value);
+		if (!_volumeSave.isActive()) {
+			_volumeSave.callOnce(kVolumeSaveDelay);
+		}
+	});
+	_volume->setChangeFinishedCallback([=](float64 value) {
+		_volumeSave.cancel();
+		_volumeWanted = -1;
+		Oblivion::Get().setRoomVideoVolume(volumeFor(value));
+	});
 
 	Oblivion::Get().changes(
 	) | rpl::on_next([=] {
-		if (!_volume->isChanging()) {
+		if (!_volume->isChanging() && _volumeWanted < 0) {
 			_volume->setValue(Oblivion::Get().roomVideoVolume() / 100.);
 		}
 		update();
@@ -2478,6 +2754,7 @@ QString Surface::actionText(VideoState state) const {
 	case VideoState::Away:
 		return tr::lng_oblivion_rvideo_rejoin(tr::now);
 	case VideoState::Failed:
+	case VideoState::NoSpace:
 	case VideoState::Unplayable:
 		return tr::lng_oblivion_rvideo_retry(tr::now);
 	default:
@@ -2576,8 +2853,16 @@ void Surface::controlsOpacityChanged() {
 	const auto shown = (opacity > 0.);
 	_seek->setFadeOpacity(opacity);
 	_volume->setFadeOpacity(opacity);
-	if (_seek->isHidden() == shown) {
-		_seek->setVisible(shown);
+	// With nothing on there is nothing to seek in: an empty line with
+	// a stub of a marker only looks broken.
+	const auto room = _room.get();
+	const auto seekable = shown
+		&& room
+		&& (room->player(Kind::Video).current() != nullptr);
+	if (_seek->isHidden() == seekable) {
+		_seek->setVisible(seekable);
+	}
+	if (_volume->isHidden() == shown) {
 		_volume->setVisible(shown);
 	}
 	if (_fullscreen) {
@@ -2631,6 +2916,8 @@ void Surface::togglePlay() {
 }
 
 void Surface::toggleMute() {
+	_volumeSave.cancel();
+	_volumeWanted = -1;
 	const auto now = Oblivion::Get().roomVideoVolume();
 	if (now > 0) {
 		_volumeBeforeMute = now;
@@ -2676,9 +2963,58 @@ void Surface::activate(Control control) {
 	}
 }
 
+// The display of the device stays on while a picture that moves is really
+// seen here, as it does for the media viewer of the app. The clock of the
+// auto-lock of the app is moved only from the window the user is in: the
+// main window is not the active one then, so nothing is told to Telegram
+// (neither "online" nor a read message) because a video plays in a room.
+void Surface::updateKeepAwake() {
+	const auto room = _room.get();
+	const auto top = window();
+	const auto block = (room != nullptr)
+		&& (top != nullptr)
+		&& !_sample
+		&& !_suspended
+		&& (_engine.get() != nullptr)
+		&& !top->isMinimized()
+		&& VideoKeepsDisplayOn(
+			status().state,
+			room->player(Kind::Video).state.playing,
+			_picture,
+			isVisible());
+	base::UpdatePowerSaveBlocker(
+		_keepAwake,
+		block,
+		base::PowerSaveBlockType::PreventDisplaySleep,
+		[] { return u"Video playback is active"_q; },
+		[top] { return top->windowHandle(); });
+	if (!block
+		|| !top->isActiveWindow()
+		|| !Core::IsAppLaunched()
+		|| Core::App().passcodeLocked()) {
+		return;
+	}
+	const auto now = crl::now();
+	if (now - _nonIdleAt >= kNonIdlePeriod) {
+		_nonIdleAt = now;
+		Core::App().updateNonIdle();
+	}
+}
+
+bool Surface::eventHook(QEvent *e) {
+	const auto type = e->type();
+	const auto result = RpWidget::eventHook(e);
+	if (type == QEvent::Show || type == QEvent::Hide) {
+		// Another tab of the room, a minimized or a hidden window.
+		updateKeepAwake();
+	}
+	return result;
+}
+
 void Surface::refresh() {
 	const auto room = _room.get();
 	if (!room) {
+		updateKeepAwake();
 		return;
 	}
 	const auto &data = room->player(Kind::Video);
@@ -2707,6 +3043,7 @@ void Surface::refresh() {
 	}
 	refreshPosition();
 	updateControls();
+	updateKeepAwake();
 	update();
 }
 
@@ -2984,6 +3321,7 @@ void Surface::paintState(
 		}
 		break;
 	case VideoState::Failed:
+	case VideoState::NoSpace:
 	case VideoState::Unplayable:
 	case VideoState::Away:
 		dim(150);
@@ -3057,12 +3395,17 @@ void Surface::paintControls(
 			p.drawEllipse(rect);
 		}
 	};
+	// With an empty queue the button offers to add a video (togglePlay()):
+	// it is bright for those who may add, not for everybody.
+	const auto playable = data.queue.empty()
+		? room->can(Right::Add)
+		: allowed;
 	hover(Control::Play, _playRect);
 	PaintGlyph(
 		p,
 		(data.state.playing && current) ? Glyph::Pause : Glyph::Play,
 		glyphRect(_playRect),
-		White((allowed || data.queue.empty()) ? 245 : 120));
+		White(playable ? 245 : 120));
 	hover(Control::Next, _nextRect);
 	PaintGlyph(
 		p,
@@ -3315,7 +3658,8 @@ std::vector<VideoQueueList::Progress> VideoQueueList::progresses() const {
 }
 
 int VideoQueueList::progressHeight() const {
-	return Scaled(46);
+	// The same as a row of the queue: see paintEvent().
+	return Scaled(56);
 }
 
 int VideoQueueList::rowHeight() const {
@@ -3435,6 +3779,8 @@ void VideoQueueList::paintEvent(QPaintEvent *e) {
 	const auto &data = _room->player(Kind::Video);
 	const auto left = Scaled(20);
 	const auto right = Scaled(16);
+	const auto thumbHeight = Scaled(38);
+	const auto thumbWidth = thumbHeight * 16 / 9;
 	auto top = 0;
 
 	for (auto i = 0, count = int(above.size()); i != count; ++i) {
@@ -3445,38 +3791,51 @@ void VideoQueueList::paintEvent(QPaintEvent *e) {
 		if (!rect.intersects(clip)) {
 			continue;
 		}
-		const auto textWidth = width() - left - right - Scaled(40);
+		// Laid out as the row of the queue it is going to become: a frame
+		// in place of the picture, with a ring that fills up.
+		const auto thumb = QRect(
+			left,
+			rect.y() + (height - thumbHeight) / 2,
+			thumbWidth,
+			thumbHeight);
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::windowBgOver);
+		p.drawRoundedRect(thumb, Scaled(6), Scaled(6));
+		const auto ring = Scaled(18);
+		const auto circle = QRectF(
+			thumb.x() + (thumb.width() - ring) / 2.,
+			thumb.y() + (thumb.height() - ring) / 2.,
+			ring,
+			ring);
+		auto ringPen = QPen(st::windowBgRipple->c, Scaled(2));
+		ringPen.setCapStyle(Qt::RoundCap);
+		p.setBrush(Qt::NoBrush);
+		p.setPen(ringPen);
+		p.drawEllipse(circle);
+		if (row.percent > 0) {
+			ringPen.setColor(st::windowBgActive->c);
+			p.setPen(ringPen);
+			p.drawArc(
+				circle,
+				90 * 16,
+				-std::min(row.percent, 100) * 360 * 16 / 100);
+		}
+		const auto textLeft = thumb.x() + thumbWidth + Scaled(12);
+		const auto textWidth = std::max(
+			width() - right - Scaled(40) - textLeft,
+			Scaled(40));
 		p.setFont(st::semiboldFont);
 		p.setPen(st::windowFg);
 		p.drawText(
-			left,
-			rect.y() + Scaled(8) + st::semiboldFont->ascent,
+			textLeft,
+			rect.y() + Scaled(10) + st::semiboldFont->ascent,
 			st::semiboldFont->elided(row.title, textWidth));
 		p.setFont(st::normalFont);
 		p.setPen(st::windowSubTextFg);
 		p.drawText(
-			left,
-			rect.y() + Scaled(26) + st::normalFont->ascent,
+			textLeft,
+			rect.y() + Scaled(30) + st::normalFont->ascent,
 			st::normalFont->elided(row.text, textWidth));
-		const auto line = QRectF(
-			left,
-			rect.y() + height - Scaled(3),
-			textWidth,
-			Scaled(2));
-		p.setPen(Qt::NoPen);
-		p.setBrush(st::windowBgRipple);
-		p.drawRoundedRect(line, line.height() / 2., line.height() / 2.);
-		if (row.percent > 0) {
-			p.setBrush(st::windowBgActive);
-			p.drawRoundedRect(
-				QRectF(
-					line.x(),
-					line.y(),
-					line.width() * row.percent / 100.,
-					line.height()),
-				line.height() / 2.,
-				line.height() / 2.);
-		}
 		const auto over = (_over.progress == i) && _over.control;
 		PaintGlyph(
 			p,
@@ -3509,8 +3868,6 @@ void VideoQueueList::paintEvent(QPaintEvent *e) {
 				Scaled(10),
 				Scaled(10));
 		}
-		const auto thumbHeight = Scaled(38);
-		const auto thumbWidth = thumbHeight * 16 / 9;
 		const auto thumb = QRect(
 			left,
 			rect.y() + (height - thumbHeight) / 2,
@@ -3521,7 +3878,8 @@ void VideoQueueList::paintEvent(QPaintEvent *e) {
 			thumb,
 			item.cover.isEmpty() ? QImage() : _room->cover(item.cover),
 			item.media,
-			Scaled(6));
+			Scaled(6),
+			!current);
 		if (current) {
 			p.setPen(Qt::NoPen);
 			p.setBrush(QColor(0, 0, 0, 120));
@@ -3610,6 +3968,7 @@ public:
 	~VideoTab();
 
 protected:
+	bool eventHook(QEvent *e) override;
 	void paintEvent(QPaintEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
 	void dragEnterEvent(QDragEnterEvent *e) override;
@@ -3794,7 +4153,8 @@ VideoEngine *VideoTab::engine() const {
 	return _engine.get();
 }
 
-// «Ещё загружают: Лера 40 %»: who can't see the current item yet.
+// «Ещё загружают: Лера 40%»: who can't see the current item yet. The
+// percent is written the way every other one in the room is.
 QString VideoTab::othersLoading() const {
 	const auto current = _room->player(Kind::Video).current();
 	if (!current) {
@@ -3817,7 +4177,7 @@ QString VideoTab::othersLoading() const {
 			member.name
 			+ ' '
 			+ QString::number(member.video.buffered)
-			+ u" %"_q);
+			+ u"%"_q);
 	}
 	if (names.isEmpty()) {
 		return QString();
@@ -3836,6 +4196,7 @@ void VideoTab::refreshAll() {
 		_list->setPlaying(data.state.playing
 			&& (state != VideoState::Away)
 			&& (state != VideoState::Failed)
+			&& (state != VideoState::NoSpace)
 			&& (state != VideoState::Unplayable));
 	}
 	_add->setVisible(_room->can(Right::Add));
@@ -3850,16 +4211,23 @@ void VideoTab::updateLayout() {
 		return;
 	}
 	const auto pad = Scaled(20);
+	// Rounded up: a 16:9 picture in a frame one pixel lower than it needs
+	// gets a black line at each side.
 	const auto videoHeight = std::clamp(
-		w * 9 / 16,
+		(w * 9 + 15) / 16,
 		Scaled(150),
 		std::max(h * 56 / 100, Scaled(150)));
 	_surface->setGeometry(0, 0, w, videoHeight);
+	// «Сейчас ничего не идёт» has no line of the state under it: no empty
+	// band is kept for that line then.
+	const auto stateLine = !VideoStatusText(_room, _surface->status()).isEmpty()
+		|| !othersLoading().isEmpty();
 	_info = QRect(
 		pad,
 		videoHeight + Scaled(12),
 		w - 2 * pad,
-		VideoTitleFont()->height + Scaled(4) + st::normalFont->height);
+		VideoTitleFont()->height
+			+ (stateLine ? (Scaled(4) + st::normalFont->height) : 0));
 	const auto headerTop = _info.y() + _info.height() + Scaled(10);
 	const auto headerHeight = std::max(_add->height(), Scaled(34));
 	_queueHeader = QRect(pad, headerTop, w - 2 * pad, headerHeight);
@@ -3907,6 +4275,7 @@ void VideoTab::paintEvent(QPaintEvent *e) {
 		const auto good = (status.state == VideoState::Synced)
 			|| (status.state == VideoState::Catching);
 		const auto bad = (status.state == VideoState::Failed)
+			|| (status.state == VideoState::NoSpace)
 			|| (status.state == VideoState::Unplayable);
 		const auto color = good
 			? st::boxTextFgGood->c
@@ -4036,9 +4405,25 @@ void VideoTab::showRowMenu(const QString &itemId) {
 	const auto currentIndex = data.indexOf(data.state.itemId);
 	_menu = base::make_unique_q<Ui::PopupMenu>(this, st::popupMenuWithIcons);
 	const auto room = _room;
-	const auto move = [=](int to) {
-		const auto from = room->player(Kind::Video).indexOf(itemId);
-		if (from >= 0) {
+	enum class RowMove {
+		Next,
+		Up,
+		Down,
+	};
+	// The place is counted by the queue as it is when the action is
+	// clicked: somebody else may have changed it while the menu was open.
+	const auto move = [=](RowMove how) {
+		const auto &now = room->player(Kind::Video);
+		const auto from = now.indexOf(itemId);
+		const auto size = int(now.queue.size());
+		const auto to = (from < 0)
+			? -1
+			: (how == RowMove::Up)
+			? (from - 1)
+			: (how == RowMove::Down)
+			? ((from + 1 < size) ? (from + 1) : -1)
+			: VideoPlayNextIndex(from, now.indexOf(now.state.itemId));
+		if (to >= 0) {
 			room->moveItem(Kind::Video, from, to);
 		}
 	};
@@ -4049,23 +4434,22 @@ void VideoTab::showRowMenu(const QString &itemId) {
 			&st::menuIconVideoChat);
 	}
 	if (_room->can(Right::Queue)) {
-		const auto next = VideoPlayNextIndex(index, currentIndex);
-		if (next >= 0) {
+		if (VideoPlayNextIndex(index, currentIndex) >= 0) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_next(tr::now),
-				[=] { move(next); },
+				[=] { move(RowMove::Next); },
 				&st::menuIconRestore);
 		}
 		if (index > 0) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_up(tr::now),
-				[=] { move(index - 1); },
+				[=] { move(RowMove::Up); },
 				&st::menuIconAbove);
 		}
 		if (index + 1 < count) {
 			_menu->addAction(
 				tr::lng_oblivion_rmusic_row_down(tr::now),
-				[=] { move(index + 1); },
+				[=] { move(RowMove::Down); },
 				&st::menuIconBelow);
 		}
 	}
@@ -4150,6 +4534,20 @@ void VideoTab::closeFullscreen() {
 			top->activateWindow();
 		}
 	}
+}
+
+bool VideoTab::eventHook(QEvent *e) {
+	if (e->type() == QEvent::Hide && _fullscreen) {
+		// The window of the room was hidden by a lock of the app. The
+		// passcode is watched by itself, this is for any other lock: the
+		// full screen does not stay over it either.
+		crl::on_main(this, [=] {
+			if (_fullscreen && window()->isHidden()) {
+				closeFullscreen();
+			}
+		});
+	}
+	return RpWidget::eventHook(e);
 }
 
 void VideoTab::setDragOver(bool over) {
@@ -4839,6 +5237,183 @@ void TestQueue(Checker &check) {
 		"queue: no engine for a sample");
 }
 
+// The display, the disk and the memory of the device.
+void TestDevice(Checker &check) {
+	// The display stays on only for a picture that moves and is seen.
+	check(VideoKeepsDisplayOn(VideoState::Synced, true, true, true)
+		&& VideoKeepsDisplayOn(VideoState::Catching, true, true, true)
+		&& VideoKeepsDisplayOn(VideoState::Starting, true, true, true)
+		&& VideoKeepsDisplayOn(VideoState::Buffering, true, true, true),
+		"display: kept on while the picture moves");
+	check(!VideoKeepsDisplayOn(VideoState::Synced, false, true, true),
+		"display: not on pause");
+	check(!VideoKeepsDisplayOn(VideoState::Synced, true, false, true),
+		"display: not without a picture");
+	check(!VideoKeepsDisplayOn(VideoState::Synced, true, true, false),
+		"display: not behind another tab");
+	check(!VideoKeepsDisplayOn(VideoState::Away, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Paused, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Loading, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Failed, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::NoSpace, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Unplayable, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Waiting, true, true, true)
+		&& !VideoKeepsDisplayOn(VideoState::Idle, true, true, true),
+		"display: not in the other states");
+
+	// The budget of the disk.
+	const auto mb = int64(1024) * 1024;
+	const auto file = [&](
+			const char *media,
+			int64 megabytes,
+			crl::time usedAt,
+			bool kept = false) {
+		return VideoFile{
+			.media = QString::fromUtf8(media),
+			.bytes = megabytes * mb,
+			.usedAt = usedAt,
+			.kept = kept,
+		};
+	};
+	auto plan = PlanVideoSpace(
+		{ file("a", 300, 10), file("new", 700, 0, true) },
+		2048 * mb,
+		50'000 * mb,
+		1'212 * mb);
+	check(plan.evict.empty() && plan.enough, "space: within the budget");
+	plan = PlanVideoSpace(
+		{
+			file("old", 600, 10),
+			file("older", 700, 5),
+			file("current", 700, 30, true),
+			file("new", 700, 0, true),
+		},
+		2048 * mb,
+		50'000 * mb,
+		1'212 * mb);
+	check(plan.evict == std::vector<QString>{ u"older"_q }
+		&& plan.enough, "space: the one used longest ago goes first");
+	plan = PlanVideoSpace(
+		{
+			file("old", 600, 10),
+			file("older", 700, 5),
+			file("oldest", 700, 1),
+			file("current", 700, 30, true),
+			file("new", 700, 0, true),
+		},
+		2048 * mb,
+		50'000 * mb,
+		1'212 * mb);
+	check(plan.evict == std::vector<QString>{ u"oldest"_q, u"older"_q }
+		&& plan.enough, "space: as many as the budget asks");
+	plan = PlanVideoSpace(
+		{
+			file("current", 700, 30, true),
+			file("next", 700, 0, true),
+			file("music", 700, 2, true),
+			file("new", 700, 0, true),
+		},
+		2048 * mb,
+		50'000 * mb,
+		1'212 * mb);
+	check(plan.evict.empty() && plan.enough,
+		"space: what is needed is never removed");
+	plan = PlanVideoSpace(
+		{ file("old", 300, 10), file("new", 700, 0, true) },
+		2048 * mb,
+		1'000 * mb,
+		1'212 * mb);
+	check(plan.evict == std::vector<QString>{ u"old"_q }
+		&& plan.enough, "space: a short disk is freed");
+	plan = PlanVideoSpace(
+		{ file("old", 100, 10), file("new", 700, 0, true) },
+		2048 * mb,
+		1'000 * mb,
+		1'212 * mb);
+	check(plan.evict == std::vector<QString>{ u"old"_q }
+		&& !plan.enough, "space: no room even so");
+	plan = PlanVideoSpace(
+		{ file("new", 700, 0, true) },
+		2048 * mb,
+		100 * mb,
+		1'212 * mb);
+	check(plan.evict.empty() && !plan.enough, "space: a full disk");
+	plan = PlanVideoSpace(
+		{ file("old", 300, 10), file("new", 700, 0, true) },
+		2048 * mb,
+		-1,
+		1'212 * mb);
+	check(plan.evict.empty() && plan.enough,
+		"space: an unknown disk is not a full one");
+
+	// The reader of the player is restarted in a long video only.
+	const auto longAgo = kRecycleInterval;
+	check(!VideoReaderRestart(kReadLimit - 1, longAgo, 600'000),
+		"memory: not before the limit");
+	check(VideoReaderRestart(kReadLimit, longAgo, 600'000),
+		"memory: at the limit");
+	check(!VideoReaderRestart(2 * kReadLimit, longAgo - 1, 600'000),
+		"memory: not too often");
+	check(!VideoReaderRestart(2 * kReadLimit, longAgo, 5'000),
+		"memory: not at the very end");
+
+	// Only the files of the relay are removed, only of the media asked.
+	const auto folder = cWorkingDir() + u"oblivion_room_video_selftest/"_q;
+	QDir(folder).removeRecursively();
+	if (!QDir().mkpath(folder)) {
+		check(false, "files: the folder");
+		return;
+	}
+	const auto write = [&](const QString &name, int size) {
+		auto created = QFile(folder + name);
+		return created.open(QIODevice::WriteOnly)
+			&& (created.write(QByteArray(size, 'x')) == size);
+	};
+	const auto here = [&](const QString &name) {
+		return QFileInfo::exists(folder + name);
+	};
+	const auto first = QString(64, QChar('a'));
+	const auto second = QString(64, QChar('b'));
+	check(write(first + u".mp4"_q, 1'000)
+		&& write(first + u".mp4.part"_q, 500)
+		&& write(first, 200)
+		&& write(second + u".mp4"_q, 300)
+		&& write(u"cover_"_q + first, 100)
+		&& write(u"tg_1.video"_q, 100)
+		&& write(u"film.mp4"_q, 100), "files: written");
+	check(RemoveMediaFilesIn(folder, u"../film"_q) == 0
+		&& RemoveMediaFilesIn(folder, u"*"_q) == 0
+		&& RemoveMediaFilesIn(folder, QString()) == 0
+		&& RemoveMediaFilesIn(QString(), first) == 0
+		&& here(first + u".mp4"_q)
+		&& here(u"film.mp4"_q), "files: only a media id is taken");
+	check(RemoveMediaFilesIn(folder, first) == 1'700,
+		"files: the file, its part and the one without a suffix");
+	check(!here(first + u".mp4"_q)
+		&& !here(first + u".mp4.part"_q)
+		&& !here(first), "files: of the media are gone");
+	check(here(second + u".mp4"_q)
+		&& here(u"cover_"_q + first)
+		&& here(u"tg_1.video"_q)
+		&& here(u"film.mp4"_q), "files: the other ones stay");
+	check(RemoveMediaFilesIn(folder, first) == 0, "files: nothing twice");
+
+	// A whole file that was moved, removed or replaced.
+	auto whole = FileState();
+	check(!WholeFileLost(whole), "lost: nothing was given");
+	whole.complete = folder + second + u".mp4"_q;
+	whole.size = 300;
+	check(!WholeFileLost(whole), "lost: the file is here");
+	whole.size = 400;
+	check(WholeFileLost(whole), "lost: not the same size");
+	whole.size = 300;
+	check(QFile::remove(whole.complete) && WholeFileLost(whole),
+		"lost: the file is gone");
+	whole.complete = folder;
+	check(WholeFileLost(whole), "lost: a folder is not a file");
+	QDir(folder).removeRecursively();
+}
+
 // ---- Snapshot scenes (OBLIVION_SELFTEST=ui).
 
 constexpr auto kSampleNow = int64(1791327935000);
@@ -4863,8 +5438,9 @@ constexpr auto kSampleThird = uint64(9000000000000102ULL);
 	p.fillRect(result.rect(), sky);
 	p.setPen(Qt::NoPen);
 	for (auto i = 0; i != 60; ++i) {
-		const auto x = (i * 197 + 61) % 1280;
-		const auto y = (i * 89 + 23) % 330;
+		// Scattered so that no two stars stick together into a smudge.
+		const auto x = (i * i * 31 + i * 197 + 61) % 1280;
+		const auto y = (i * i * 11 + i * 89 + 23) % 330;
 		const auto size = 1.5 + (i % 3);
 		p.setBrush(QColor(255, 255, 255, 90 + (i % 4) * 40));
 		p.drawEllipse(QPointF(x, y), size, size);
@@ -5163,6 +5739,13 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.status = { .state = VideoState::Failed },
 		};
 	});
+	window(u"room_video_no_space"_q, size, [] {
+		return SampleDescriptor(SampleKind::Guest);
+	}, [] {
+		return SampleView{
+			.status = { .state = VideoState::NoSpace },
+		};
+	});
 	window(u"room_video_narrow"_q, QSize(Scaled(380), Scaled(520)), [] {
 		return SampleDescriptor(SampleKind::Owner);
 	}, playing);
@@ -5194,6 +5777,8 @@ bool RunVideoSelfTest(QStringList &log) {
 	check.section("frame");
 	TestQueue(check);
 	check.section("queue");
+	TestDevice(check);
+	check.section("device");
 	log.push_back(u"room_video: %1 checks, %2 failed"_q.arg(
 		QString::number(check.passed() + check.failed()),
 		QString::number(check.failed())));

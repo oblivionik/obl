@@ -68,7 +68,9 @@ void MusicListenTracker::report() {
 	const auto document = base::take(_document);
 	const auto contextId = base::take(_contextId);
 	const auto duration = static_cast<int>(base::take(_listenedMs) / 1000);
-	if (!document || duration < kReportDurationSecondsMin) {
+	if (!document
+		|| !document->hasRemoteLocation() // Oblivion: a room / cloud track.
+		|| duration < kReportDurationSecondsMin) {
 		return;
 	}
 

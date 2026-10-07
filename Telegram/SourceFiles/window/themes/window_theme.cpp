@@ -38,6 +38,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/boxes/confirm_box.h"
 #include "boxes/background_box.h"
 #include "core/application.h"
+#include "oblivion/oblivion_look.h"
 #include "webview/webview_common.h"
 
 #include <QtCore/QBuffer>
@@ -529,12 +530,16 @@ void ChatBackground::start() {
 	_updates.events(
 	) | rpl::on_next([=](const BackgroundUpdate &update) {
 		refreshThemeWatcher();
-		if (update.paletteChanged()) {
+		// Oblivion: the look is put back over the palette and the
+		// wallpaper the theme code has just set, see oblivion_look.h.
+		const auto look = Oblivion::Look::PutOnAfterTheme();
+		if (update.paletteChanged() || look) {
 			style::NotifyPaletteChanged();
 		}
 	}, _lifetime);
 
 	initialRead();
+	Oblivion::Look::ThemeStarted(_lifetime); // Oblivion.
 
 	Core::App().domain().activeSessionValue(
 	) | rpl::filter([=](Main::Session *session) {
@@ -686,6 +691,10 @@ QImage ChatBackground::postprocessBackgroundImage(QImage image) {
 }
 
 void ChatBackground::set(const Data::WallPaper &paper, QImage image) {
+	// Oblivion: the service colours are derived from the wallpaper below,
+	// from the colours of the theme and not of the look.
+	Oblivion::Look::TakeOffForTheme();
+
 	image = Ui::PreprocessBackgroundImage(std::move(image));
 
 	const auto needResetAdjustable = Data::IsDefaultWallPaper(paper)
@@ -846,6 +855,7 @@ std::optional<Data::CloudTheme> ChatBackground::editingTheme() const {
 
 void ChatBackground::setEditingTheme(const Data::CloudTheme &editing) {
 	_editingTheme = editing;
+	Oblivion::Look::ThemeEditingChanged(); // Oblivion: no look in the editor.
 	refreshThemeWatcher();
 }
 
@@ -854,6 +864,7 @@ void ChatBackground::clearEditingTheme(ClearEditing clear) {
 		return;
 	}
 	_editingTheme = std::nullopt;
+	Oblivion::Look::ThemeEditingChanged(); // Oblivion: the look is back.
 	if (clear == ClearEditing::Temporary) {
 		return;
 	}
@@ -1318,6 +1329,10 @@ bool Apply(
 }
 
 bool Apply(std::unique_ptr<Preview> preview) {
+	// Oblivion: the palette saved for a revert below and the one that
+	// replaces it are the palettes of the themes, without the look.
+	Oblivion::Look::TakeOffForTheme();
+
 	GlobalApplying.data.object = std::move(preview->object);
 	GlobalApplying.data.cache = std::move(preview->instance.cached);
 	if (GlobalApplying.paletteForRevert.isEmpty()) {
@@ -1333,6 +1348,8 @@ void ApplyDefaultWithPath(const QString &themePath) {
 			Apply(std::move(preview));
 		}
 	} else {
+		Oblivion::Look::TakeOffForTheme(); // Oblivion: as in Apply().
+
 		GlobalApplying.data = Saved();
 		if (GlobalApplying.paletteForRevert.isEmpty()) {
 			GlobalApplying.paletteForRevert = style::main_palette::save();
@@ -1346,6 +1363,7 @@ bool ApplyEditedPalette(const QByteArray &content) {
 	if (!loadColorScheme(content, style::colorizer(), &out)) {
 		return false;
 	}
+	Oblivion::Look::TakeOffForTheme(); // Oblivion: as in Apply().
 	style::main_palette::apply(out.palette);
 	Background()->appliedEditedPalette();
 	return true;
@@ -1382,6 +1400,8 @@ void KeepFromEditor(
 	auto saved = Saved();
 	auto &cache = saved.cache;
 	auto &object = saved.object;
+	// Oblivion: the cache of the theme gets its own colours, not the look.
+	Oblivion::Look::TakeOffForTheme();
 	cache.colors = style::main_palette::save();
 	cache.paletteChecksum = style::palette::Checksum();
 	cache.contentChecksum = base::crc32(content.constData(), content.size());
@@ -1406,6 +1426,7 @@ void Revert() {
 	if (!AreTestingTheme()) {
 		return;
 	}
+	Oblivion::Look::TakeOffForTheme(); // Oblivion: as in Apply().
 	style::main_palette::load(GlobalApplying.paletteForRevert);
 	Background()->saveAdjustableColors();
 
@@ -1677,6 +1698,13 @@ std::unique_ptr<Ui::ChatTheme> DefaultChatThemeOn(rpl::lifetime &lifetime) {
 	const auto push = [=, raw = result.get()] {
 		const auto background = Background();
 		const auto &paper = background->paper();
+		// Oblivion: a look has its own chat background, shown only
+		// while the user has not chosen a wallpaper.
+		auto look = Ui::ChatThemeBackground();
+		if (Oblivion::Look::ChatBackground(look)) {
+			raw->setBackground(std::move(look));
+			return;
+		}
 		raw->setBackground({
 			.prepared = background->prepared(),
 			.preparedForTiled = background->preparedForTiled(),
@@ -1698,6 +1726,7 @@ std::unique_ptr<Ui::ChatTheme> DefaultChatThemeOn(rpl::lifetime &lifetime) {
 			push();
 		}
 	}, lifetime);
+	Oblivion::Look::Updates() | rpl::on_next(push, lifetime); // Oblivion.
 
 	return result;
 }

@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "oblivion/oblivion_cloud_social.h"
 #include "oblivion/oblivion_lang.h"
 #include "oblivion/oblivion_ui_snapshots.h"
 #include "ui/boxes/confirm_box.h"
@@ -40,6 +41,10 @@ constexpr auto kCodeLimit = 16;
 constexpr auto kCodeMinimum = 8;
 constexpr auto kCodeFontSize = 30;
 constexpr auto kCodeSpacing = 3;
+constexpr auto kCodeRadius = 10;
+constexpr auto kBulletSize = 5;
+constexpr auto kBulletIndent = 15;
+constexpr auto kBulletSkip = 4;
 constexpr auto kDotSize = 9;
 constexpr auto kTick = crl::time(1000);
 constexpr auto kConnectingToastDelay = crl::time(1500);
@@ -68,7 +73,9 @@ void Toast(const std::shared_ptr<Ui::Show> &show, const QString &text) {
 		return st::windowSubTextFg->c;
 	}
 	switch (info.state) {
-	case State::Online: return st::boxTextFgGood->c;
+	// Green in every theme: «good» text is blue in the night ones and
+	// could not be told from «Подключение…».
+	case State::Online: return st::settingsIconBg2->c;
 	case State::Connecting:
 	case State::NeedsLink: return st::windowActiveTextFg->c;
 	case State::Offline:
@@ -139,8 +146,8 @@ void StatusRow::paintEvent(QPaintEvent *e) {
 }
 
 // The link code, large and spaced, so that it is easy to read aloud and
-// to type on another device. The same place shows «Получаем код…» and
-// what went wrong.
+// to type on another device, on a plate of its own. The same plate shows
+// «Получаем код…» and what went wrong.
 class CodeView final : public Ui::RpWidget {
 public:
 	explicit CodeView(QWidget *parent);
@@ -179,6 +186,11 @@ void CodeView::showCode(const QString &code, bool expired) {
 	_text = QString();
 	_expired = expired;
 	_error = false;
+
+	// The plate may have grown for a long text shown before the code.
+	if (width() > 0) {
+		resizeToWidth(width());
+	}
 	update();
 }
 
@@ -193,19 +205,26 @@ void CodeView::showText(const QString &text, bool error) {
 }
 
 int CodeView::resizeGetHeight(int newWidth) {
-	const auto lines = _text.isEmpty()
+	const auto skip = st::boxLittleSkip;
+	const auto inner = std::max(newWidth - 2 * skip, 1);
+	const auto text = _text.isEmpty()
 		? 0
-		: std::max(
-			(st::normalFont->width(_text) + newWidth - 1)
-				/ std::max(newWidth, 1),
-			1);
-	return std::max(
-		CodeFont()->height + 2 * st::boxLittleSkip,
-		lines * st::normalFont->height + 2 * st::boxLittleSkip);
+		: QFontMetrics(st::normalFont->f).boundingRect(
+			QRect(0, 0, inner, 1 << 16),
+			Qt::AlignHCenter | Qt::TextWordWrap,
+			_text).height();
+	return std::max(CodeFont()->height, text) + 2 * skip;
 }
 
 void CodeView::paintEvent(QPaintEvent *e) {
 	auto p = QPainter(this);
+	{
+		auto hq = PainterHighQualityEnabler(p);
+		const auto radius = Scaled(kCodeRadius);
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::windowBgOver);
+		p.drawRoundedRect(rect(), radius, radius);
+	}
 	if (!_code.isEmpty()) {
 		auto font = CodeFont()->f;
 		font.setLetterSpacing(QFont::AbsoluteSpacing, Scaled(kCodeSpacing));
@@ -213,13 +232,70 @@ void CodeView::paintEvent(QPaintEvent *e) {
 		p.setPen(_expired ? st::windowSubTextFg : st::windowActiveTextFg);
 		p.drawText(rect(), Qt::AlignCenter, _code);
 	} else if (!_text.isEmpty()) {
+		const auto skip = st::boxLittleSkip;
 		p.setFont(st::normalFont);
 		p.setPen(_error ? st::boxTextFgError : st::windowSubTextFg);
 		p.drawText(
-			rect(),
+			rect().marginsRemoved({ skip, skip, skip, skip }),
 			Qt::AlignCenter | Qt::TextWordWrap,
 			_text);
 	}
+}
+
+// A line of a list: a small dot and a text that wraps next to it, not
+// under it. The consent box tells what is sent with such lines.
+class BulletRow final : public Ui::RpWidget {
+public:
+	BulletRow(QWidget *parent, const TextWithEntities &text);
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+	int resizeGetHeight(int newWidth) override;
+
+private:
+	const not_null<Ui::FlatLabel*> _label;
+
+};
+
+BulletRow::BulletRow(QWidget *parent, const TextWithEntities &text)
+: RpWidget(parent)
+, _label(Ui::CreateChild<Ui::FlatLabel>(this, st::defaultFlatLabel)) {
+	_label->setMarkedText(text);
+}
+
+int BulletRow::resizeGetHeight(int newWidth) {
+	const auto left = Scaled(kBulletIndent);
+	_label->resizeToWidth(std::max(newWidth - left, 1));
+	_label->moveToLeft(left, 0, newWidth);
+	return _label->height();
+}
+
+void BulletRow::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	auto hq = PainterHighQualityEnabler(p);
+	const auto size = Scaled(kBulletSize);
+	const auto line = st::defaultFlatLabel.style.font->height;
+	const auto x = rtl() ? (width() - Scaled(2) - size) : Scaled(2);
+	p.setPen(Qt::NoPen);
+	p.setBrush(st::windowSubTextFg);
+	p.drawEllipse(QRectF(x, (line - size) / 2. + Scaled(1), size, size));
+}
+
+// The lines of a text as separate texts, with their formatting kept.
+[[nodiscard]] std::vector<TextWithEntities> SplitLines(
+		const TextWithEntities &text) {
+	auto result = std::vector<TextWithEntities>();
+	const auto size = int(text.text.size());
+	auto from = 0;
+	while (from < size) {
+		const auto found = int(text.text.indexOf(QChar('\n'), from));
+		const auto till = (found < 0) ? size : found;
+		if (till > from) {
+			result.push_back(Ui::Text::Mid(text, from, till - from));
+		}
+		from = till + 1;
+	}
+	return result;
 }
 
 struct ConsentArgs {
@@ -241,21 +317,41 @@ void ConsentBox(not_null<Ui::GenericBox*> box, ConsentArgs &&args) {
 				st::boxLabel),
 			RowPadding());
 	};
-	const auto titled = [&](const QString &title, TextWithEntities text) {
-		paragraph(tr::bold(title).append(QChar('\n')).append(std::move(text)));
+	// A heading and a list under it: every line of the text is a row
+	// with a dot, so that it is read at a glance, not as a wall of text.
+	const auto listed = [&](const QString &title, TextWithEntities text) {
+		box->addRow(
+			object_ptr<Ui::FlatLabel>(
+				box,
+				rpl::single(tr::bold(title)),
+				st::boxLabel),
+			st::boxRowPadding
+				+ style::margins(0, 0, 0, Scaled(kBulletSkip) / 2));
+		const auto lines = SplitLines(text);
+		const auto count = int(lines.size());
+		for (auto i = 0; i != count; ++i) {
+			const auto last = (i + 1 == count);
+			box->addRow(
+				object_ptr<BulletRow>(box, lines[i]),
+				st::boxRowPadding + style::margins(
+					0,
+					0,
+					0,
+					last ? st::boxLittleSkip : Scaled(kBulletSkip)));
+		}
 	};
 
 	// Four facts in plain words, in the order a person asks them: what it
 	// is and whose server, what goes there, what never does, how to leave.
 	paragraph({ tr::lng_oblivion_cloud_consent_about(tr::now) });
-	titled(
+	listed(
 		tr::lng_oblivion_cloud_consent_sent_title(tr::now),
 		tr::lng_oblivion_cloud_consent_sent(
 			tr::now,
 			lt_name,
-			tr::bold(args.account),
+			tr::bold(args.account.simplified()),
 			tr::marked));
-	titled(
+	listed(
 		tr::lng_oblivion_cloud_consent_not_title(tr::now),
 		{ tr::lng_oblivion_cloud_consent_not(tr::now) });
 	paragraph({ tr::lng_oblivion_cloud_consent_off(tr::now) });
@@ -329,12 +425,16 @@ void LinkCodeBox(not_null<Ui::GenericBox*> box, LinkCodeArgs &&args) {
 			st::boxLabel),
 		RowPadding());
 	const auto view = box->addRow(object_ptr<CodeView>(box), RowPadding());
+
+	// How long the code lives: a caption in the middle, under the plate
+	// with the code it is about.
 	box->addRow(
 		object_ptr<Ui::FlatLabel>(
 			box,
 			state->expires.value(),
-			st::boxLabel),
-		RowPadding());
+			st::defaultPeerListAbout),
+		RowPadding(),
+		style::al_justify);
 	box->addRow(
 		object_ptr<Ui::FlatLabel>(
 			box,
@@ -401,7 +501,17 @@ struct EnterCodeArgs {
 	Fn<void()> cancel;
 	QString code;
 	QString error;
+	bool reserved = false;
 };
+
+// The server answers "already registered" both when another device holds
+// the account and when no device is left at all (the account is kept, but
+// the last device has logged out of Telegram). It marks the second case,
+// and only the developer can give a code then.
+[[nodiscard]] bool ReservedError(const Error &error) {
+	return error.is("already_registered")
+		&& error.details.value(u"reserved"_q).toBool();
+}
 
 [[nodiscard]] QString CodeErrorText(const Error &error) {
 	return error.is("invalid_code")
@@ -421,13 +531,16 @@ void EnterCodeBox(not_null<Ui::GenericBox*> box, EnterCodeArgs &&args) {
 	const auto submit = std::move(args.submit);
 	const auto linked = std::move(args.linked);
 	const auto cancel = std::move(args.cancel);
+	const auto reserved = args.reserved;
 
 	box->setTitle(tr::lng_oblivion_cloud_code_title());
 	box->setWidth(st::boxWideWidth);
 	box->addRow(
 		object_ptr<Ui::FlatLabel>(
 			box,
-			tr::lng_oblivion_cloud_code_about(),
+			(reserved
+				? tr::lng_oblivion_cloud_code_reserved_about()
+				: tr::lng_oblivion_cloud_code_about()),
 			st::boxLabel),
 		RowPadding());
 	const auto field = box->addRow(
@@ -447,7 +560,9 @@ void EnterCodeBox(not_null<Ui::GenericBox*> box, EnterCodeArgs &&args) {
 	const auto showHint = [=](const QString &error) {
 		if (error.isEmpty()) {
 			hint->setTextColorOverride(std::nullopt);
-			state->hint = tr::lng_oblivion_cloud_code_lost(tr::now);
+			state->hint = reserved
+				? QString()
+				: tr::lng_oblivion_cloud_code_lost(tr::now);
 		} else {
 			hint->setTextColorOverride(st::boxTextFgError->c);
 			state->hint = error;
@@ -505,6 +620,7 @@ void ShowEnterCodeFlow(
 		std::shared_ptr<Ui::Show> show,
 		Fn<void()> done,
 		Fn<void()> declined) {
+	const auto strong = weak.get();
 	show->showBox(Box(EnterCodeBox, EnterCodeArgs{
 		.submit = [=](const QString &code, Fn<void()> linked, Fail fail) {
 			if (const auto account = weak.get()) {
@@ -518,6 +634,7 @@ void ShowEnterCodeFlow(
 			}
 		},
 		.cancel = declined,
+		.reserved = strong && ReservedError(strong->lastError()),
 	}));
 }
 
@@ -579,6 +696,16 @@ void WaitReady(
 		}
 		finish(declined);
 	}, *lifetime);
+
+	// The subscriptions above keep themselves alive through the lifetime
+	// they are stored in, and only finish() lets go of it. If the account
+	// goes away first (a logout while the box waits), its state is over
+	// without any of them being called, so this is the one that releases
+	// everything then. Nobody is told: the account is gone.
+	account->stateValue(
+	) | rpl::on_done([=] {
+		finish(nullptr);
+	}, *lifetime);
 }
 
 [[nodiscard]] QString SampleText(const char *ru, const char *en) {
@@ -618,6 +745,7 @@ StatusSamples::StatusSamples(QWidget *parent)
 	add({ .state = State::NoConsent });
 	add({ .state = State::Disconnected });
 	add({ .state = State::NeedsLink });
+	add({ .state = State::NeedsLink, .reserved = true });
 	add({ .state = State::UpgradeRequired });
 	add({ .state = State::Banned });
 	add({ .state = State::NoConsent, .unavailable = true });
@@ -700,6 +828,10 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.error = tr::lng_oblivion_cloud_code_wrong(tr::now),
 		});
 	});
+	RegisterBoxScene(u"cloud_enter_code_reserved"_q, size, [](
+			std::shared_ptr<Ui::Show> show) {
+		return Box(EnterCodeBox, EnterCodeArgs{ .reserved = true });
+	});
 
 	RegisterBoxScene(u"cloud_enable_again"_q, size, [](
 			std::shared_ptr<Ui::Show> show) {
@@ -713,6 +845,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		return Ui::MakeConfirmBox({
 			.text = tr::lng_oblivion_cloud_off_sure(),
 			.confirmText = tr::lng_oblivion_cloud_off_confirm(),
+			.title = tr::lng_oblivion_cloud_off_title(),
 		});
 	});
 	RegisterBoxScene(u"cloud_confirm_delete"_q, size, [](
@@ -721,6 +854,7 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 			.text = tr::lng_oblivion_cloud_delete_sure(),
 			.confirmText = tr::lng_oblivion_cloud_delete_confirm(),
 			.confirmStyle = &st::attentionBoxButton,
+			.title = tr::lng_oblivion_cloud_delete_title(),
 		});
 	});
 	RegisterBoxScene(u"cloud_delete_need"_q, size, [](
@@ -767,6 +901,8 @@ QString ErrorText(const Error &error) {
 		? tr::lng_oblivion_cloud_error_banned(tr::now)
 		: error.is("invalid_code")
 		? tr::lng_oblivion_cloud_code_wrong(tr::now)
+		: ReservedError(error) // No device at all: not «на другом».
+		? tr::lng_oblivion_cloud_status_reserved_about(tr::now)
 		: (error.is("already_registered")
 			|| error.is("verification_required"))
 		? tr::lng_oblivion_cloud_error_bound(tr::now)
@@ -810,6 +946,8 @@ rpl::producer<StatusInfo> StatusValue(not_null<Account*> account) {
 			? strong->me().name
 			: strong->chosenName();
 		result.unavailable = !strong->available();
+		result.reserved = (result.state == State::NeedsLink)
+			&& ReservedError(strong->lastError());
 		const auto &hello = strong->hello();
 		result.motd = CurrentLanguageIsRussian()
 			? hello.motdRu
@@ -861,7 +999,9 @@ QString StatusAbout(const StatusInfo &info) {
 	case State::Disconnected:
 		return tr::lng_oblivion_cloud_status_off_about(tr::now);
 	case State::NeedsLink:
-		return tr::lng_oblivion_cloud_status_link_about(tr::now);
+		return info.reserved
+			? tr::lng_oblivion_cloud_status_reserved_about(tr::now)
+			: tr::lng_oblivion_cloud_status_link_about(tr::now);
 	case State::Connecting:
 		return tr::lng_oblivion_cloud_status_connecting_about(tr::now);
 	case State::Online:
@@ -993,6 +1133,7 @@ void ToggleFromSettings(not_null<Window::SessionController*> controller) {
 	const auto account = &For(&controller->session());
 	const auto state = account->state();
 	const auto weak = base::make_weak(account);
+	const auto session = base::make_weak(&controller->session());
 	const auto show = controller->uiShow();
 	if (state == State::NoConsent || state == State::Disconnected) {
 		RequireConsent(controller, [=] {
@@ -1004,12 +1145,23 @@ void ToggleFromSettings(not_null<Window::SessionController*> controller) {
 		.text = tr::lng_oblivion_cloud_off_sure(),
 		.confirmed = [=](Fn<void()> close) {
 			close();
-			if (const auto strong = weak.get()) {
-				strong->switchOff();
-				Toast(show, tr::lng_oblivion_cloud_off_done(tr::now));
+			const auto alive = session.get();
+			if (!alive) {
+				return;
 			}
+			// The track that was told to the audience («слушает») is
+			// taken back first: after switchOff() nothing can be sent.
+			// The callback comes from the event loop, in 1.2 seconds at
+			// the latest, see Social::StopPublishing().
+			Social::StopPublishing(alive, [=] {
+				if (const auto strong = weak.get()) {
+					strong->switchOff();
+					Toast(show, tr::lng_oblivion_cloud_off_done(tr::now));
+				}
+			});
 		},
 		.confirmText = tr::lng_oblivion_cloud_off_confirm(),
+		.title = tr::lng_oblivion_cloud_off_title(),
 	}));
 }
 
@@ -1061,6 +1213,7 @@ void ShowDeleteData(not_null<Window::SessionController*> controller) {
 		},
 		.confirmText = tr::lng_oblivion_cloud_delete_confirm(),
 		.confirmStyle = &st::attentionBoxButton,
+		.title = tr::lng_oblivion_cloud_delete_title(),
 	}));
 }
 

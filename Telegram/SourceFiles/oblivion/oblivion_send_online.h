@@ -46,6 +46,11 @@ class SessionController;
 //   message found in that state after a restart is sent again by itself
 //   only within a few minutes of the attempt, later the user is asked
 //   («Не удалось подтвердить отправку»), it never goes out silently;
+// - the same after an attempt with no clear answer (a server error, an
+//   answer that was not read): it is repeated by itself a few times
+//   within those minutes, without waiting for the person to come online
+//   once more, then the user is asked; the text of such a message can't
+//   be changed any more, the repeat must be the same message;
 // - several messages for one person go one by one, in their order.
 //
 // The limit of Oblivion::Get().sendWhenOnlineHours(): after it a message
@@ -53,9 +58,21 @@ class SessionController;
 // is asked what to do. The same when the chat is not available any more
 // (deleted or blocked account, paid messages) or the server refused it.
 //
+// Nothing goes behind the user's back:
+// - a message that is being edited, or whose removal is being confirmed,
+//   is held until that box is closed, and so are the ones behind it;
+// - «Удалить чат» on this device and blocking the person stop everything
+//   that waits for them: it stays in the list as not sent, with the
+//   reason, and only a click sends it (a chat deleted from another
+//   device is not noticed);
+// - a person who is not loaded yet (right after the start) and a lost
+//   connection are reasons to wait, never to give up or to send later
+//   than promised.
+//
 // Sending goes the way of an ordinary text message, with "send without
 // going online" of the ghost mode applied (oblivion_sending.h), but the
-// chat is neither read nor scrolled: the user may be away.
+// chat is neither read nor scrolled: the user may be away. In a chat
+// that is read invisibly the delivery does not mark it as read either.
 namespace Oblivion::SendOnline {
 
 // Called by Cloud::SessionStarted() / Cloud::SessionLoggedOut() (the

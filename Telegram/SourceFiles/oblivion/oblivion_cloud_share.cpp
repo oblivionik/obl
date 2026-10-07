@@ -44,6 +44,11 @@ namespace {
 constexpr auto kFileVersion = 1;
 constexpr auto kPresetFormat = 1;
 constexpr auto kMaxSaved = 200;
+// How many deleted presets are remembered (for the settings sync) and
+// for how long: a device that was not used for longer than that may
+// bring a deleted preset back.
+constexpr auto kMaxRemovedPresets = 2000;
+constexpr auto kRemovedLife = int64(180) * 24 * 60 * 60;
 constexpr auto kMaxKnownMedia = 5000;
 constexpr auto kMaxPublished = 500;
 constexpr auto kMaxOwnerName = 64;
@@ -54,6 +59,66 @@ constexpr auto kDefaultAudioLimit = int64(83886080);
 constexpr auto kMaxMediaSize = int64(1) << 40;
 constexpr auto kResolveTimeout = crl::time(15000);
 constexpr auto kPreviewSourceWidth = 1600;
+constexpr auto kKeepResumeDelay = crl::time(10'000);
+constexpr auto kKeepGoneRun = 5;
+
+// «Добавить к себе»: the pause before the files that could not be taken
+// are tried again. It grows and stays at an hour, so a computer without
+// connection asks once an hour at most.
+[[nodiscard]] crl::time KeepRetryDelay(int failures) {
+	constexpr auto kMinute = crl::time(60'000);
+	return (failures <= 0)
+		? kMinute
+		: (failures == 1)
+		? (5 * kMinute)
+		: (failures == 2)
+		? (15 * kMinute)
+		: (60 * kMinute);
+}
+
+// The file is not on the server any more (or not for this user), or what
+// came does not pass the check: asking again changes nothing. Anything
+// else is taken for a lost connection.
+[[nodiscard]] bool KeepGoneError(const Cloud::Error &error) {
+	using Type = Cloud::Error::Type;
+	return (error.type == Type::File)
+		|| (error.type == Type::Protocol)
+		|| (error.type == Type::Http
+			&& (error.status == 403
+				|| error.status == 404
+				|| error.status == 410
+				|| error.status == 416));
+}
+
+// A track the server does not take as it is (a field of its "tracks"
+// entry): the upload goes on with the next one instead of stopping at
+// the same track with every «Повторить».
+[[nodiscard]] bool TrackRefused(const Cloud::Error &error) {
+	return (error.type == Cloud::Error::Type::Http)
+		&& (error.status == 400)
+		&& error.detail("field").startsWith(u"tracks["_q);
+}
+
+// Tracks whose files the server has already are added one right after
+// another, and the server may ask to slow down (429). The pause before
+// the same track is added again, 0 when the upload should stop instead:
+// a long wait or a server that refuses again and again.
+[[nodiscard]] crl::time AddAgainDelay(const Cloud::Error &error, int retries) {
+	constexpr auto kMaxRetries = 5;
+	constexpr auto kMinWait = crl::time(1'000);
+	constexpr auto kMaxWait = crl::time(30'000);
+	if (error.type != Cloud::Error::Type::Http
+		|| error.status != 429
+		|| retries >= kMaxRetries
+		|| error.retryAfter > kMaxWait) {
+		return 0;
+	}
+	// A little longer every time, in case the server gave no number.
+	return std::clamp(
+		std::max(error.retryAfter, kMinWait * (retries + 1)),
+		kMinWait,
+		kMaxWait);
+}
 
 [[nodiscard]] QString TagsPrefix() {
 	return u"fx: "_q;
@@ -874,6 +939,96 @@ void TestFiles(Checker &check) {
 		library.remove(firstId);
 		check(library.list().size() == 1 && !library.find(firstId),
 			"library: a preset is removed");
+
+		// The settings sync: a deletion stays a deletion. The other
+		// device still has the preset and sends its list.
+		const auto gone = library.exportRemovedJson();
+		check(gone.size() == 1
+			&& (gone.at(0).toObject().value(u"id"_q).toString()
+				== QString::number(firstId)),
+			"library: a removed preset is remembered");
+		check(other.find(firstId) != nullptr
+			&& !library.mergeChanges(
+				other.exportJson(),
+				other.exportRemovedJson()),
+			"library: a list with the removed preset would change nothing");
+		library.mergeJson(other.exportJson(), other.exportRemovedJson());
+		check(library.list().size() == 1 && !library.find(firstId),
+			"library: a removed preset does not come back");
+		check(other.mergeChanges(library.exportJson(), gone)
+			&& other.countRemovals(gone) == 1
+			&& other.find(firstId) != nullptr,
+			"library: asking what a merge would change changes nothing");
+		other.mergeJson(library.exportJson(), gone);
+		check(other.list().size() == 1 && !other.find(firstId),
+			"library: a removal reaches the other device");
+		check(other.countRemovals(gone) == 0,
+			"library: nothing more to remove after that");
+		check(other.exportRemovedJson() == gone,
+			"library: and is passed on by it");
+		check(!other.mergeChanges(library.exportJson(), gone),
+			"library: the second time nothing changes");
+		check(other.add({
+			.kind = u"video"_q,
+			.title = u"Again"_q,
+			.stack = stack,
+		}) != 0, "library: a new preset is still saved");
+
+		// Too old to matter, broken, and from a clock that runs ahead.
+		const auto lastId = library.list().empty()
+			? uint64(0)
+			: library.list().front().id;
+		const auto now = int64(base::unixtime::now());
+		auto stale = QJsonArray();
+		stale.push_back(QJsonObject{
+			{ u"id"_q, QString::number(lastId) },
+			{ u"time"_q, double(now - int64(400) * 86400) },
+		});
+		stale.push_back(QJsonObject{
+			{ u"id"_q, u"0"_q },
+			{ u"time"_q, double(now) },
+		});
+		stale.push_back(QJsonObject{ { u"id"_q, QString::number(lastId) } });
+		stale.push_back(u"text"_q);
+		library.mergeJson(QJsonArray(), stale);
+		check(lastId
+			&& library.find(lastId) != nullptr
+			&& library.exportRemovedJson().size() == 1,
+			"library: an old or a broken removal removes nothing");
+		auto ahead = QJsonArray();
+		ahead.push_back(QJsonObject{
+			{ u"id"_q, QString::number(lastId) },
+			{ u"time"_q, double(now + int64(4000) * 86400) },
+		});
+		library.mergeJson(QJsonArray(), ahead);
+		const auto noted = library.exportRemovedJson();
+		check(library.list().empty() && noted.size() == 2,
+			"library: a removal from a clock that runs ahead is taken");
+		auto latest = int64(0);
+		for (const auto &value : noted) {
+			latest = std::max(
+				latest,
+				Cloud::JsonInt(value.toObject().value(u"time"_q)));
+		}
+		check(latest > 0 && latest <= int64(base::unixtime::now()),
+			"library: but not with a time in the future");
+	}
+	{
+		auto library = Library(libraryPath);
+		check(library.list().empty()
+			&& library.exportRemovedJson().size() == 2
+			&& library.exportJson().isEmpty(),
+			"library: the removals are on the disk");
+		auto other = Library(QString());
+		const auto id = other.add({
+			.kind = u"video"_q,
+			.title = u"Mine"_q,
+			.stack = stack,
+		});
+		check(id && !library.find(id), "library: another device, a preset");
+		library.mergeJson(other.exportJson(), other.exportRemovedJson());
+		check(library.find(id) != nullptr,
+			"library: a preset that was never removed is still added");
 	}
 	{
 		auto file = QFile(libraryPath);
@@ -928,6 +1083,108 @@ void TestFiles(Checker &check) {
 			"store: the changes are on the disk");
 	}
 	check.section("files");
+}
+
+void TestRules(Checker &check) {
+	// «Набор применён» only when the editor has taken the stack.
+	const auto editor = std::make_shared<QByteArray>("[]");
+	const auto locked = std::make_shared<bool>(false);
+	const auto calls = std::make_shared<int>(0);
+	const auto host = PresetHost{
+		.kind = u"video"_q,
+		.current = [=] { return *editor; },
+		.apply = [=](const QByteArray &stack) {
+			++*calls;
+			if (!*locked) {
+				*editor = stack;
+			}
+		},
+	};
+	const auto apply = CheckedApply(host);
+	check(apply != nullptr, "apply: a host that can apply");
+	if (apply) {
+		check(apply(QByteArray("[1]")) && *editor == QByteArray("[1]"),
+			"apply: a stack the editor takes is applied");
+		check(!apply(QByteArray("[1]")),
+			"apply: the stack that is there already changes nothing");
+		*locked = true;
+		check(!apply(QByteArray("[2]")) && *editor == QByteArray("[1]"),
+			"apply: a stack the editor refuses is not applied");
+		check(*calls == 3, "apply: the editor is asked every time");
+		*locked = false;
+	}
+	auto blind = host;
+	blind.current = nullptr;
+	const auto trusted = CheckedApply(blind);
+	check(trusted && trusted(QByteArray("[3]")),
+		"apply: a host without a stack to compare is trusted");
+	auto viewer = host;
+	viewer.apply = nullptr;
+	check(!CheckedApply(viewer), "apply: a host that can't apply");
+
+	// «Добавить к себе»: what is tried again and when.
+	check(KeepRetryDelay(0) >= crl::time(60'000)
+		&& KeepRetryDelay(-3) == KeepRetryDelay(0),
+		"keep: not sooner than a minute after a failure");
+	check(KeepRetryDelay(1) > KeepRetryDelay(0)
+		&& KeepRetryDelay(2) > KeepRetryDelay(1)
+		&& KeepRetryDelay(3) > KeepRetryDelay(2),
+		"keep: the pause grows");
+	check(KeepRetryDelay(3) == crl::time(3'600'000)
+		&& KeepRetryDelay(1000) == KeepRetryDelay(3),
+		"keep: and stays at an hour");
+	using Type = Cloud::Error::Type;
+	check(KeepGoneError({ .type = Type::Http, .status = 404 })
+		&& KeepGoneError({ .type = Type::Http, .status = 403 })
+		&& KeepGoneError({ .type = Type::File }),
+		"keep: a file the server does not give is not asked for again");
+	check(!KeepGoneError({ .type = Type::Network })
+		&& !KeepGoneError({ .type = Type::Timeout })
+		&& !KeepGoneError({ .type = Type::NotConnected })
+		&& !KeepGoneError({ .type = Type::Http, .status = 429 })
+		&& !KeepGoneError({ .type = Type::Http, .status = 503 }),
+		"keep: without connection the file is tried again later");
+
+	// The upload: one refused track does not stop the rest.
+	const auto refused = Cloud::Error{
+		.type = Type::Http,
+		.status = 400,
+		.code = u"bad_request"_q,
+		.details = QJsonObject{ { u"field"_q, u"tracks[0].title"_q } },
+	};
+	check(TrackRefused(refused), "upload: a refused track is skipped");
+	auto title = refused;
+	title.details = QJsonObject{ { u"field"_q, u"title"_q } };
+	check(!TrackRefused(title),
+		"upload: a refused title of the playlist stops the upload");
+	check(!TrackRefused({
+		.type = Type::Http,
+		.status = 422,
+		.code = u"limit_reached"_q,
+	}) && !TrackRefused({ .type = Type::Network }),
+		"upload: a limit or a lost connection stops the upload");
+	const auto slow = Cloud::Error{
+		.type = Type::Http,
+		.status = 429,
+		.retryAfter = 2'000,
+	};
+	check(AddAgainDelay(slow, 0) == crl::time(2'000),
+		"upload: asked to slow down, the track waits as long as asked");
+	check(AddAgainDelay({ .type = Type::Http, .status = 429 }, 0)
+		>= crl::time(1'000),
+		"upload: at least a second without a number from the server");
+	check(AddAgainDelay(slow, 4) > AddAgainDelay(slow, 0)
+		&& AddAgainDelay(slow, 5) == 0,
+		"upload: a few times, not again and again");
+	check(AddAgainDelay({
+		.type = Type::Http,
+		.status = 429,
+		.retryAfter = 600'000,
+	}, 0) == 0, "upload: a long wait stops the upload instead");
+	check(AddAgainDelay({ .type = Type::Http, .status = 422 }, 0) == 0
+		&& AddAgainDelay({ .type = Type::Network }, 0) == 0,
+		"upload: other failures are not waited out");
+	check.section("rules");
 }
 
 } // namespace
@@ -1285,13 +1542,20 @@ void Library::ensureLoaded() {
 	}
 	const auto object = ReadJsonFile(_path);
 	_list.clear();
-	mergeList(object.value(u"presets"_q).toArray());
+	_removed.clear();
+	merge(
+		object.value(u"presets"_q).toArray(),
+		object.value(u"removed"_q).toArray());
 }
 
 void Library::save() {
 	auto object = QJsonObject();
 	object.insert(u"v"_q, kFileVersion);
 	object.insert(u"presets"_q, exportJson());
+	const auto removed = exportRemovedJson();
+	if (!removed.isEmpty()) {
+		object.insert(u"removed"_q, removed);
+	}
 	WriteJsonFile(_path, object);
 }
 
@@ -1344,7 +1608,7 @@ uint64 Library::add(LocalPreset preset) {
 	}
 	do {
 		preset.id = base::RandomValue<uint64>() >> 12;
-	} while (!preset.id || find(preset.id));
+	} while (!preset.id || find(preset.id) || wasRemoved(preset.id));
 	if (preset.created <= 0) {
 		preset.created = base::unixtime::now();
 	}
@@ -1386,8 +1650,40 @@ void Library::remove(uint64 id) {
 		return;
 	}
 	_list.erase(i);
+	// For the settings sync: the other devices delete it too instead of
+	// sending it back.
+	noteRemoved(id, int64(base::unixtime::now()));
 	save();
 	_changes.fire({});
+}
+
+bool Library::wasRemoved(uint64 id) const {
+	return ranges::contains(_removed, id, &Removed::id);
+}
+
+// True if something new is remembered.
+bool Library::noteRemoved(uint64 id, int64 time) {
+	const auto i = ranges::find(_removed, id, &Removed::id);
+	if (i != end(_removed)) {
+		if (i->time >= time) {
+			return false;
+		}
+		i->time = time;
+		return true;
+	} else if (int(_removed.size()) < kMaxRemovedPresets) {
+		_removed.push_back({ .id = id, .time = time });
+		return true;
+	}
+	// Full: the oldest one gives its place to a newer one.
+	const auto oldest = ranges::min_element(
+		_removed,
+		ranges::less(),
+		&Removed::time);
+	if (oldest->time >= time) {
+		return false;
+	}
+	*oldest = Removed{ .id = id, .time = time };
+	return true;
 }
 
 rpl::producer<> Library::changes() const {
@@ -1414,12 +1710,92 @@ QJsonArray Library::exportJson() {
 	return result;
 }
 
-void Library::mergeJson(const QJsonArray &list) {
+QJsonArray Library::exportRemovedJson() {
 	ensureLoaded();
-	if (mergeList(list)) {
+	const auto now = int64(base::unixtime::now());
+	auto result = QJsonArray();
+	for (const auto &entry : _removed) {
+		if (entry.time + kRemovedLife <= now) {
+			continue;
+		}
+		auto object = QJsonObject();
+		object.insert(u"id"_q, QString::number(entry.id));
+		object.insert(u"time"_q, double(entry.time));
+		result.push_back(object);
+	}
+	return result;
+}
+
+void Library::mergeJson(const QJsonArray &list, const QJsonArray &removed) {
+	ensureLoaded();
+	const auto result = merge(list, removed);
+	if (result.list || result.removed) {
 		save();
+	}
+	if (result.list) {
 		_changes.fire({});
 	}
+}
+
+bool Library::mergeChanges(
+		const QJsonArray &list,
+		const QJsonArray &removed) {
+	ensureLoaded();
+	auto keptList = _list;
+	auto keptRemoved = _removed;
+	const auto result = merge(list, removed);
+	_list = std::move(keptList);
+	_removed = std::move(keptRemoved);
+	return result.list;
+}
+
+int Library::countRemovals(const QJsonArray &removed) {
+	ensureLoaded();
+	auto keptList = _list;
+	auto keptRemoved = _removed;
+	merge(QJsonArray(), removed);
+	const auto result = int(keptList.size()) - int(_list.size());
+	_list = std::move(keptList);
+	_removed = std::move(keptRemoved);
+	return std::max(result, 0);
+}
+
+Library::Merged Library::merge(
+		const QJsonArray &list,
+		const QJsonArray &removed) {
+	auto result = Merged();
+	const auto now = int64(base::unixtime::now());
+	_removed.erase(
+		ranges::remove_if(_removed, [&](const Removed &entry) {
+			return (entry.time + kRemovedLife <= now);
+		}),
+		end(_removed));
+
+	// What was deleted goes first: a deletion wins over a preset with
+	// the same id in the list.
+	auto count = 0;
+	for (const auto &value : removed) {
+		if (++count > kMaxRemovedPresets) {
+			break;
+		}
+		const auto entry = value.toObject();
+		const auto id = entry.value(u"id"_q).toString().toULongLong();
+		// A clock that runs ahead does not make a deletion live longer.
+		const auto time = std::min(
+			Cloud::JsonInt(entry.value(u"time"_q)),
+			now);
+		if (!id || time <= 0 || time + kRemovedLife <= now) {
+			continue;
+		}
+		result.removed = noteRemoved(id, time) || result.removed;
+		const auto i = ranges::find(_list, id, &LocalPreset::id);
+		if (i != end(_list)) {
+			_list.erase(i);
+			result.list = true;
+		}
+	}
+	result.list = mergeList(list) || result.list;
+	return result;
 }
 
 bool Library::mergeList(const QJsonArray &list) {
@@ -1434,6 +1810,7 @@ bool Library::mergeList(const QJsonArray &list) {
 			kMaxPresetTitle);
 		const auto stack = entry.value(u"stack"_q);
 		if (!preset.id
+			|| wasRemoved(preset.id)
 			|| !ValidKind(preset.kind)
 			|| preset.title.isEmpty()
 			|| !stack.isArray()) {
@@ -1471,6 +1848,24 @@ Library &PresetLibrary() {
 	static const auto result = new Library(
 		cWorkingDir() + u"tdata/oblivion/presets.json"_q);
 	return *result;
+}
+
+Fn<bool(const QByteArray &stack)> CheckedApply(const PresetHost &host) {
+	const auto apply = host.apply;
+	const auto current = host.current;
+	if (!apply) {
+		return nullptr;
+	}
+	return [=](const QByteArray &stack) {
+		if (!current) {
+			// Nothing to compare with: taken on trust.
+			apply(stack);
+			return true;
+		}
+		const auto before = current();
+		apply(stack);
+		return (current() != before);
+	};
 }
 
 Store::Store(QString path)
@@ -1661,7 +2056,8 @@ Uploader::Uploader(
 , _account(base::make_weak(&Cloud::For(session)))
 , _sender(&Cloud::For(session))
 , _request(std::move(request))
-, _watchdog([=] { skip(); }) {
+, _watchdog([=] { skip(); })
+, _addAgain([=] { add(_addMedia, _addKnown); }) {
 	_status.count = int(_request.sources.size());
 	_status.title = _request.title;
 	_status.playlistId = _request.playlistId;
@@ -1712,15 +2108,40 @@ void Uploader::cancel() {
 	if (_status.finished()) {
 		return;
 	}
-	if (_ownDownload && _fetching && _document && _document->loading()) {
-		_document->cancel();
-	}
+	stopFetching();
 	finish(UploadStatus::Stage::Cancelled);
+}
+
+void Uploader::disconnected() {
+	if (_status.finished() || _status.stage == UploadStatus::Stage::Idle) {
+		return;
+	}
+	stopFetching();
+	_status.error = { .type = Cloud::Error::Type::NotConnected };
+	finish(UploadStatus::Stage::Failed);
+}
+
+bool Uploader::fetching(not_null<DocumentData*> document) const {
+	return _fetching && _ownDownload && (_document == document.get());
+}
+
+// The download from Telegram this upload has started is stopped. It is
+// not a track that could not be taken: the watcher of the download must
+// not count it as skipped.
+void Uploader::stopFetching() {
+	if (_ownDownload && _fetching && _document && _document->loading()) {
+		const auto document = _document;
+		_fetching = false;
+		_fetchLifetime.destroy();
+		document->cancel();
+	}
 }
 
 void Uploader::clearCurrent() {
 	++_generation;
 	_watchdog.cancel();
+	_addAgain.cancel();
+	_addRetries = 0;
 	_fetchLifetime.destroy();
 	_sender.cancelAll();
 	if (_transfer) {
@@ -2052,6 +2473,16 @@ void Uploader::add(const QString &media, bool known) {
 	_status.part = 1.;
 	changed();
 
+	_addMedia = media;
+	_addKnown = known;
+	if (_addGap > 0) {
+		const auto wait = _addLast + _addGap - crl::now();
+		if (wait > 0) {
+			_addAgain.callOnce(wait);
+			return;
+		}
+	}
+	_addLast = crl::now();
 	_input.media = media;
 	auto tracks = QJsonArray();
 	tracks.push_back(TrackInputToJson(_input));
@@ -2093,6 +2524,17 @@ void Uploader::add(const QString &media, bool known) {
 			// The server has dropped the file since: sent again.
 			_store->setKnownMedia(documentId, QString());
 			schedule();
+			return;
+		} else if (TrackRefused(error)) {
+			skip();
+			return;
+		} else if (const auto wait = AddAgainDelay(error, _addRetries)) {
+			// Too many tracks in a row for the server: this one again
+			// after the pause it asks for, the upload does not stop, and
+			// the next tracks keep the distance.
+			++_addRetries;
+			_addGap = std::max(_addGap, wait);
+			_addAgain.callOnce(wait);
 			return;
 		}
 		fail(error);
@@ -2141,7 +2583,48 @@ Service::Service(not_null<Main::Session*> session)
 : _session(session)
 , _account(base::make_weak(&Cloud::For(session)))
 , _folder(AccountFolder(session))
-, _store(_folder + u"shared.json"_q) {
+, _store(_folder + u"shared.json"_q)
+, _keepRetry([=] { resumeKeeping(); }) {
+	// The files of «Добавить к себе» that are not on this device yet are
+	// taken when the account is connected (after a restart as well). And
+	// when the account is switched off (by the user, by a ban, by a
+	// protocol that is too old) the core drops what was on the way
+	// without calling back: nothing here may go on waiting for it.
+	Cloud::For(session).readyValue(
+	) | rpl::on_next([=](bool ready) {
+		if (ready) {
+			_keepFailures = 0;
+			_keepRetry.callOnce(kKeepResumeDelay);
+		} else {
+			disconnected();
+		}
+	}, _lifetime);
+}
+
+void Service::disconnected() {
+	_keepRetry.cancel();
+	_keepTransfer = 0;
+	if (!_keepLocal) {
+		_keepBusy = false;
+	}
+	// Made again from the kept playlists when the account is back.
+	const auto keeping = !_keepQueue.empty();
+	_keepQueue.clear();
+	_keepGoneRun = 0;
+
+	_loading = _preloading = 0;
+	if (_playing.loading) {
+		_playing.loading = false;
+		_playing.failed = true;
+		_playing.progress = 0.;
+		_playingChanges.fire({});
+	}
+	if (_uploader) {
+		_uploader->disconnected();
+	}
+	if (keeping) {
+		_keptChanges.fire({});
+	}
 }
 
 Service::~Service() {
@@ -2215,18 +2698,24 @@ DocumentData *Service::makeDocument(
 	const auto name = !track.fileName.isEmpty()
 		? track.fileName
 		: (track.title.isEmpty() ? u"audio"_q : track.title) + u".mp3"_q;
-	using Flag = MTPDdocumentAttributeAudio::Flag;
-	const auto flags = (track.title.isEmpty() ? Flag() : Flag::f_title)
-		| (track.performer.isEmpty() ? Flag() : Flag::f_performer);
+	// The attribute goes without the title and the performer: with both
+	// of them the document asks Telegram for an album cover at once, and
+	// this one is not a document of Telegram (nothing about a track of a
+	// shared playlist is ever sent there). The texts for the player are
+	// set right after, they are read when the player is painted.
 	document->setattributes({
 		MTP_documentAttributeFilename(MTP_string(name)),
 		MTP_documentAttributeAudio(
-			MTP_flags(flags),
+			MTP_flags(0),
 			MTP_int(int(std::max(track.duration / 1000, int64(1)))),
-			MTP_string(track.title),
-			MTP_string(track.performer),
+			MTPstring(),
+			MTPstring(),
 			MTPbytes()),
 	});
+	if (const auto song = document->song()) {
+		song->title = track.title;
+		song->performer = track.performer;
+	}
 	document->size = info.size();
 	document->setMimeString(track.mime.startsWith(u"audio/"_q)
 		? track.mime
@@ -2338,6 +2827,16 @@ void Service::startAt(int index) {
 		return;
 	}
 	const auto media = track.media;
+	const auto connected = _account.get();
+	if ((!connected || !connected->ready())
+		&& !QFileInfo(Cloud::MediaCachePath(media)).isFile()) {
+		// The account is switched off and the file is not on this device:
+		// a download that is asked for now may never answer.
+		_playing.loading = false;
+		_playing.failed = true;
+		_playingChanges.fire({});
+		return;
+	}
 	const auto current = [=] {
 		return (_playing.index == index) && (_playing.media == media);
 	};
@@ -2382,6 +2881,7 @@ void Service::playFile(int index, const QString &path) {
 	}
 	setupPlayer();
 	_current = document;
+	_playing.failed = false;
 	_playingChanges.fire({});
 	Media::Player::instance()->play(AudioMsgId(document, FullMsgId()));
 	preload(index + 1);
@@ -2421,17 +2921,106 @@ void Service::keep(const Playlist &playlist) {
 		return;
 	}
 	_store.save(playlist);
+	// A click: everything is tried now, whatever has failed before.
 	for (const auto &track : playlist.tracks) {
-		const auto queued = ranges::contains(
-			_keepQueue,
-			track.media,
-			&KeepTask::media);
-		if (!queued && !QFileInfo(keptPath(track.media)).isFile()) {
-			_keepQueue.push_back({ playlist.id, track.media });
+		_keepGone.remove(track.media);
+	}
+	queueMissing(playlist);
+	_keptChanges.fire({});
+	_keepFailures = 0;
+	_keepGoneRun = 0;
+	keepNext();
+}
+
+// The tracks of a kept playlist that have no file on this device yet.
+bool Service::queueMissing(const Playlist &playlist) {
+	auto added = false;
+	for (const auto &track : playlist.tracks) {
+		const auto &media = track.media;
+		if (!Cloud::ValidMediaId(media)
+			|| _keepGone.contains(media)
+			|| ranges::contains(_keepQueue, media, &KeepTask::media)
+			|| QFileInfo(keptPath(media)).isFile()) {
+			continue;
+		}
+		_keepQueue.push_back({ playlist.id, media });
+		added = true;
+	}
+	return added;
+}
+
+// What «Добавить к себе» has not taken yet: after a restart, after a
+// time without connection, after the account was switched on again.
+void Service::resumeKeeping() {
+	const auto account = _account.get();
+	if (!account || !account->ready()) {
+		return;
+	}
+	auto added = false;
+	for (const auto &playlist : _store.saved()) {
+		added = queueMissing(playlist) || added;
+	}
+	if (added) {
+		_keptChanges.fire({});
+	}
+	keepNext();
+}
+
+bool Service::neededMedia(const QString &media) {
+	for (const auto &playlist : _store.saved()) {
+		if (ranges::contains(playlist.tracks, media, &Track::media)) {
+			return true;
 		}
 	}
-	_keptChanges.fire({});
-	keepNext();
+	return false;
+}
+
+// The tasks for files no kept playlist needs any more.
+void Service::pruneKeepQueue() {
+	if (_keepQueue.empty()) {
+		return;
+	}
+	auto needed = base::flat_set<QString>();
+	for (const auto &playlist : _store.saved()) {
+		for (const auto &track : playlist.tracks) {
+			needed.emplace(track.media);
+		}
+	}
+	if (_keepTransfer && !needed.contains(_keepQueue.front().media)) {
+		// The file that is being taken right now.
+		if (const auto account = _account.get()) {
+			account->cancelTransfer(_keepTransfer);
+		}
+		_keepTransfer = 0;
+		_keepBusy = false;
+	}
+	_keepQueue.erase(
+		ranges::remove_if(_keepQueue, [&](const KeepTask &task) {
+			return !needed.contains(task.media);
+		}),
+		end(_keepQueue));
+}
+
+// The files of these tracks no kept playlist needs any more, with what a
+// download that was stopped half way has left.
+void Service::dropUnneeded(const std::vector<Track> &tracks) {
+	auto needed = base::flat_set<QString>();
+	for (const auto &playlist : _store.saved()) {
+		for (const auto &track : playlist.tracks) {
+			needed.emplace(track.media);
+		}
+	}
+	for (const auto &track : tracks) {
+		const auto &media = track.media;
+		if (needed.contains(media) || !Cloud::ValidMediaId(media)) {
+			continue;
+		}
+		const auto path = keptPath(media);
+		QFile::remove(path + u".part"_q);
+		if (!_current || _playing.media != media) {
+			QFile::remove(path);
+		}
+	}
 }
 
 void Service::forget(const Playlist &playlist) {
@@ -2439,32 +3028,8 @@ void Service::forget(const Playlist &playlist) {
 	const auto saved = _store.findSaved(id);
 	const auto tracks = saved ? saved->tracks : playlist.tracks;
 	_store.unsave(id);
-	if (_keepTransfer
-		&& !_keepQueue.empty()
-		&& _keepQueue.front().playlistId == id) {
-		// The file of this playlist that is being taken right now.
-		account().cancelTransfer(_keepTransfer);
-		_keepTransfer = 0;
-		_keepBusy = false;
-	}
-	_keepQueue.erase(
-		ranges::remove(_keepQueue, id, &KeepTask::playlistId),
-		end(_keepQueue));
-
-	// The files other kept playlists don't need.
-	auto needed = base::flat_set<QString>();
-	for (const auto &other : _store.saved()) {
-		for (const auto &track : other.tracks) {
-			needed.emplace(track.media);
-		}
-	}
-	for (const auto &track : tracks) {
-		if (!needed.contains(track.media)
-			&& Cloud::ValidMediaId(track.media)
-			&& (!_current || _playing.media != track.media)) {
-			QFile::remove(keptPath(track.media));
-		}
-	}
+	pruneKeepQueue();
+	dropUnneeded(tracks);
 	_keptChanges.fire({});
 	keepNext();
 }
@@ -2495,21 +3060,34 @@ void Service::keepNext() {
 	if (_keepBusy || _keepQueue.empty()) {
 		return;
 	}
+	const auto account = _account.get();
+	if (!account || !account->ready()) {
+		// Goes on when the account is connected: a download that is
+		// asked for now would never answer.
+		return;
+	}
 	const auto media = _keepQueue.front().media;
 	const auto target = keptPath(media);
-	if (!Cloud::ValidMediaId(media)
-		|| QFileInfo(target).isFile()
-		|| !QDir().mkpath(QFileInfo(target).absolutePath())) {
+	const auto finishLater = [=](KeepResult result) {
 		_keepBusy = true;
+		_keepLocal = true;
 		crl::on_main(this, [=] {
-			keepDone(media, true);
+			keepDone(media, result);
 		});
+	};
+	if (!Cloud::ValidMediaId(media)
+		|| !QDir().mkpath(QFileInfo(target).absolutePath())) {
+		finishLater(KeepResult::Gone);
+		return;
+	} else if (QFileInfo(target).isFile()) {
+		finishLater(KeepResult::Done);
 		return;
 	}
 	_keepBusy = true;
 	const auto cached = Cloud::MediaCachePath(media);
 	if (QFileInfo(cached).isFile()) {
 		// It was listened to already: a copy instead of a download.
+		_keepLocal = true;
 		const auto weak = base::make_weak(this);
 		crl::async([=] {
 			const auto temp = target + u".copy"_q;
@@ -2521,41 +3099,73 @@ void Service::keepNext() {
 			}
 			crl::on_main(weak, [=] {
 				if (const auto strong = weak.get()) {
-					strong->keepDone(media, copied);
+					strong->keepDone(
+						media,
+						copied ? KeepResult::Done : KeepResult::Failed);
 				}
 			});
 		});
 		return;
 	}
-	_keepTransfer = account().download({
+	_keepLocal = false;
+	_keepTransfer = account->download({
 		.media = media,
 		.to = target,
 		.done = crl::guard(this, [=](const QString &path) {
 			_keepTransfer = 0;
-			keepDone(media, true);
+			keepDone(media, KeepResult::Done);
 		}),
 		.fail = crl::guard(this, [=](const Cloud::Error &error) {
 			_keepTransfer = 0;
-			keepDone(media, false);
+			keepDone(
+				media,
+				KeepGoneError(error)
+					? KeepResult::Gone
+					: KeepResult::Failed);
 		}),
 	});
 }
 
-void Service::keepDone(const QString &media, bool success) {
+void Service::keepDone(const QString &media, KeepResult result) {
 	_keepBusy = false;
+	_keepLocal = false;
 
-	// The task may be gone already: its playlist was removed meanwhile.
-	if (!_keepQueue.empty() && _keepQueue.front().media == media) {
-		if (success) {
-			_keepQueue.erase(begin(_keepQueue));
-		} else {
-			// A track that could not be taken stays on the server and is
-			// played from there: the rest of this playlist is not tried
-			// again and again while there is no connection.
-			const auto id = _keepQueue.front().playlistId;
-			_keepQueue.erase(
-				ranges::remove(_keepQueue, id, &KeepTask::playlistId),
-				end(_keepQueue));
+	// The task may be gone already: its playlist was removed meanwhile,
+	// or the account was switched off.
+	const auto current = !_keepQueue.empty()
+		&& (_keepQueue.front().media == media);
+	if (result == KeepResult::Failed && current) {
+		// No connection, most likely. The queue stays as it is: tried
+		// again after a pause that grows up to an hour, when the account
+		// connects and when the user opens the playlist.
+		_keepRetry.callOnce(KeepRetryDelay(_keepFailures++));
+		_keptChanges.fire({});
+		return;
+	}
+	if (current) {
+		_keepQueue.erase(begin(_keepQueue));
+	}
+	if (result == KeepResult::Gone) {
+		// Stays on the list of the playlist and is not asked for again
+		// in this launch (or till the playlist is opened).
+		_keepGone.emplace(media);
+		if (++_keepGoneRun >= kKeepGoneRun) {
+			// One refusal after another (the playlist is gone from the
+			// server, or it is not shared with this account any more):
+			// the rest is not asked for in one burst.
+			_keepGoneRun = 0;
+			_keepRetry.callOnce(KeepRetryDelay(_keepFailures++));
+			_keptChanges.fire({});
+			return;
+		}
+	} else if (result == KeepResult::Done) {
+		_keepFailures = 0;
+		_keepGoneRun = 0;
+		if (!neededMedia(media)
+			&& Cloud::ValidMediaId(media)
+			&& (!_current || _playing.media != media)) {
+			// «Убрать из моих» while the file was on its way.
+			QFile::remove(keptPath(media));
 		}
 	}
 	_keptChanges.fire({});
@@ -2566,8 +3176,23 @@ void Service::remember(const Playlist &playlist) {
 	if (!playlist.valid() || !playlist.full) {
 		return;
 	}
-	if (_store.findSaved(playlist.id)) {
+	if (const auto saved = _store.findSaved(playlist.id)) {
+		// A kept playlist follows the one of the server: the files of
+		// the tracks that were removed from it are deleted, the new
+		// tracks are saved.
+		const auto before = saved->tracks;
 		_store.save(playlist);
+		pruneKeepQueue();
+		dropUnneeded(before);
+		for (const auto &track : playlist.tracks) {
+			_keepGone.remove(track.media);
+		}
+		if (queueMissing(playlist)) {
+			_keptChanges.fire({});
+		}
+		// It was just asked from the server: the connection is there.
+		_keepFailures = 0;
+		keepNext();
 	}
 	_updates.fire_copy(playlist);
 }
@@ -2591,7 +3216,41 @@ Service &ServiceFor(not_null<Main::Session*> session) {
 	return *raw;
 }
 
+bool QuietLoad(not_null<DocumentData*> document) {
+	for (const auto &[session, service] : Services()) {
+		const auto uploader = service->uploader();
+		if (uploader && uploader->fetching(document)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void Start(not_null<Main::Session*> session) {
+	// An account that has kept or shared a playlist: the files «Добавить
+	// к себе» has not taken yet are taken when the account is connected
+	// (the Service does it). Nothing is created for the other accounts,
+	// and nothing is asked from the server before the account is ready.
+	const auto own = AccountFolder(session);
+	if (QFileInfo::exists(own + u"shared.json"_q)) {
+		(void)ServiceFor(session);
+
+		// What a copy of an earlier launch has left half way. No copy of
+		// this launch is made yet.
+		const auto media = own + u"shared_media"_q;
+		crl::async([=] {
+			auto dir = QDir(media);
+			if (dir.exists()) {
+				const auto files = dir.entryList(
+					QStringList{ u"*.copy"_q },
+					QDir::Files);
+				for (const auto &name : files) {
+					dir.remove(name);
+				}
+			}
+		});
+	}
+
 	// Files of an upload that did not live to its end, once per launch:
 	// later another account may be in the middle of its own upload.
 	static auto Cleaned = false;
@@ -2632,6 +3291,7 @@ bool RunSelfTest(QStringList &log) {
 	TestPlaylists(check);
 	TestStacks(check);
 	TestFiles(check);
+	TestRules(check);
 	return !check.failed();
 }
 

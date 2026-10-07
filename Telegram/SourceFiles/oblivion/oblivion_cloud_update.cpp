@@ -157,10 +157,13 @@ enum class Verdict {
 	result.published = true;
 	result.version = version.toString();
 	result.build = build;
+	// The oldest build the cloud accepts can't be newer than the newest
+	// one that exists: a slip in the manifest must not tell the people
+	// who have the latest version that they have to update.
 	result.minBuild = std::clamp(
 		Cloud::JsonInt(object.value(u"min_build"_q)),
 		int64(0),
-		kMaxBuild);
+		build);
 	result.publishedAt = std::max(
 		Cloud::JsonInt(object.value(u"published_at"_q)),
 		int64(0)) / 1000;
@@ -195,6 +198,23 @@ enum class Verdict {
 		: Platform::IsWindows()
 		? manifest.win
 		: Package();
+}
+
+// Whether a background check shows its box. A new version without a
+// file for this system is not offered yet (there is nothing to download)
+// and is not marked as seen: the box comes when the file is published,
+// under the same build number. A version this build has to move to is
+// told once per launch even without a file.
+[[nodiscard]] bool OffersInBackground(
+		Verdict verdict,
+		bool hasFile,
+		bool seen,
+		bool requiredShown) {
+	return (verdict == Verdict::Required)
+		? !requiredShown
+		: (verdict == Verdict::Available)
+		? (hasFile && !seen)
+		: false;
 }
 
 // "name (2).zip" next to a file with this name that is something else.
@@ -308,6 +328,7 @@ void UpdateBox(not_null<Ui::GenericBox*> box, UpdateBoxArgs &&args) {
 		QString error;
 		Fn<void()> cancel;
 		Fn<void()> refresh;
+		rpl::variable<QString> title;
 		rpl::variable<QString> status;
 	};
 	const auto state = box->lifetime().make_state<State>();
@@ -322,7 +343,10 @@ void UpdateBox(not_null<Ui::GenericBox*> box, UpdateBoxArgs &&args) {
 	state->path = args.path;
 	state->error = args.error;
 
-	box->setTitle(tr::lng_oblivion_update_title());
+	// The title follows the download: «Доступна новая версия» over a file
+	// that is saved already would ask to download it again.
+	state->title = tr::lng_oblivion_update_title(tr::now);
+	box->setTitle(state->title.value());
 	box->setWidth(st::boxWideWidth);
 	box->setMaxHeight(st::boxMaxListHeight);
 	box->setCloseByOutsideClick(false);
@@ -436,6 +460,13 @@ void UpdateBox(not_null<Ui::GenericBox*> box, UpdateBoxArgs &&args) {
 	const auto shown = std::make_shared<int>(-1);
 	state->refresh = [=] {
 		const auto phase = state->phase;
+		state->title = !hasFile
+			? tr::lng_oblivion_update_title(tr::now)
+			: (phase == Phase::Loading)
+			? tr::lng_oblivion_update_title_loading(tr::now)
+			: (phase == Phase::Ready)
+			? tr::lng_oblivion_update_title_ready(tr::now)
+			: tr::lng_oblivion_update_title(tr::now);
 		bar->toggle(phase == Phase::Loading, anim::type::instant);
 		bar->entity()->setValue((state->total > 0)
 			? (state->ready / float64(state->total))
@@ -457,7 +488,7 @@ void UpdateBox(not_null<Ui::GenericBox*> box, UpdateBoxArgs &&args) {
 				tr::now,
 				lt_path,
 				QDir::toNativeSeparators(state->path))
-				+ QChar('\n')
+				+ u"\n\n"_q
 				+ (Platform::IsMac()
 					? tr::lng_oblivion_update_install_mac(tr::now)
 					: tr::lng_oblivion_update_install_win(tr::now)))
@@ -514,6 +545,7 @@ struct Global {
 	Cloud::RequestId request = 0;
 	bool started = false;
 	bool requiredShown = false;
+	bool manual = false; // «Проверить обновления» waits for its answer.
 	std::vector<Fn<void(const Manifest*, const Cloud::Error&)>> waiting;
 };
 
@@ -660,10 +692,9 @@ void RequestManifest(Fn<void(const Manifest*, const Cloud::Error&)> done) {
 void OfferLatest() {
 	auto &state = State();
 	const auto verdict = Compare(state.latest, kOblivionBuild);
-	if (verdict == Verdict::Latest
-		|| (verdict == Verdict::Available
-			&& Get().cloudUpdateSeenBuild() >= state.latest.build)
-		|| (verdict == Verdict::Required && state.requiredShown)) {
+	const auto hasFile = PackageFor(state.latest).valid();
+	const auto seen = (Get().cloudUpdateSeenBuild() >= state.latest.build);
+	if (!OffersInBackground(verdict, hasFile, seen, state.requiredShown)) {
 		return;
 	}
 	const auto window = Core::IsAppLaunched()
@@ -676,7 +707,10 @@ void OfferLatest() {
 		return;
 	}
 	state.requiredShown = (verdict == Verdict::Required);
-	Get().setCloudUpdateSeenBuild(state.latest.build);
+	if (hasFile) {
+		// Only what the user could download counts as seen.
+		Get().setCloudUpdateSeenBuild(state.latest.build);
+	}
 	ShowUpdate(controller->uiShow(), state.latest);
 }
 
@@ -795,6 +829,29 @@ void TestManifest(Checker &check) {
 		"compare: a build below the minimum must update");
 	check(Compare(demanding, 5000001) == Verdict::Latest,
 		"compare: the minimum itself is fine");
+	const auto slip = ParseManifest(ManifestJson(
+		"{\"version\":\"5.0.1\",\"build\":5000001,\"min_build\":5000009}"));
+	check(slip.published && slip.minBuild == 5000001,
+		"manifest: the minimum is never above the build itself");
+	check(Compare(slip, 5000001) == Verdict::Latest
+		&& Compare(slip, 5000000) == Verdict::Required,
+		"compare: the latest build is never told to update");
+
+	// The box of a background check.
+	check(OffersInBackground(Verdict::Available, true, false, false),
+		"offer: a new version with a file is offered");
+	check(!OffersInBackground(Verdict::Available, true, true, false),
+		"offer: once");
+	check(!OffersInBackground(Verdict::Available, false, false, false),
+		"offer: not while there is no file for this system");
+	check(!OffersInBackground(Verdict::Latest, true, false, false)
+		&& !OffersInBackground(Verdict::Latest, false, false, false),
+		"offer: nothing for the latest build");
+	check(OffersInBackground(Verdict::Required, false, true, false)
+		&& OffersInBackground(Verdict::Required, true, true, false),
+		"offer: a required update is told even if it was seen");
+	check(!OffersInBackground(Verdict::Required, true, false, true),
+		"offer: but once per launch");
 
 	const auto empty = ParseManifest(ManifestJson("{\"version\":null}"));
 	check(!empty.published, "manifest: nothing is published");
@@ -914,8 +971,12 @@ const auto SnapshotScenes = SelfTest::SceneRegistrar([] {
 		args.phase = Phase::Failed;
 		args.error = tr::lng_oblivion_cloud_error_network(tr::now);
 	});
+	// One thing missing at a time: both at once made a box of two
+	// refusals that told nothing about either case.
 	scene(u"update_no_file"_q, [](UpdateBoxArgs &args) {
 		args.fileName = QString();
+	});
+	scene(u"update_no_notes"_q, [](UpdateBoxArgs &args) {
 		args.notes = QString();
 	});
 });
@@ -948,9 +1009,16 @@ void Start(not_null<Main::Session*> session) {
 }
 
 void CheckNow(not_null<Window::SessionController*> controller) {
+	auto &state = State();
+	if (state.manual) {
+		// The second of two quick clicks: one answer, one box.
+		return;
+	}
+	state.manual = true;
 	const auto weak = base::make_weak(controller);
 	controller->showToast(tr::lng_oblivion_update_checking(tr::now));
 	RequestManifest([=](const Manifest *manifest, const Cloud::Error &error) {
+		State().manual = false;
 		const auto strong = weak.get();
 		if (!strong) {
 			return;
@@ -966,7 +1034,11 @@ void CheckNow(not_null<Window::SessionController*> controller) {
 				QString::fromLatin1(kOblivionVersion)));
 			return;
 		}
-		Get().setCloudUpdateSeenBuild(manifest->build);
+		if (PackageFor(*manifest).valid()) {
+			// Without a file for this system the version is not "seen":
+			// the daily check tells when the file is published.
+			Get().setCloudUpdateSeenBuild(manifest->build);
+		}
 		ShowUpdate(strong->uiShow(), *manifest);
 	});
 }

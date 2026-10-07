@@ -1896,19 +1896,23 @@ void RegisterParts() {
 		.id = "digicam.reflection",
 		.group = FxGroup::Lofi,
 		.name = tr::lng_oblivion_photo_digicam_reflection,
+		// The effect alone starts with a reflection that is seen at once
+		// on any photo: the wide spot of the third shape. The first shape
+		// at 45% (what the CCD camera has) is two faint bands, on a bright
+		// picture the effect looked like it did nothing.
 		.params = {
 			FxInt(
 				"variant",
 				tr::lng_oblivion_photo_digicam_reflection_variant,
 				1,
 				kDigicamReflectionCount,
-				1),
+				3),
 			FxInt(
 				"strength",
 				tr::lng_oblivion_photo_lofi_amount,
 				0,
 				100,
-				45,
+				60,
 				u"%"_q),
 			FxColor(
 				"color",
@@ -1935,6 +1939,9 @@ void RegisterParts() {
 		.id = "digicam.vignette",
 		.group = FxGroup::Lofi,
 		.name = tr::lng_oblivion_photo_digicam_vignette,
+		// The colors are the ones of the "washed" camera, three times as
+		// strong: at its 20 the tints are a part of a look, alone they
+		// could not be told from the original photo.
 		.params = {
 			FxColor(
 				"inner",
@@ -1945,7 +1952,7 @@ void RegisterParts() {
 				tr::lng_oblivion_photo_digicam_inner_amount,
 				0,
 				100,
-				20),
+				60),
 			FxColor(
 				"outer",
 				tr::lng_oblivion_photo_digicam_outer,
@@ -1955,7 +1962,7 @@ void RegisterParts() {
 				tr::lng_oblivion_photo_digicam_outer_amount,
 				0,
 				100,
-				20),
+				60),
 			FxInt(
 				"size",
 				tr::lng_oblivion_photo_lofi_size,

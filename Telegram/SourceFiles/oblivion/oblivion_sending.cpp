@@ -324,6 +324,12 @@ void TrackDeliveries(not_null<Main::Session*> session) {
 
 // sentAt is when the user has sent the message, 0 if it's not known
 // (the date is moved after an upload).
+//
+// Round 5, «отправить, когда будет в сети» relies on two things here, see
+// SendOnline Account::send() in oblivion_send_online.cpp before changing
+// either of them: with sentAt == 0 a window that exists is never replaced
+// by a new one, and a window whose till is still ahead keeps its from.
+// RefreshSendOptions() below always comes here with sentAt == 0.
 void ExpectDelivery(not_null<PeerData*> peer, TimeId date, TimeId sentAt) {
 	TrackDeliveries(&peer->session());
 
